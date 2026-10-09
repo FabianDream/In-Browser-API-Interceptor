@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UpLearn Telemetry Blocker & TimeSpent Booster
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
-// @version      2.2.0
-// @description  Blocks telemetry ALWAYS; random-range time boost; full control panel UI with custom keybind
+// @version      2.9.0
+// @description  Blocks telemetry ALWAYS; random-range time boost; consistent soft dark mode with preserved top bar; full control panel UI with custom keybind
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
@@ -47,14 +47,10 @@
         timeBoostEnabled:      true,
         extraSecondsMin:       30,
         extraSecondsMax:       90,
-        boostQuizQuestions:    true,
-        boostGroupCompletion:  true,
-        // Telemetry
-        blockLogImproperUse:   true,
-        // Visibility spoofing
-        spoofVisibility:       true,
-        spoofFocus:            true,
-        suppressVisibilityEvents: true,
+        // Behaviour
+        disableAutoFullscreen: true,
+        // Appearance
+        darkMode:              false,
         // UI
         pillVisible:           true,
         pillPosition:          'bottom-right',
@@ -85,15 +81,19 @@
             const raw = localStorage.getItem(SETTINGS_KEY);
             if (raw) {
                 const parsed = JSON.parse(raw);
-                // Migrate single `extraSeconds` -> min/max range
                 if (typeof parsed.extraSeconds === 'number') {
                     parsed.extraSecondsMin = parsed.extraSeconds;
                     parsed.extraSecondsMax = parsed.extraSeconds;
                     delete parsed.extraSeconds;
                 }
+                delete parsed.blockLogImproperUse;
+                delete parsed.spoofVisibility;
+                delete parsed.spoofFocus;
+                delete parsed.suppressVisibilityEvents;
+                delete parsed.boostQuizQuestions;
+                delete parsed.boostGroupCompletion;
                 Object.assign(s, parsed);
             } else {
-                // migrate from v1
                 const b = localStorage.getItem(LEGACY_BOOST_KEY);
                 if (b !== null) s.timeBoostEnabled = b === 'true';
                 const u = localStorage.getItem(LEGACY_UI_KEY);
@@ -151,10 +151,141 @@
         } catch { return false; }
     }
 
-    const stats = { apiPosts: 0, seen: 0, boosted: 0, blocked: 0, groupExtra: 0 };
+    const stats = { apiPosts: 0, seen: 0, boosted: 0, blocked: 0, groupExtra: 0, fullscreenBlocked: 0 };
 
     // ============================================================
-    // TELEMETRY BLOCKING
+    // DARK MODE  (consistent soft partial-invert on #root only)
+    // ============================================================
+    //  ── Why #root and not html? ──
+    //  The site wraps everything in <div id="root">. Our pill and
+    //  settings modal are appended to <body> as siblings of #root,
+    //  so filtering only #root means our UI is completely outside
+    //  the inverted subtree — no colour shift when the modal opens.
+    //
+    //  ── Why force backgrounds? ──
+    //  Different routes render slightly different background shades
+    //  (pure #fff, off-white, subtle grey) inside #root. After the
+    //  invert those tiny differences become visibly distinct dark
+    //  greys. We force #root to pure white !important so every page
+    //  inverts to the same fixed dark grey, and pin html/body to
+    //  that exact target so the exposed canvas matches everywhere.
+    //
+    //  ── Math ──
+    //  Parent (on #root): invert(0.88) so pure white → #1f1f1f and
+    //  pure black → #e0e0e0 (soft dark, not the harsh 21:1 full invert).
+    //      p(v) = -0.76·v + 0.88
+    //  Child (media/svg/nav inside #root) needs an exact inverse:
+    //      f(x) = invert(1) ∘ contrast(c)   (with hue-rotate(180deg))
+    //           = 0.5 + 0.5c - c·x
+    //      Solve f(p(v)) = v  →  c = 1.3158
+    // ============================================================
+    const DARK_MODE_STYLE_ID  = '__ul-dark-styles';
+    const PARENT_INVERT       = 0.88;
+    const CHILD_CONTRAST      = 1.3158;
+    const DARK_BASE_COLOR     = '#1f1f1f';   // = invert(0.88) of #ffffff
+    const DARK_PRE_INVERT_BG  = '#ffffff';   // so #root inverts to DARK_BASE_COLOR
+
+    function ensureDarkModeStyles() {
+        if (document.getElementById(DARK_MODE_STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = DARK_MODE_STYLE_ID;
+        style.textContent = `
+            /* ---- Consistent base canvas ---- */
+            html.ul-dark-mode,
+            html.ul-dark-mode body {
+                background-color: ${DARK_BASE_COLOR} !important;
+            }
+
+            /* ---- Soft-invert ONLY the site wrapper, with a fixed white canvas ---- */
+            html.ul-dark-mode #root {
+                filter: invert(${PARENT_INVERT}) hue-rotate(180deg);
+                background-color: ${DARK_PRE_INVERT_BG} !important;
+                min-height: 100vh;
+            }
+
+            /* ---- Top navigation bar: keep exactly like light mode ---- */
+            html.ul-dark-mode #root nav {
+                filter: invert(1) hue-rotate(180deg) contrast(${CHILD_CONTRAST});
+            }
+
+            /* Because the nav is fully un-inverted, kill the auto
+               un-invert rules below for media/svg inside it (otherwise
+               they'd be un-inverted twice and flip back). */
+            html.ul-dark-mode #root nav img,
+            html.ul-dark-mode #root nav picture,
+            html.ul-dark-mode #root nav video,
+            html.ul-dark-mode #root nav iframe,
+            html.ul-dark-mode #root nav canvas,
+            html.ul-dark-mode #root nav embed,
+            html.ul-dark-mode #root nav object,
+            html.ul-dark-mode #root nav svg {
+                filter: none;
+            }
+
+            /* ---- Other elements inside #root we want to see "normally" ---- */
+            html.ul-dark-mode #root img,
+            html.ul-dark-mode #root video,
+            html.ul-dark-mode #root picture,
+            html.ul-dark-mode #root iframe,
+            html.ul-dark-mode #root canvas,
+            html.ul-dark-mode #root embed,
+            html.ul-dark-mode #root object,
+            html.ul-dark-mode #root svg[role="img"] {
+                filter: invert(1) hue-rotate(180deg) contrast(${CHILD_CONTRAST});
+            }
+
+            /* NOTE: #__ul-pill and #__ul-settings-overlay live as siblings
+               of #root under <body>, so they are NOT inside the inverted
+               subtree and need no filter at all. */
+        `;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function applyDarkMode() {
+        try {
+            const html = document.documentElement;
+            if (!html) return;
+            if (settings.darkMode) {
+                html.classList.add('ul-dark-mode');
+            } else {
+                html.classList.remove('ul-dark-mode');
+            }
+        } catch (e) { WARN('dark mode apply failed', e); }
+    }
+
+    ensureDarkModeStyles();
+    applyDarkMode();
+
+    // Guard against React stripping/overwriting html's class list.
+    try {
+        const obs = new MutationObserver(() => {
+            const html = document.documentElement;
+            if (!html) return;
+            const has = html.classList.contains('ul-dark-mode');
+            if (settings.darkMode && !has) {
+                html.classList.add('ul-dark-mode');
+            } else if (!settings.darkMode && has) {
+                html.classList.remove('ul-dark-mode');
+            }
+        });
+        obs.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+    } catch {}
+
+    // Belt-and-braces: lightweight periodic check in case the observer
+    // misses an edge case during SPA route transitions.
+    setInterval(() => {
+        const html = document.documentElement;
+        if (!html) return;
+        const has = html.classList.contains('ul-dark-mode');
+        if (settings.darkMode && !has) {
+            html.classList.add('ul-dark-mode');
+        } else if (!settings.darkMode && has) {
+            html.classList.remove('ul-dark-mode');
+        }
+    }, 500);
+
+    // ============================================================
+    // TELEMETRY BLOCKING  (always on)
     // ============================================================
     function bodyLooksLikeLogImproperUse(body) {
         if (body == null) return false;
@@ -212,8 +343,8 @@
         if (!settings.timeBoostEnabled) return { body, changed: false };
         if (typeof body !== 'string')    return { body, changed: false };
 
-        const hasQuiz  = settings.boostQuizQuestions   && body.includes(QUIZ_OP);
-        const hasGroup = settings.boostGroupCompletion && body.includes(GROUP_OP);
+        const hasQuiz  = body.includes(QUIZ_OP);
+        const hasGroup = body.includes(GROUP_OP);
         if (!hasQuiz && !hasGroup) return { body, changed: false };
 
         let json;
@@ -225,8 +356,7 @@
         const patch = (obj) => {
             if (!obj || !obj.operationName || !obj.variables) return;
 
-            if (settings.boostQuizQuestions &&
-                obj.operationName === QUIZ_OP &&
+            if (obj.operationName === QUIZ_OP &&
                 typeof obj.variables.timeSpent === 'string') {
                 const total = parseISODuration(obj.variables.timeSpent);
                 if (total === null) return;
@@ -242,8 +372,7 @@
                     `(+${extra}s rolled from [${settings.extraSecondsMin}-${settings.extraSecondsMax}]` +
                     `, accumulated: ${accumulatedExtraSeconds}s across ${accumulatedQuestionCount} q)`);
             }
-            else if (settings.boostGroupCompletion &&
-                     obj.operationName === GROUP_OP &&
+            else if (obj.operationName === GROUP_OP &&
                      typeof obj.variables.timeSpent === 'string') {
                 const total = parseISODuration(obj.variables.timeSpent);
                 if (total === null) return;
@@ -290,7 +419,7 @@
                             const self = this;
                             const passInit = init;
                             return input.clone().text().then((text) => {
-                                if (settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(text)) {
+                                if (bodyLooksLikeLogImproperUse(text)) {
                                     LOG('LogImproperUse (Request body) — dropping');
                                     stats.blocked++;
                                     return logImproperUseSyntheticResponse();
@@ -305,7 +434,7 @@
                         }
                     }
 
-                    if (settings.blockLogImproperUse && body != null && bodyLooksLikeLogImproperUse(body)) {
+                    if (body != null && bodyLooksLikeLogImproperUse(body)) {
                         LOG('LogImproperUse — dropping');
                         stats.blocked++;
                         return Promise.resolve(logImproperUseSyntheticResponse());
@@ -346,7 +475,7 @@
                 if (method === 'POST' && isTargetApi(this.__ul_url)) {
                     stats.apiPosts++;
 
-                    if (settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(body)) {
+                    if (bodyLooksLikeLogImproperUse(body)) {
                         LOG('xhr LogImproperUse — dropping');
                         stats.blocked++;
                         const self = this;
@@ -384,7 +513,7 @@
     }
 
     // ============================================================
-    // VISIBILITY / FOCUS SPOOFING
+    // VISIBILITY / FOCUS SPOOFING  (always on)
     // ============================================================
     const ORIG_VIS = (() => {
         try {
@@ -405,19 +534,19 @@
     function patchVisibilityProps() {
         try {
             Object.defineProperty(document, 'visibilityState', {
-                get: () => settings.spoofVisibility ? 'visible' : (ORIG_VIS ? ORIG_VIS.call(document) : 'visible'),
+                get: () => 'visible',
                 configurable: true
             });
             Object.defineProperty(document, 'webkitVisibilityState', {
-                get: () => settings.spoofVisibility ? 'visible' : (ORIG_VIS ? ORIG_VIS.call(document) : 'visible'),
+                get: () => 'visible',
                 configurable: true
             });
             Object.defineProperty(document, 'hidden', {
-                get: () => settings.spoofVisibility ? false : (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : false),
+                get: () => false,
                 configurable: true
             });
             Object.defineProperty(document, 'webkitHidden', {
-                get: () => settings.spoofVisibility ? false : (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : false),
+                get: () => false,
                 configurable: true
             });
         } catch (e) { WARN('visibility patch failed', e); }
@@ -426,10 +555,7 @@
 
     function installHasFocusPatch() {
         try {
-            document.hasFocus = function () {
-                if (settings.spoofFocus) return true;
-                return ORIG_HAS_FOCUS();
-            };
+            document.hasFocus = function () { return true; };
         } catch {}
     }
     installHasFocusPatch();
@@ -441,7 +567,7 @@
     function wrapAddEventListener(target) {
         const origAdd = target.addEventListener;
         target.addEventListener = function (type, listener, options) {
-            if (settings.suppressVisibilityEvents && SUPPRESSED_EVENTS.has(type)) return;
+            if (SUPPRESSED_EVENTS.has(type)) return;
             return origAdd.call(this, type, listener, options);
         };
     }
@@ -451,9 +577,7 @@
     try {
         const origProtoAdd = EventTarget.prototype.addEventListener;
         EventTarget.prototype.addEventListener = function (type, listener, options) {
-            if (settings.suppressVisibilityEvents &&
-                (this === window || this === document) &&
-                SUPPRESSED_EVENTS.has(type)) return;
+            if ((this === window || this === document) && SUPPRESSED_EVENTS.has(type)) return;
             return origProtoAdd.call(this, type, listener, options);
         };
     } catch {}
@@ -466,7 +590,6 @@
     });
 
     const KILL = (e) => {
-        if (!settings.suppressVisibilityEvents) return;
         e.stopImmediatePropagation(); e.stopPropagation();
     };
     ['visibilitychange', 'webkitvisibilitychange', 'blur', 'focusout', 'pagehide'].forEach((evt) => {
@@ -480,6 +603,54 @@
         patchVisibilityProps();
         installHasFocusPatch();
     }, 2000);
+
+    // ============================================================
+    // AUTO FULLSCREEN BLOCKER
+    // ============================================================
+    const FULLSCREEN_METHODS = [
+        'requestFullscreen',
+        'webkitRequestFullscreen',
+        'webkitRequestFullScreen',
+        'mozRequestFullScreen',
+        'msRequestFullscreen',
+    ];
+
+    function installFullscreenBlocker() {
+        FULLSCREEN_METHODS.forEach((name) => {
+            const proto = Element.prototype;
+            if (!proto[name]) return;
+            if (proto[name].__ul_patched) return;
+            const orig = proto[name];
+            const wrapped = function () {
+                if (settings.disableAutoFullscreen) {
+                    stats.fullscreenBlocked++;
+                    LOG('blocked requestFullscreen on', this.tagName || String(this));
+                    try {
+                        if (document.fullscreenElement && document.exitFullscreen) {
+                            document.exitFullscreen().catch(() => {});
+                        }
+                    } catch {}
+                    return Promise.reject(new DOMException(
+                        'Fullscreen request blocked by userscript',
+                        'NotAllowedError'
+                    ));
+                }
+                return orig.apply(this, arguments);
+            };
+            wrapped.__ul_patched = true;
+            wrapped.__ul_orig    = orig;
+            try {
+                Object.defineProperty(proto, name, {
+                    value: wrapped,
+                    writable: true,
+                    configurable: true,
+                });
+            } catch {
+                proto[name] = wrapped;
+            }
+        });
+    }
+    installFullscreenBlocker();
 
     // ============================================================
     // KEYBIND HELPERS
@@ -549,8 +720,6 @@
             alt:   e.altKey,
             meta:  e.metaKey,
         };
-        // A modifier key reports itself as pressed in its own modifier flag.
-        // Strip that so the stored combo matches what the user "means".
         if (e.code === 'ControlLeft' || e.code === 'ControlRight') kb.ctrl  = false;
         if (e.code === 'ShiftLeft'   || e.code === 'ShiftRight')   kb.shift = false;
         if (e.code === 'AltLeft'     || e.code === 'AltRight')     kb.alt   = false;
@@ -561,7 +730,6 @@
     function matchesKeybind(e, kb) {
         if (!kb || !kb.code) return false;
         if (isModifierCode(kb.code)) {
-            // For modifier-only keybinds, match on code alone
             return e.code === kb.code;
         }
         return e.code === kb.code
@@ -769,7 +937,6 @@
                 outline: 2px solid var(--ul-accent); outline-offset: 0;
             }
 
-            /* Hide native spinner arrows on number inputs */
             .ul-modal input[type="number"]::-webkit-outer-spin-button,
             .ul-modal input[type="number"]::-webkit-inner-spin-button {
                 -webkit-appearance: none;
@@ -823,7 +990,6 @@
                 font-weight: 500;
             }
 
-            /* ---------- KEYBIND ---------- */
             .ul-modal .ul-keybind-group {
                 display: flex; align-items: center; gap: 6px;
                 flex-shrink: 0;
@@ -1028,7 +1194,6 @@
                 row2.textContent = '🛡 always on';
             }
 
-            // Update tooltip with current keybind
             const kbText = formatKeybind(settings.uiToggleKeybind);
             main.title = `Click: toggle time boost | ${kbText}: hide/show pill`;
         };
@@ -1152,6 +1317,7 @@
         set('boosted',   stats.boosted);
         set('pending',   accumulatedExtraSeconds + 's');
         set('groupExtra', stats.groupExtra + 's');
+        set('fullscreenBlocked', stats.fullscreenBlocked);
     }
 
     function applySettingChange(key, value) {
@@ -1179,6 +1345,14 @@
             case 'extraSecondsMax':
                 updateRangeLabels();
                 if (pillPaint) pillPaint();
+                break;
+            case 'disableAutoFullscreen':
+                LOG('auto-fullscreen blocking ' + (value ? 'ENABLED' : 'DISABLED'));
+                break;
+            case 'darkMode':
+                ensureDarkModeStyles();
+                applyDarkMode();
+                LOG('dark mode ' + (value ? 'ENABLED' : 'DISABLED'));
                 break;
             case 'pillVisible':
                 applyPillVisibility();
@@ -1226,7 +1400,7 @@
 
                     <section class="ul-section">
                         <h3>⏱ Time Boost</h3>
-                        <p class="ul-desc">Add extra time to your quiz answer submissions.</p>
+                        <p class="ul-desc">Add extra time to your quiz answer submissions. Quiz questions and group completion are always boosted automatically.</p>
 
                         <div class="ul-row">
                             <label for="ul-set-timeBoostEnabled">Enable time boost
@@ -1253,57 +1427,29 @@
                                 <span class="ul-range-unit">s</span>
                             </div>
                         </div>
+                    </section>
+
+                    <section class="ul-section">
+                        <h3>🖥 Page Behaviour</h3>
+                        <p class="ul-desc">Control how the site is allowed to interact with your browser.</p>
 
                         <div class="ul-row">
-                            <label for="ul-set-boostQuizQuestions">Boost quiz questions
-                                <small>Patch AnswerProgressQuizQuestion payloads</small>
+                            <label for="ul-set-disableAutoFullscreen">Disable auto fullscreen
+                                <small>Blocks the site from silently entering fullscreen mode</small>
                             </label>
-                            <input type="checkbox" id="ul-set-boostQuizQuestions" data-setting="boostQuizQuestions">
-                        </div>
-
-                        <div class="ul-row">
-                            <label for="ul-set-boostGroupCompletion">Boost group completion
-                                <small>Apply accumulated bonus on CompleteProgressQuizGroup</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-boostGroupCompletion" data-setting="boostGroupCompletion">
+                            <input type="checkbox" id="ul-set-disableAutoFullscreen" data-setting="disableAutoFullscreen">
                         </div>
                     </section>
 
                     <section class="ul-section">
-                        <h3>🛡 Telemetry Blocking</h3>
-                        <p class="ul-desc">Drops LogImproperUse requests at the network layer.</p>
+                        <h3>🌙 Appearance</h3>
+                        <p class="ul-desc">Change the look of the UpLearn website itself.</p>
 
                         <div class="ul-row">
-                            <label for="ul-set-blockLogImproperUse">Block LogImproperUse
-                                <small>Recommended: keep enabled</small>
+                            <label for="ul-set-darkMode">Dark mode
+                                <small>Soft dark theme — consistent across all pages, top bar preserved</small>
                             </label>
-                            <input type="checkbox" id="ul-set-blockLogImproperUse" data-setting="blockLogImproperUse">
-                        </div>
-                    </section>
-
-                    <section class="ul-section">
-                        <h3>👁 Visibility Spoofing</h3>
-                        <p class="ul-desc">Makes the page think it's always focused and visible.</p>
-
-                        <div class="ul-row">
-                            <label for="ul-set-spoofVisibility">Spoof visibilityState
-                                <small>document.visibilityState always returns "visible"</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-spoofVisibility" data-setting="spoofVisibility">
-                        </div>
-
-                        <div class="ul-row">
-                            <label for="ul-set-spoofFocus">Spoof focus
-                                <small>document.hasFocus() always returns true</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-spoofFocus" data-setting="spoofFocus">
-                        </div>
-
-                        <div class="ul-row">
-                            <label for="ul-set-suppressVisibilityEvents">Suppress visibility events
-                                <small>Swallows blur / visibilitychange / pagehide</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-suppressVisibilityEvents" data-setting="suppressVisibilityEvents">
+                            <input type="checkbox" id="ul-set-darkMode" data-setting="darkMode">
                         </div>
                     </section>
 
@@ -1402,6 +1548,10 @@
                                 <div class="ul-stat-label">Group bonus</div>
                                 <div class="ul-stat-value" data-stat="groupExtra">0s</div>
                             </div>
+                            <div class="ul-stat">
+                                <div class="ul-stat-label">FS Blocked</div>
+                                <div class="ul-stat-value" data-stat="fullscreenBlocked">0</div>
+                            </div>
                         </div>
                         <div style="margin-top:10px;">
                             <button class="ul-btn ul-btn-secondary" data-action="reset-stats">Reset stats</button>
@@ -1419,7 +1569,6 @@
         document.body.appendChild(overlay);
         modalEl = overlay.querySelector('#__ul-modal');
 
-        // wire setting inputs
         overlay.querySelectorAll('[data-setting]').forEach((input) => {
             const key = input.dataset.setting;
 
@@ -1446,7 +1595,6 @@
             }
         });
 
-        // wire keybind recorder
         const kbBtn   = overlay.querySelector('#ul-keybind-btn');
         const kbClear = overlay.querySelector('#ul-keybind-clear');
 
@@ -1470,7 +1618,6 @@
             LOG('keybind cleared');
         });
 
-        // actions
         overlay.addEventListener('click', (e) => {
             const actionEl = e.target.closest('[data-action]');
             if (actionEl) {
@@ -1486,6 +1633,7 @@
                         applyPillPosition();
                         applyPillVisibility();
                         applyPillOpacity();
+                        applyDarkMode();
                         if (pillPaint) pillPaint();
                         LOG('settings reset to defaults');
                     }
@@ -1497,6 +1645,7 @@
                     stats.boosted = 0;
                     stats.blocked = 0;
                     stats.groupExtra = 0;
+                    stats.fullscreenBlocked = 0;
                     accumulatedExtraSeconds = 0;
                     accumulatedQuestionCount = 0;
                     updateModalStats();
@@ -1541,7 +1690,6 @@
     // GLOBAL KEYBOARD SHORTCUTS
     // ============================================================
     window.addEventListener('keydown', (e) => {
-        // --- Keybind capture mode takes priority ---
         if (capturingKeybind) {
             e.preventDefault();
             e.stopPropagation();
@@ -1559,14 +1707,12 @@
             return;
         }
 
-        // --- Open settings with Ctrl+Shift+U ---
         if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === 'KeyU') {
             e.preventDefault();
             openSettingsModal();
             return;
         }
 
-        // --- User-configured keybind toggles the pill ---
         if (matchesKeybind(e, settings.uiToggleKeybind) && !e.repeat) {
             settings.pillVisible = !settings.pillVisible;
             saveSettings();
@@ -1596,12 +1742,16 @@
         stats,
         openSettings: openSettingsModal,
         closeSettings: closeSettingsModal,
+        toggleDarkMode: () => {
+            applySettingChange('darkMode', !settings.darkMode);
+        },
         resetStats: () => {
             stats.apiPosts = 0;
             stats.seen = 0;
             stats.boosted = 0;
             stats.blocked = 0;
             stats.groupExtra = 0;
+            stats.fullscreenBlocked = 0;
             accumulatedExtraSeconds = 0;
             accumulatedQuestionCount = 0;
         },
@@ -1613,6 +1763,8 @@
     LOG('=== READY | timeBoost:', settings.timeBoostEnabled,
         '| range:', settings.extraSecondsMin + '–' + settings.extraSecondsMax + 's',
         '| keybind:', formatKeybind(settings.uiToggleKeybind),
-        '| telemetry blocking:', settings.blockLogImproperUse ? 'ON' : 'OFF',
+        '| auto-fullscreen blocked:', settings.disableAutoFullscreen ? 'ON' : 'OFF',
+        '| dark mode:', settings.darkMode ? 'ON (consistent, #root-only)' : 'OFF',
+        '| telemetry blocking: ON | visibility spoofing: ON | boost quiz/group: ON',
         '===');
 })();
