@@ -34,8 +34,13 @@
     const LEGACY_BOOST_KEY  = 'uplearn_time_boost_enabled';
     const LEGACY_UI_KEY     = 'uplearn_time_boost_ui_visible';
 
+    const IS_MAC = /Mac|iPhone|iPad|iPod/i.test(
+    (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent
+    );
+
     const DEFAULT_KEYBIND = {
-        code: 'ControlRight',
+        // Right ⌘ on macOS, Right Ctrl elsewhere.
+        code: IS_MAC ? 'MetaRight' : 'ControlRight',
         ctrl: false,
         shift: false,
         alt: false,
