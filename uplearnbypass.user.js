@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UpLearn Telemetry Blocker & TimeSpent Booster
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
-// @version      1.7.1
-// @description  Blocks telemetry ALWAYS; +60s time boost is toggleable (pill click / Right Ctrl shows-hides pill)
+// @version      1.9.0
+// @description  Blocks telemetry ALWAYS; toggleable +60s time boost and fullscreen block. UI toggled via Right Ctrl (Win/Linux) or Right Command (macOS).
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
@@ -30,7 +30,7 @@
     const LOG  = (msg, ...rest) => console.log('%c[UL] ' + msg, 'color:#00e5ff;font-weight:bold', ...rest);
     const WARN = (msg, ...rest) => console.warn('[UL] ' + msg, ...rest);
 
-    LOG('=== SCRIPT LOADED on', location.host, '===');
+    LOG('=== SCRIPT LOADED on', location.host, '| platform:', navigator.platform, '===');
 
     // ============================================================
     // SHARED CONFIG
@@ -45,15 +45,14 @@
         } catch { return false; }
     }
 
-    const stats = { apiPosts: 0, seen: 0, boosted: 0, blocked: 0, groupExtra: 0 };
+    const stats = {
+        apiPosts: 0, seen: 0, boosted: 0, blocked: 0, groupExtra: 0,
+        fsBlocked: 0,
+    };
 
     // ============================================================
-    // ─── TELEMETRY BLOCKING (ALWAYS ON, INDEPENDENT OF TOGGLE) ──
+    // ─── TELEMETRY BLOCKING (ALWAYS ON) ────────────────────────
     // ============================================================
-    // This section is intentionally NOT gated behind `timeBoostEnabled`.
-    // The user's toggle only controls the +60s time boost. LogImproperUse
-    // telemetry is dropped unconditionally, every single time.
-
     function bodyLooksLikeLogImproperUse(body) {
         if (body == null) return false;
         if (typeof body !== 'string') {
@@ -82,12 +81,13 @@
     }
 
     // ============================================================
-    // ─── TIME BOOST (TOGGLEABLE) ───────────────────────────────
+    // ─── STATE ─────────────────────────────────────────────────
     // ============================================================
     const QUIZ_OP             = 'AnswerProgressQuizQuestion';
     const GROUP_OP            = 'CompleteProgressQuizGroup';
     const EXTRA_SECONDS       = 60;
     const TOGGLE_STORAGE_KEY  = 'uplearn_time_boost_enabled';
+    const FS_BLOCK_KEY        = 'uplearn_fs_block_enabled';
     const UI_VISIBLE_KEY      = 'uplearn_time_boost_ui_visible';
 
     let accumulatedExtraSeconds = 0;
@@ -99,6 +99,13 @@
         } catch { return true; }
     })();
 
+    let fsBlockEnabled = (() => {
+        try {
+            const v = localStorage.getItem(FS_BLOCK_KEY);
+            return v === null ? true : v === 'true';   // default ON = block
+        } catch { return true; }
+    })();
+
     let uiVisible = (() => {
         try {
             const v = localStorage.getItem(UI_VISIBLE_KEY);
@@ -106,16 +113,25 @@
         } catch { return true; }
     })();
 
-    let paintToggleUI     = null;
+    let paintUI = null;
     let applyUIVisibility = null;
 
     function setTimeBoost(enabled) {
         timeBoostEnabled = !!enabled;
         try { localStorage.setItem(TOGGLE_STORAGE_KEY, String(timeBoostEnabled)); } catch {}
-        if (typeof paintToggleUI === 'function') paintToggleUI();
+        if (typeof paintUI === 'function') paintUI();
         LOG('time-boost ' + (timeBoostEnabled ? 'ENABLED' : 'DISABLED') +
             '  (telemetry blocking remains ALWAYS ON)');
         return timeBoostEnabled;
+    }
+    function setFsBlock(enabled) {
+        fsBlockEnabled = !!enabled;
+        try { localStorage.setItem(FS_BLOCK_KEY, String(fsBlockEnabled)); } catch {}
+        if (typeof paintUI === 'function') paintUI();
+        LOG('fullscreen-block ' +
+            (fsBlockEnabled ? 'ENABLED (requestFullscreen will be swallowed)'
+                            : 'DISABLED (fullscreen requests allowed)'));
+        return fsBlockEnabled;
     }
     function setUIVisible(visible) {
         uiVisible = !!visible;
@@ -126,19 +142,62 @@
     }
 
     window.__ulTimeBoost = {
+        // time boost
         isEnabled:    () => timeBoostEnabled,
         enable:       () => setTimeBoost(true),
         disable:      () => setTimeBoost(false),
         toggle:       () => setTimeBoost(!timeBoostEnabled),
+        // fullscreen block
+        isFsBlocked:  () => fsBlockEnabled,
+        enableFsBlock:  () => setFsBlock(true),
+        disableFsBlock: () => setFsBlock(false),
+        toggleFsBlock:  () => setFsBlock(!fsBlockEnabled),
+        // UI visibility
         isUIVisible:  () => uiVisible,
         showUI:       () => setUIVisible(true),
         hideUI:       () => setUIVisible(false),
         toggleUI:     () => setUIVisible(!uiVisible),
+        // misc
         getAccumulated:   () => accumulatedExtraSeconds,
         resetAccumulated: () => { accumulatedExtraSeconds = 0; LOG('accumulator reset'); },
         stats,
     };
 
+    // ============================================================
+    // ─── FULLSCREEN BLOCK (TOGGLEABLE) ─────────────────────────
+    // ============================================================
+    // Patched at document-start so that no page script can capture
+    // the original method first. Any of the four standard/vendor
+    // names, on Element.prototype, gets intercepted.
+    //
+    // When blocking: we return a resolved Promise (matching the spec
+    // behaviour when fullscreen succeeds) rather than rejecting, so
+    // page code that does `await requestFullscreen()` doesn't throw.
+    function patchFullscreenMethod(proto, name) {
+        const orig = proto[name];
+        if (typeof orig !== 'function') return;
+        proto[name] = function (...args) {
+            if (fsBlockEnabled) {
+                stats.fsBlocked++;
+                LOG(`Blocked ${name}() on <${this.tagName ? this.tagName.toLowerCase() : '?'}> — fullscreen block is ON`);
+                return Promise.resolve();
+            }
+            return orig.apply(this, args);
+        };
+    }
+    try {
+        if (typeof Element !== 'undefined' && Element.prototype) {
+            patchFullscreenMethod(Element.prototype, 'requestFullscreen');
+            patchFullscreenMethod(Element.prototype, 'webkitRequestFullscreen');
+            patchFullscreenMethod(Element.prototype, 'mozRequestFullScreen');
+            patchFullscreenMethod(Element.prototype, 'msRequestFullscreen');
+            LOG('requestFullscreen + vendor prefixes patched');
+        }
+    } catch (e) { WARN('fullscreen patch failed', e); }
+
+    // ============================================================
+    // ─── TIME BOOST LOGIC ──────────────────────────────────────
+    // ============================================================
     function parseISODuration(str) {
         const m = /^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/.exec(str);
         if (!m) return null;
@@ -148,10 +207,8 @@
         return 'PT' + String(Math.round(totalSeconds * 1000) / 1000) + 'S';
     }
 
-    // Note: the very first line is the ONLY gate on the toggle.
-    // Telemetry blocking never reaches this function — it's handled above.
     function maybeBumpTimeSpent(body, source) {
-        if (!timeBoostEnabled)         return { body, changed: false };   // ← toggle check
+        if (!timeBoostEnabled)         return { body, changed: false };
         if (typeof body !== 'string')  return { body, changed: false };
 
         const hasQuiz  = body.includes(QUIZ_OP);
@@ -217,20 +274,17 @@
                     stats.apiPosts++;
                     let body = init && typeof init.body === 'string' ? init.body : null;
 
-                    // --- Request-object path ---
                     if (body == null && input instanceof Request) {
                         const ct = (input.headers.get('content-type') || '').toLowerCase();
                         if (ct.includes('application/json')) {
                             const self = this;
                             const passInit = init;
                             return input.clone().text().then((text) => {
-                                // ── TELEMETRY BLOCK: always, no toggle ──
                                 if (bodyLooksLikeLogImproperUse(text)) {
                                     LOG('LogImproperUse (Request body) — dropping [always-on]');
                                     stats.blocked++;
                                     return logImproperUseSyntheticResponse();
                                 }
-                                // ── TIME BOOST: gated inside ──
                                 const { body: newBody, changed } = maybeBumpTimeSpent(text, 'fetch-Req');
                                 const newReq = new Request(input, {
                                     body: changed ? newBody : text,
@@ -241,14 +295,12 @@
                         }
                     }
 
-                    // ── TELEMETRY BLOCK: always, no toggle ──
                     if (body != null && bodyLooksLikeLogImproperUse(body)) {
                         LOG('LogImproperUse — dropping [always-on]');
                         stats.blocked++;
                         return Promise.resolve(logImproperUseSyntheticResponse());
                     }
 
-                    // ── TIME BOOST: gated inside ──
                     if (body != null) {
                         const { body: newBody, changed } = maybeBumpTimeSpent(body, 'fetch');
                         if (changed) {
@@ -260,6 +312,7 @@
                 WARN('fetch interceptor error:', e);
             }
 
+            // Explicit init (strict-mode `arguments` is not aliased)
             return origFetch.call(this, input, init);
         };
     }
@@ -284,7 +337,6 @@
                 if (method === 'POST' && isTargetApi(this.__ul_url)) {
                     stats.apiPosts++;
 
-                    // ── TELEMETRY BLOCK: always, no toggle ──
                     if (bodyLooksLikeLogImproperUse(body)) {
                         LOG('xhr LogImproperUse — dropping [always-on]');
                         stats.blocked++;
@@ -310,7 +362,6 @@
                         return;
                     }
 
-                    // ── TIME BOOST: gated inside ──
                     if (typeof body === 'string') {
                         const { body: newBody, changed } = maybeBumpTimeSpent(body, 'xhr');
                         if (changed) body = newBody;
@@ -376,77 +427,133 @@
     }, 2000);
 
     // ============================================================
-    // UI PILL
+    // UI — two stacked pills
     // ============================================================
     function installToggleUI() {
         if (!document.body) { setTimeout(installToggleUI, 100); return; }
-        if (document.getElementById('__ul-time-boost-ui')) return;
+        if (document.getElementById('__ul-pill-container')) return;
 
-        // Two-row pill: top row is the toggle (time boost only),
-        // bottom row is a permanent telemetry status indicator.
-        const wrap = document.createElement('div');
-        wrap.id = '__ul-time-boost-ui';
-        Object.assign(wrap.style, {
+        const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
+        const shortcutLabel = isMac ? 'Right ⌘' : 'Right Ctrl';
+
+        const container = document.createElement('div');
+        container.id = '__ul-pill-container';
+        Object.assign(container.style, {
             position: 'fixed', right: '12px', bottom: '12px', zIndex: '2147483647',
+            display: 'flex', flexDirection: 'column', gap: '6px',
+            alignItems: 'flex-end',
             fontFamily: 'system-ui, -apple-system, sans-serif',
+        });
+
+        // ---------- Pill 1: Time Boost ----------
+        const pillBoost = document.createElement('div');
+        Object.assign(pillBoost.style, {
             fontSize: '12px', fontWeight: '600', lineHeight: '1.3',
             padding: '8px 12px', borderRadius: '12px',
             boxShadow: '0 2px 10px rgba(0,0,0,0.30)',
             cursor: 'pointer', userSelect: 'none',
             transition: 'background 0.15s, color 0.15s, transform 0.1s',
-            letterSpacing: '0.2px',
-            textAlign: 'center',
+            letterSpacing: '0.2px', textAlign: 'center',
         });
-        wrap.title = 'Click: toggle +' + EXTRA_SECONDS + 's time boost (telemetry blocking is always on) | Right Ctrl: hide/show';
+        pillBoost.title =
+            'Click: toggle +' + EXTRA_SECONDS + 's time boost (telemetry blocking is always on) | ' +
+            shortcutLabel + ': hide/show all pills';
 
-        const row1 = document.createElement('div');   // time-boost toggle
-        const row2 = document.createElement('div');   // always-on telemetry status
-        Object.assign(row2.style, {
-            marginTop: '3px',
-            fontSize: '10px',
-            fontWeight: '600',
-            opacity: '0.85',
-            letterSpacing: '0.3px',
+        const boostRow1 = document.createElement('div');
+        const boostRow2 = document.createElement('div');
+        Object.assign(boostRow2.style, {
+            marginTop: '3px', fontSize: '10px', fontWeight: '600',
+            opacity: '0.85', letterSpacing: '0.3px',
         });
-        wrap.appendChild(row1);
-        wrap.appendChild(row2);
+        pillBoost.appendChild(boostRow1);
+        pillBoost.appendChild(boostRow2);
 
-        const paint = () => {
-            // Row 1 — the toggle (time boost)
+        // ---------- Pill 2: Fullscreen Block ----------
+        const pillFS = document.createElement('div');
+        Object.assign(pillFS.style, {
+            fontSize: '12px', fontWeight: '600', lineHeight: '1.3',
+            padding: '8px 12px', borderRadius: '12px',
+            boxShadow: '0 2px 10px rgba(0,0,0,0.30)',
+            cursor: 'pointer', userSelect: 'none',
+            transition: 'background 0.15s, color 0.15s, transform 0.1s',
+            letterSpacing: '0.2px', textAlign: 'center',
+        });
+        pillFS.title =
+            'Click: toggle auto-fullscreen blocking. ' +
+            'When BLOCKED, requestFullscreen() calls from the page are swallowed.';
+
+        const fsRow1 = document.createElement('div');
+        const fsRow2 = document.createElement('div');
+        Object.assign(fsRow2.style, {
+            marginTop: '3px', fontSize: '10px', fontWeight: '600',
+            opacity: '0.85', letterSpacing: '0.3px',
+        });
+        pillFS.appendChild(fsRow1);
+        pillFS.appendChild(fsRow2);
+
+        // ---------- Paint ----------
+        paintUI = () => {
+            // Pill 1
             if (timeBoostEnabled) {
-                row1.textContent = `+${EXTRA_SECONDS}s  ON`;
-                wrap.style.background = '#16a34a';
-                wrap.style.color      = '#ffffff';
+                boostRow1.textContent = `+${EXTRA_SECONDS}s  ON`;
+                pillBoost.style.background = '#16a34a';
+                pillBoost.style.color      = '#ffffff';
             } else {
-                row1.textContent = `+${EXTRA_SECONDS}s  OFF`;
-                wrap.style.background = '#334155';
-                wrap.style.color      = '#cbd5e1';
+                boostRow1.textContent = `+${EXTRA_SECONDS}s  OFF`;
+                pillBoost.style.background = '#334155';
+                pillBoost.style.color      = '#cbd5e1';
             }
-            // Row 2 — always-on telemetry status (never changes)
-            row2.textContent =
+            boostRow2.textContent =
                 `🛡 telemetry always blocked  ·  drops:${stats.blocked}` +
-                (timeBoostEnabled ? `  ·  q:${stats.boosted}  pending:+${accumulatedExtraSeconds}s  grp:+${stats.groupExtra}s` : '');
-        };
-        paintToggleUI     = paint;
-        applyUIVisibility = () => { wrap.style.display = uiVisible ? 'block' : 'none'; };
+                (timeBoostEnabled
+                    ? `  ·  q:${stats.boosted}  pending:+${accumulatedExtraSeconds}s  grp:+${stats.groupExtra}s`
+                    : '');
 
-        wrap.addEventListener('click', (e) => {
+            // Pill 2
+            if (fsBlockEnabled) {
+                fsRow1.textContent = `Fullscreen: BLOCKED`;
+                pillFS.style.background = '#0369a1';    // blue for "active block"
+                pillFS.style.color      = '#ffffff';
+            } else {
+                fsRow1.textContent = `Fullscreen: ALLOWED`;
+                pillFS.style.background = '#334155';    // grey for "off"
+                pillFS.style.color      = '#cbd5e1';
+            }
+            fsRow2.textContent = `fs-blocked:${stats.fsBlocked}`;
+        };
+        applyUIVisibility = () => { container.style.display = uiVisible ? 'flex' : 'none'; };
+
+        // ---------- Events ----------
+        pillBoost.addEventListener('click', (e) => {
             e.preventDefault(); e.stopPropagation();
             setTimeBoost(!timeBoostEnabled);
         });
-        wrap.addEventListener('mouseenter', () => { wrap.style.transform = 'scale(1.05)'; });
-        wrap.addEventListener('mouseleave', () => { wrap.style.transform = 'scale(1)';   });
+        pillBoost.addEventListener('mouseenter', () => { pillBoost.style.transform = 'scale(1.05)'; });
+        pillBoost.addEventListener('mouseleave', () => { pillBoost.style.transform = 'scale(1)';   });
 
-        paint();
+        pillFS.addEventListener('click', (e) => {
+            e.preventDefault(); e.stopPropagation();
+            setFsBlock(!fsBlockEnabled);
+        });
+        pillFS.addEventListener('mouseenter', () => { pillFS.style.transform = 'scale(1.05)'; });
+        pillFS.addEventListener('mouseleave', () => { pillFS.style.transform = 'scale(1)';   });
+
+        container.appendChild(pillFS);
+        container.appendChild(pillBoost);
+        paintUI();
         applyUIVisibility();
-        document.body.appendChild(wrap);
-        setInterval(paint, 500);
+        document.body.appendChild(container);
+        setInterval(paintUI, 500);
 
-        LOG('Toggle UI installed | uiVisible:', uiVisible);
+        LOG('Toggle UI installed | timeBoost:', timeBoostEnabled,
+            '| fsBlock:', fsBlockEnabled, '| uiVisible:', uiVisible,
+            '| shortcut:', shortcutLabel);
     }
 
+    // ---- UI visibility shortcut: Right Ctrl (Win/Linux) OR Right Command (macOS) ----
+    const UI_TOGGLE_CODES = new Set(['ControlRight', 'MetaRight']);
     window.addEventListener('keydown', (e) => {
-        if (e.code === 'ControlRight' && !e.repeat) {
+        if (UI_TOGGLE_CODES.has(e.code) && !e.repeat) {
             setUIVisible(!uiVisible);
         }
     }, true);
@@ -458,6 +565,7 @@
     }
 
     LOG('=== READY — timeBoost:', timeBoostEnabled,
+        '| fsBlock:', fsBlockEnabled,
         '| UI visible:', uiVisible,
         '| telemetry blocking: ALWAYS ON ===');
 })();
