@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UpLearn Telemetry + Fullscreen + Tab-Switch Blocker
 // @namespace    https://github.com/local/uplearn-blocker
-// @version      1.1.0
+// @version      1.1.1
 // @description  Blocks telemetry, third-party trackers, auto-fullscreen, and tab-switch/blur detection across all userscript managers.
 // @author       you
 // @match        https://web.uplearn.co.uk/*
@@ -11,7 +11,6 @@
 // @noframes
 //
 // @webRequest   [{"selector":{"include":"://openreplay.uplearn.co.uk/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://jitsu.uplearn.co.uk/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://.ingest.us.sentry.io/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://static.cloudflareinsights.com/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://api-iam.intercom.io/"},"action":"cancel"}]
@@ -41,7 +40,7 @@
 
     const TELEMETRY_HOSTS = [
         'openreplay.uplearn.co.uk',
-        'jitsu.uplearn.co.uk',
+        // 'jitsu.uplearn.co.uk',   // <-- allowed through (unblocked)
         'ingest.us.sentry.io',
         'sentry.io',
         'static.cloudflareinsights.com',

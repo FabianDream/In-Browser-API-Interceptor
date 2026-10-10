@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UpLearn Telemetry Blocker & TimeSpent Booster
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
-// @version      3.3.0
-// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture; random-range time boost; dark mode; full control panel UI
+// @version      3.5.0
+// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; dark mode; full control panel UI
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
@@ -76,6 +76,7 @@
     const DEFAULT_SETTINGS = {
         telemetryPreset:           'harsh',
         telemetryServices:         buildDefaultTelemetryServices(),
+        suppressJitsu:             true,   // true = block Jitsu, false = allow + log
         blockLogImproperUse:       true,
         spoofVisibility:           true,
         blockWebSockets:           true,
@@ -134,6 +135,16 @@
                         if (!(k in parsed.telemetryServices)) parsed.telemetryServices[k] = true;
                     }
                 }
+                // Migration: old allowJitsu (true = allow) → new suppressJitsu (true = block)
+                if (typeof parsed.suppressJitsu !== 'boolean') {
+                    if (typeof parsed.allowJitsu === 'boolean') {
+                        parsed.suppressJitsu = !parsed.allowJitsu;
+                    } else {
+                        parsed.suppressJitsu = DEFAULT_SETTINGS.suppressJitsu;
+                    }
+                }
+                delete parsed.allowJitsu;
+
                 Object.assign(s, parsed);
             } else {
                 const b = localStorage.getItem(LEGACY_BOOST_KEY);
@@ -207,6 +218,7 @@
         block:      'color:#f87171;font-weight:bold',
         improper:   'color:#f472b6;font-weight:bold',
         service:    'color:#fbbf24;font-weight:bold',
+        jitsu:      'color:#22d3ee;font-weight:bold',
         url:        'color:#e2e8f0',
         muted:      'color:#94a3b8',
         dim:        'color:#64748b',
@@ -233,18 +245,42 @@
     // ============================================================
     const API_HOST    = 'web.uplearn.co.uk';
     const API_PATH_RE = /\/api\/?$/;
+    const JITSU_HOSTS = TELEMETRY_SERVICES.jitsu.hosts;
 
     function hostOf(url) {
         try { return new URL(url, location.href).hostname.toLowerCase(); }
         catch { return ''; }
     }
 
+    function isJitsuHost(h) {
+        if (!h) return false;
+        for (let i = 0; i < JITSU_HOSTS.length; i++) {
+            const t = JITSU_HOSTS[i];
+            if (h === t || h.endsWith('.' + t) || h.includes(t)) return true;
+        }
+        return false;
+    }
+
+    function isJitsuUrl(url) {
+        if (!url) return false;
+        return isJitsuHost(hostOf(url));
+    }
+
     function matchTelemetryService(url) {
         if (!url) return null;
         const h = hostOf(url);
         if (!h) return null;
+
+        // Jitsu is controlled by its own dedicated toggle (settings.suppressJitsu),
+        // independent of presets and the per-service checkbox.
+        if (isJitsuHost(h)) {
+            if (!settings.suppressJitsu) return null;
+            return { key: 'jitsu', label: 'Jitsu', host: h, pattern: JITSU_HOSTS[0] };
+        }
+
         const enabled = settings.telemetryServices || {};
         for (const key in TELEMETRY_SERVICES) {
+            if (key === 'jitsu') continue;
             if (!enabled[key]) continue;
             const hosts = TELEMETRY_SERVICES[key].hosts;
             for (let i = 0; i < hosts.length; i++) {
@@ -283,41 +319,24 @@
     }
 
     // ============================================================
-    // STATS (declared here so the console filter can increment)
+    // STATS
     // ============================================================
     const stats = {
         apiPosts: 0, seen: 0, boosted: 0, blocked: 0,
         groupExtra: 0, fullscreenBlocked: 0, consoleSuppressed: 0,
-        logImproperUseBlocked: 0,
+        logImproperUseBlocked: 0, jitsuPackets: 0,
     };
 
     // ============================================================
     // CONSOLE NOISE FILTER
     // ============================================================
-    // Two sources of noise from the site's own libraries:
-    //   1. Jitsu: "[J-ERROR] Dropping queued event after 4 attempts…",
-    //             "Failed to send data to https://jitsu.uplearn.co.uk/…"
-    //   2. Apollo Client: yellow warning referencing go.apollo.dev/c/err
-    //             triggered by our synthetic 204 responses on blocked
-    //             telemetry endpoints.
-    // Both are console.error / console.warn calls we can intercept.
-    //
-    // NOTE: DevTools-native network error lines ("POST https://…  net::
-    // ERR_BLOCKED_BY_CLIENT") are rendered by Chrome itself and CANNOT
-    // be suppressed from JavaScript. They usually mean a browser
-    // extension or Chrome's tracking protection is also blocking the
-    // request (or a stale @webRequest rule from an older script version).
-    // ============================================================
     const NOISE_PATTERNS = [
-        // Jitsu internal logging
         /\[J-(?:ERROR|WARN|DEBUG|INFO|LOG)\]/i,
         /\[Jitsu\]/i,
         /Failed to send data to/i,
         /Dropping queued event after/i,
         /max send attempts/i,
-        // Apollo Client complaining about blocked/synthetic responses
         /go\.apollo\.dev\/c\/err/i,
-        // Sentry SDK self-logging (e.g. "[Sentry] …")
         /\[Sentry\]/i,
     ];
 
@@ -331,12 +350,22 @@
 
     function textMatchesNoise(text) {
         if (typeof text !== 'string' || !text) return false;
+        // If Jitsu is being ALLOWED (suppressJitsu === false), don't silence its own
+        // log lines — the user asked to see what it's doing.
+        const showJitsuNoise = !settings.suppressJitsu;
         for (let i = 0; i < NOISE_PATTERNS.length; i++) {
-            if (NOISE_PATTERNS[i].test(text)) return true;
+            if (NOISE_PATTERNS[i].test(text)) {
+                if (showJitsuNoise && i < 5) continue; // first 5 patterns are Jitsu-specific
+                return true;
+            }
         }
         const lower = text.toLowerCase();
         for (let i = 0; i < ALL_TELEMETRY_HOSTS.length; i++) {
-            if (lower.indexOf(ALL_TELEMETRY_HOSTS[i]) !== -1) return true;
+            const h = ALL_TELEMETRY_HOSTS[i];
+            if (lower.indexOf(h) !== -1) {
+                if (showJitsuNoise && isJitsuHost(h)) continue;
+                return true;
+            }
         }
         return false;
     }
@@ -375,7 +404,7 @@
     installConsoleNoiseFilter();
 
     // ============================================================
-    // BLOCK / ALLOW REPORTERS
+    // REPORTING
     // ============================================================
     function truncateBody(b, max) {
         if (b == null) return null;
@@ -424,6 +453,34 @@
             }
             nativeConsole.log(...args);
         }
+    }
+
+    // Dedicated reporter for Jitsu packets so the user can inspect exactly what
+    // the UpLearn tracker is trying to send (allowed OR blocked).
+    function reportJitsuPacket(source, url, body) {
+        if (settings.logLevel === 'silent') return;
+        const host = hostOf(url);
+        const preview = truncateBody(body, settings.logLevel === 'verbose' ? 6000 : 2000);
+
+        nativeConsole.groupCollapsed(
+            `%c📡 JITSU PACKET%c · ${source}%c · ${host}`,
+            CSS.jitsu, CSS.url, CSS.muted
+        );
+        nativeConsole.log('%cURL:     ', CSS.muted, url);
+        nativeConsole.log('%cSource:  ', CSS.muted, source);
+        nativeConsole.log('%cSuppress:', CSS.muted, settings.suppressJitsu ? 'ON (request will be blocked)' : 'OFF (request passes through)');
+        if (preview) {
+            nativeConsole.log('%cPayload: ', CSS.body, preview);
+            // Try to pretty-print JSON for readability
+            try {
+                const parsed = JSON.parse(body);
+                nativeConsole.log('%cParsed:  ', CSS.body, parsed);
+            } catch {}
+        } else {
+            nativeConsole.log('%cPayload: ', CSS.muted, '(no body captured)');
+        }
+        nativeConsole.log('%cTime:    ', CSS.muted, new Date().toLocaleTimeString());
+        nativeConsole.groupEnd();
     }
 
     // Dedicated reporter for LogImproperUse so it stands out from generic
@@ -497,9 +554,10 @@
         nativeConsole.log('%cTelemetry:       ', CSS.muted, settings.telemetryPreset);
         nativeConsole.log('%cServices on:     ', CSS.muted,
             Object.keys(TELEMETRY_SERVICES)
-                .filter((k) => settings.telemetryServices[k])
+                .filter((k) => k !== 'jitsu' && settings.telemetryServices[k])
                 .map((k) => TELEMETRY_SERVICES[k].label)
                 .join(', ') || '(none)');
+        nativeConsole.log('%cSuppress Jitsu:  ', CSS.muted, settings.suppressJitsu ? 'YES (blocked + logged)' : 'no (allowed + logged)');
         nativeConsole.log('%cLogImproperUse:  ', CSS.muted, settings.blockLogImproperUse);
         nativeConsole.log('%cDOM inject:      ', CSS.muted, settings.blockDomElements);
         nativeConsole.log('%cWebSockets:      ', CSS.muted, settings.blockWebSockets);
@@ -530,6 +588,8 @@
                         const m = matchAnyTelemetryService(val);
                         if (m && !settings.telemetryServices[m.key]) {
                             reportAllow(`<${tag}>.src`, val, `service "${m.label}" disabled`);
+                        } else if (m && m.key === 'jitsu' && !settings.suppressJitsu) {
+                            reportAllow(`<${tag}>.src`, val, `service "${m.label}" not suppressed`);
                         }
                     }
                     return desc.set.call(this, val);
@@ -805,23 +865,61 @@
     const origFetch = window.fetch;
     if (origFetch) {
         window.fetch = function (input, init) {
+            const self = this;
             try {
                 const url = typeof input === 'string' ? input
                           : (input && input.url) ? input.url
                           : String(input);
                 const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
 
-                // Telemetry URL hard block
+                // ---- Telemetry block ----
                 if (isTelemetryUrl(url)) {
-                    const bodyForReport = init && typeof init.body === 'string' ? init.body : null;
-                    reportBlock('fetch', url, { method, body: bodyForReport });
                     stats.blocked++;
-                    // 200 with empty body avoids triggering library retry logic
-                    // that a 204 does (e.g. Apollo treating 204 as an error).
-                    return Promise.resolve(new Response('', {
-                        status: 200, statusText: 'OK',
-                        headers: { 'Content-Type': 'application/json' },
-                    }));
+                    const m = matchTelemetryService(url);
+                    const isJitsu = m && m.key === 'jitsu';
+
+                    const doBlock = (capturedBody) => {
+                        if (isJitsu) {
+                            stats.jitsuPackets++;
+                            reportJitsuPacket('fetch · BLOCKED', url, capturedBody);
+                        } else {
+                            reportBlock('fetch', url, { method, body: capturedBody });
+                        }
+                        return new Response('', {
+                            status: 200, statusText: 'OK',
+                            headers: { 'Content-Type': 'application/json' },
+                        });
+                    };
+
+                    let bodyStr = init && typeof init.body === 'string' ? init.body : null;
+                    if (bodyStr == null && input instanceof Request) {
+                        try {
+                            const ct = (input.headers.get('content-type') || '').toLowerCase();
+                            if (ct.includes('application/json') || ct.includes('text/')) {
+                                return input.clone().text().then(doBlock);
+                            }
+                        } catch {}
+                    }
+                    return Promise.resolve(doBlock(bodyStr));
+                }
+
+                // ---- Jitsu allowed: log the packet, then pass through ----
+                if (isJitsuUrl(url)) {
+                    stats.jitsuPackets++;
+                    const doLogAndPass = (capturedBody) => {
+                        reportJitsuPacket('fetch', url, capturedBody);
+                        return origFetch.call(self, input, init);
+                    };
+                    let bodyStr = init && typeof init.body === 'string' ? init.body : null;
+                    if (bodyStr == null && input instanceof Request) {
+                        try {
+                            const ct = (input.headers.get('content-type') || '').toLowerCase();
+                            if (ct.includes('application/json') || ct.includes('text/')) {
+                                return input.clone().text().then(doLogAndPass);
+                            }
+                        } catch {}
+                    }
+                    return doLogAndPass(bodyStr);
                 }
 
                 if (settings.logLevel === 'verbose') {
@@ -838,7 +936,6 @@
                     if (body == null && input instanceof Request) {
                         const ct = (input.headers.get('content-type') || '').toLowerCase();
                         if (ct.includes('application/json')) {
-                            const self = this;
                             const passInit = init;
                             return input.clone().text().then((text) => {
                                 if (settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(text)) {
@@ -873,7 +970,7 @@
                 WARN('fetch interceptor error:', e);
             }
 
-            return origFetch.call(this, input, init);
+            return origFetch.call(self, input, init);
         };
         VLOG('fetch hook installed');
     }
@@ -896,6 +993,7 @@
             try {
                 const method = (this.__ul_method || '').toUpperCase();
 
+                // ---- Telemetry block ----
                 if (isTelemetryUrl(this.__ul_url)) {
                     let bodyStr = null;
                     try {
@@ -906,7 +1004,14 @@
                             bodyStr = `(${typeof body} body)`;
                         }
                     } catch {}
-                    reportBlock('XHR', this.__ul_url, { method, body: bodyStr });
+                    const m = matchTelemetryService(this.__ul_url);
+                    const isJitsu = m && m.key === 'jitsu';
+                    if (isJitsu) {
+                        stats.jitsuPackets++;
+                        reportJitsuPacket('XHR · BLOCKED', this.__ul_url, bodyStr);
+                    } else {
+                        reportBlock('XHR', this.__ul_url, { method, body: bodyStr });
+                    }
                     stats.blocked++;
                     const self = this;
                     Object.defineProperty(self, 'readyState',   { value: 4, configurable: true });
@@ -925,6 +1030,18 @@
                         } catch {}
                     }, 0);
                     return;
+                }
+
+                // ---- Jitsu allowed: log packet, then pass through ----
+                if (isJitsuUrl(this.__ul_url)) {
+                    stats.jitsuPackets++;
+                    let bodyStr = null;
+                    try {
+                        if (typeof body === 'string') bodyStr = body;
+                        else if (body != null) bodyStr = `(${body.constructor ? body.constructor.name : typeof body} body)`;
+                    } catch {}
+                    reportJitsuPacket('XHR', this.__ul_url, bodyStr);
+                    // fall through to origSend
                 }
 
                 if (settings.logLevel === 'verbose') {
@@ -991,10 +1108,31 @@
                         else if (data instanceof ArrayBuffer) bodyStr = `(ArrayBuffer · ${data.byteLength} bytes)`;
                         else if (data != null) bodyStr = `(${typeof data} body)`;
                     } catch {}
-                    reportBlock('sendBeacon', String(url), { body: bodyStr });
+                    const m = matchTelemetryService(url);
+                    const isJitsu = m && m.key === 'jitsu';
+                    if (isJitsu) {
+                        stats.jitsuPackets++;
+                        reportJitsuPacket('sendBeacon · BLOCKED', String(url), bodyStr);
+                    } else {
+                        reportBlock('sendBeacon', String(url), { body: bodyStr });
+                    }
                     stats.blocked++;
                     return true;
                 }
+
+                if (isJitsuUrl(url)) {
+                    stats.jitsuPackets++;
+                    let bodyStr = null;
+                    try {
+                        if (typeof data === 'string') bodyStr = data;
+                        else if (data instanceof Blob) bodyStr = `(Blob · ${data.size} bytes)`;
+                        else if (data instanceof ArrayBuffer) bodyStr = `(ArrayBuffer · ${data.byteLength} bytes)`;
+                        else if (data != null) bodyStr = `(${typeof data} body)`;
+                    } catch {}
+                    reportJitsuPacket('sendBeacon', String(url), bodyStr);
+                    // fall through
+                }
+
                 if (settings.logLevel === 'verbose') {
                     const m = matchAnyTelemetryService(url);
                     if (m && !settings.telemetryServices[m.key]) {
@@ -1698,8 +1836,15 @@
             input.type = 'checkbox';
             input.dataset.service = key;
             input.checked = !!settings.telemetryServices[key];
+            // Jitsu is controlled by its own dedicated toggle — mark the checkbox disabled.
+            if (key === 'jitsu') {
+                input.disabled = true;
+                input.title = 'Controlled by "Suppress Jitsu telemetry" above';
+                label.title = input.title;
+            }
 
             input.addEventListener('change', () => {
+                if (key === 'jitsu') return;
                 settings.telemetryServices[key] = input.checked;
                 if (!applyingPreset) settings.telemetryPreset = 'custom';
                 saveSettings();
@@ -1711,7 +1856,7 @@
             });
 
             const span = document.createElement('span');
-            span.textContent = svc.label;
+            span.textContent = svc.label + (key === 'jitsu' ? '  (see toggle above)' : '');
 
             label.appendChild(input);
             label.appendChild(span);
@@ -1750,6 +1895,7 @@
         set('groupExtra', stats.groupExtra + 's');
         set('fullscreenBlocked', stats.fullscreenBlocked);
         set('consoleSuppressed', stats.consoleSuppressed);
+        set('jitsuPackets', stats.jitsuPackets);
     }
 
     function applySettingChange(key, value) {
@@ -1764,7 +1910,8 @@
             saveSettings();
             LOG('telemetry preset:', value);
             VLOG('preset expanded to:', {
-                services: Object.keys(TELEMETRY_SERVICES).filter((k) => settings.telemetryServices[k]),
+                services: Object.keys(TELEMETRY_SERVICES).filter((k) => k !== 'jitsu' && settings.telemetryServices[k]),
+                suppressJitsu:        settings.suppressJitsu,
                 blockLogImproperUse: settings.blockLogImproperUse,
                 blockDomElements:    settings.blockDomElements,
                 blockWebSockets:     settings.blockWebSockets,
@@ -1808,6 +1955,9 @@
             case 'extraSecondsMax':
                 updateRangeLabels();
                 if (pillPaint) pillPaint();
+                break;
+            case 'suppressJitsu':
+                LOG('Jitsu telemetry ' + (value ? 'SUPPRESSED (blocked + logged)' : 'ALLOWED (passed through + logged)'));
                 break;
             case 'disableAutoFullscreen':
                 LOG('auto-fullscreen blocking ' + (value ? 'ENABLED' : 'DISABLED'));
@@ -1906,6 +2056,12 @@
                                 <small>Silences <code>[J-ERROR]</code>, Jitsu "Failed to send data", Apollo <code>go.apollo.dev/c/err</code> warnings, and any message mentioning a blocked host. DevTools network-tab errors cannot be suppressed.</small>
                             </label>
                             <input type="checkbox" id="ul-set-suppressConsoleNoise" data-setting="suppressConsoleNoise">
+                        </div>
+                        <div class="ul-row">
+                            <label for="ul-set-suppressJitsu">Suppress Jitsu telemetry
+                                <small><strong>Checked:</strong> requests to <code>jitsu.uplearn.co.uk</code> are blocked (No progress analytics are sent). <strong>Unchecked:</strong> they pass through and every packet is logged to the console so you can inspect exactly what is being sent.</small>
+                            </label>
+                            <input type="checkbox" id="ul-set-suppressJitsu" data-setting="suppressJitsu">
                         </div>
 
                         <details class="ul-details">
@@ -2034,6 +2190,7 @@
                             <div class="ul-stat"><div class="ul-stat-label">Group bonus</div><div class="ul-stat-value" data-stat="groupExtra">0s</div></div>
                             <div class="ul-stat"><div class="ul-stat-label">FS Blocked</div><div class="ul-stat-value" data-stat="fullscreenBlocked">0</div></div>
                             <div class="ul-stat"><div class="ul-stat-label">Console muted</div><div class="ul-stat-value" data-stat="consoleSuppressed">0</div></div>
+                            <div class="ul-stat"><div class="ul-stat-label">Jitsu packets</div><div class="ul-stat-value" data-stat="jitsuPackets">0</div></div>
                         </div>
                         <div style="margin-top:10px;">
                             <button class="ul-btn ul-btn-secondary" data-action="reset-stats">Reset stats</button>
@@ -2119,6 +2276,7 @@
                     stats.apiPosts = 0; stats.seen = 0; stats.boosted = 0;
                     stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
                     stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
+                    stats.jitsuPackets = 0;
                     accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
                     updateModalStats();
                     if (pillPaint) pillPaint();
@@ -2207,11 +2365,13 @@
         toggleDarkMode: () => { applySettingChange('darkMode', !settings.darkMode); },
         setTelemetryPreset: (p) => { applySettingChange('telemetryPreset', p); },
         setLogLevel: (lvl) => { applySettingChange('logLevel', lvl); },
+        setSuppressJitsu: (v) => { applySettingChange('suppressJitsu', !!v); },
         telemetryServices: TELEMETRY_SERVICES,
         resetStats: () => {
             stats.apiPosts = 0; stats.seen = 0; stats.boosted = 0;
             stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
             stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
+            stats.jitsuPackets = 0;
             accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
         },
         getAccumulated: () => accumulatedExtraSeconds,
@@ -2226,11 +2386,15 @@
         '| auto-fullscreen blocked:', settings.disableAutoFullscreen ? 'ON' : 'OFF',
         '| dark mode:', settings.darkMode ? 'ON' : 'OFF',
         '| telemetry preset:', settings.telemetryPreset,
+        '| suppress jitsu:', settings.suppressJitsu ? 'YES' : 'no',
         '===');
     if (settings.logLevel === 'verbose') {
         nativeConsole.groupCollapsed('%c[UL · verbose] 🟢 Ready — active blockers', CSS.verbose);
-        const anyServiceOn = Object.keys(TELEMETRY_SERVICES).some((k) => settings.telemetryServices[k]);
+        const anyServiceOn = Object.keys(TELEMETRY_SERVICES).some(
+            (k) => k !== 'jitsu' && settings.telemetryServices[k]
+        );
         nativeConsole.log('%cThird-party services:   ', CSS.muted, anyServiceOn ? 'ON' : 'OFF');
+        nativeConsole.log('%cSuppress Jitsu:         ', CSS.muted, settings.suppressJitsu ? 'YES (blocked + logged)' : 'no (allowed + logged)');
         nativeConsole.log('%cLogImproperUse:         ', CSS.muted, settings.blockLogImproperUse ? 'ON' : 'OFF');
         nativeConsole.log('%cDOM injection:          ', CSS.muted, settings.blockDomElements ? 'ON' : 'OFF');
         nativeConsole.log('%cWebSockets:             ', CSS.muted, settings.blockWebSockets ? 'ON' : 'OFF');
