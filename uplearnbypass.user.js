@@ -9,6 +9,9 @@
 // @grant        none
 // @inject-into  page
 // @noframes
+// @require      https://unpkg.com/react@18.3.1/umd/react.production.min.js
+// @require      https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js
+// @require      https://unpkg.com/htm@3.1.1/dist/htm.umd.js
 // ==/UserScript==
 
 (function () {
@@ -92,6 +95,7 @@
         pillPosition:              'bottom-right',
         pillOpacity:               1,
         showStats:                 true,
+        pillMode:                  'minimal',
         theme:                     'dark',
         accentColor:               '#16a34a',
         logLevel:                  'normal',
@@ -156,6 +160,7 @@
 
         s.telemetryServices = Object.assign({}, s.telemetryServices);
         normalizeRange(s);
+        s.pillMode = s.pillMode || 'minimal';
         s.uiToggleKeybind = normalizeKeybind(s.uiToggleKeybind);
         return s;
     }
@@ -1381,521 +1386,1723 @@
     }
 
     // ============================================================
-    // STYLES
+    // HEROUI v3 DESIGN SYSTEM & UI COMPONENTS
     // ============================================================
-    function ensureStyles() {
-        if (document.getElementById('__ul-styles')) return;
-        const style = document.createElement('style');
-        style.id = '__ul-styles';
-        style.textContent = `
-            #__ul-pill {
-                position: fixed; z-index: 2147483646;
-                font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-                font-size: 12px; font-weight: 600; line-height: 1.3;
-                border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.35);
-                user-select: none; display: flex; align-items: stretch; overflow: hidden;
-                transition: transform 0.12s ease, opacity 0.15s ease;
-                letter-spacing: 0.2px; border: 1px solid rgba(255,255,255,0.08);
-            }
-            #__ul-pill .ul-pill-main {
-                padding: 8px 12px; cursor: pointer; text-align: center;
-                transition: background 0.15s, color 0.15s;
-                display: flex; flex-direction: column; justify-content: center; gap: 2px;
-            }
-            #__ul-pill .ul-pill-main:hover { filter: brightness(1.08); }
-            #__ul-pill .ul-pill-row1 { font-weight: 700; }
-            #__ul-pill .ul-pill-row2 { font-size: 10px; font-weight: 600; opacity: 0.88; letter-spacing: 0.3px; }
-            #__ul-pill .ul-pill-gear {
-                display: flex; align-items: center; justify-content: center;
-                padding: 0 10px; cursor: pointer; background: rgba(0,0,0,0.22);
-                color: inherit; font-size: 14px; transition: background 0.15s;
-                border: none; font-family: inherit;
-            }
-            #__ul-pill .ul-pill-gear:hover { background: rgba(0,0,0,0.4); }
+    let uiHostEl = null;
+    let uiShadowRoot = null;
+    let uiContainerEl = null;
+    let reactRootInstance = null;
+    let capturingKeybind = false;
+    let isModalOpenGlobal = false;
+    let reactSetSettings = null;
+    let reactSetStats = null;
+    let reactSetModalOpen = null;
+    let reactSetCapturingKeybind = null;
 
-            #__ul-settings-overlay {
-                position: fixed; inset: 0; z-index: 2147483647;
-                background: rgba(0,0,0,0.55);
-                backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
-                display: flex; align-items: center; justify-content: center;
-                font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-                animation: ul-fade-in 0.15s ease-out;
-            }
-            @keyframes ul-fade-in { from { opacity: 0; } to { opacity: 1; } }
-            .ul-modal {
-                --ul-bg: #0f172a; --ul-fg: #e2e8f0; --ul-muted: #94a3b8;
-                --ul-border: rgba(148, 163, 184, 0.18); --ul-card: #1e293b;
-                --ul-input-bg: #0b1220; --ul-accent: #16a34a; --ul-danger: #dc2626;
-                width: min(760px, 94vw); max-height: 88vh;
-                background: var(--ul-bg); color: var(--ul-fg);
-                border-radius: 16px; border: 1px solid var(--ul-border);
-                box-shadow: 0 24px 80px rgba(0,0,0,0.6);
-                display: flex; flex-direction: column; overflow: hidden;
-                animation: ul-pop 0.18s ease-out;
-            }
-            @keyframes ul-pop { from { transform: scale(0.96); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-            .ul-modal[data-theme="light"] {
-                --ul-bg: #ffffff; --ul-fg: #0f172a; --ul-muted: #64748b;
-                --ul-border: rgba(15, 23, 42, 0.12); --ul-card: #f1f5f9; --ul-input-bg: #ffffff;
-            }
-            .ul-modal .ul-header {
-                display: flex; align-items: center; justify-content: space-between;
-                padding: 16px 22px; border-bottom: 1px solid var(--ul-border);
-                background: var(--ul-card); flex-shrink: 0;
-            }
-            .ul-modal .ul-title { display: flex; align-items: center; gap: 10px; }
-            .ul-modal .ul-title h2 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: 0.2px; }
-            .ul-modal .ul-logo { font-size: 20px; }
-            .ul-modal .ul-close {
-                background: transparent; border: none; color: var(--ul-muted);
-                font-size: 20px; cursor: pointer; line-height: 1;
-                padding: 4px 10px; border-radius: 8px;
-                transition: background 0.15s, color 0.15s; font-family: inherit;
-            }
-            .ul-modal .ul-close:hover { background: rgba(148,163,184,0.18); color: var(--ul-fg); }
-            .ul-modal .ul-body {
-                padding: 4px 22px 20px; overflow-y: auto; flex: 1;
-                scrollbar-width: thin; scrollbar-color: var(--ul-border) transparent;
-            }
-            .ul-modal .ul-body::-webkit-scrollbar { width: 8px; }
-            .ul-modal .ul-body::-webkit-scrollbar-thumb { background: var(--ul-border); border-radius: 4px; }
-            .ul-modal .ul-section { margin-top: 20px; }
-            .ul-modal .ul-section h3 {
-                margin: 0 0 4px 0; font-size: 12px; font-weight: 700;
-                text-transform: uppercase; letter-spacing: 0.9px; color: var(--ul-muted);
-            }
-            .ul-modal .ul-desc { margin: 0 0 10px 0; font-size: 12px; color: var(--ul-muted); }
-            .ul-modal .ul-row {
-                display: flex; align-items: center; justify-content: space-between;
-                gap: 16px; padding: 10px 14px; border-radius: 10px;
-                background: var(--ul-card); margin-bottom: 6px;
-                border: 1px solid transparent; transition: border-color 0.15s;
-            }
-            .ul-modal .ul-row:hover { border-color: var(--ul-border); }
-            .ul-modal .ul-row > label { flex: 1; font-size: 13px; cursor: pointer; display: flex; flex-direction: column; }
-            .ul-modal .ul-row > label small { display: block; color: var(--ul-muted); font-size: 11px; margin-top: 2px; font-weight: 400; }
-            .ul-modal input[type="checkbox"] {
-                appearance: none; -webkit-appearance: none;
-                width: 40px; height: 22px; border-radius: 22px;
-                background: #475569; position: relative; cursor: pointer;
-                transition: background 0.15s; flex-shrink: 0; margin: 0;
-            }
-            .ul-modal input[type="checkbox"]::after {
-                content: ''; position: absolute; top: 2px; left: 2px;
-                width: 18px; height: 18px; border-radius: 50%;
-                background: white; transition: transform 0.15s;
-                box-shadow: 0 1px 3px rgba(0,0,0,0.3);
-            }
-            .ul-modal input[type="checkbox"]:checked { background: var(--ul-accent); }
-            .ul-modal input[type="checkbox"]:checked::after { transform: translateX(18px); }
-            .ul-modal input[type="number"], .ul-modal select {
-                background: var(--ul-input-bg); color: var(--ul-fg);
-                border: 1px solid var(--ul-border); border-radius: 8px;
-                padding: 6px 10px; font-size: 13px; font-family: inherit;
-                min-width: 120px; cursor: pointer;
-            }
-            .ul-modal input[type="number"] { cursor: text; }
-            .ul-modal input[type="number"]:focus, .ul-modal select:focus {
-                outline: 2px solid var(--ul-accent); outline-offset: 0;
-            }
-            .ul-modal input[type="number"]::-webkit-outer-spin-button,
-            .ul-modal input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; appearance: none; margin: 0; }
-            .ul-modal input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
-            .ul-modal input[type="number"].ul-num-sm {
-                min-width: 0; width: 74px; text-align: center;
-                font-variant-numeric: tabular-nums; font-weight: 600;
-            }
-            .ul-modal input[type="color"] {
-                width: 44px; height: 30px; border: 1px solid var(--ul-border);
-                border-radius: 8px; background: transparent; cursor: pointer; padding: 2px;
-            }
-            .ul-modal input[type="range"] { width: 180px; accent-color: var(--ul-accent); cursor: pointer; margin: 0; }
-            .ul-modal .ul-val { min-width: 52px; text-align: right; font-weight: 700; font-size: 13px; font-variant-numeric: tabular-nums; }
-            .ul-modal .ul-range-group { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-            .ul-modal .ul-range-sep { color: var(--ul-muted); font-size: 12px; font-weight: 600; }
-            .ul-modal .ul-range-unit { color: var(--ul-muted); font-size: 12px; font-weight: 600; }
-            .ul-modal .ul-hint {
-                display: block; font-size: 11px; color: var(--ul-muted);
-                margin-top: 4px; text-align: right; font-weight: 500;
-            }
-            .ul-modal .ul-keybind-group { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-            .ul-modal .ul-keybind-btn {
-                background: var(--ul-input-bg); color: var(--ul-fg);
-                border: 1px solid var(--ul-border); border-radius: 8px;
-                padding: 6px 14px; font-size: 13px; font-family: inherit;
-                font-weight: 600; cursor: pointer; min-width: 118px;
-                text-align: center; transition: background 0.15s, border-color 0.15s, color 0.15s;
-            }
-            .ul-modal .ul-keybind-btn:hover { background: rgba(148,163,184,0.14); }
-            .ul-modal .ul-keybind-btn.ul-capturing {
-                background: var(--ul-accent); color: #ffffff;
-                border-color: transparent; animation: ul-pulse 1.2s ease-in-out infinite;
-            }
-            @keyframes ul-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
-            .ul-modal .ul-keybind-clear {
-                background: transparent; color: var(--ul-muted);
-                border: 1px solid var(--ul-border); border-radius: 8px;
-                padding: 6px 10px; cursor: pointer; font-family: inherit;
-                font-size: 12px; font-weight: 600; line-height: 1;
-                transition: background 0.15s, color 0.15s, border-color 0.15s;
-            }
-            .ul-modal .ul-keybind-clear:hover {
-                background: rgba(220,38,38,0.12); color: var(--ul-danger);
-                border-color: var(--ul-danger);
-            }
-            .ul-modal .ul-footer {
-                display: flex; align-items: center; gap: 10px;
-                padding: 14px 22px; border-top: 1px solid var(--ul-border);
-                background: var(--ul-card); flex-shrink: 0;
-            }
-            .ul-modal .ul-spacer { flex: 1; }
-            .ul-modal .ul-btn {
-                background: var(--ul-accent); color: #ffffff;
-                border: 1px solid transparent; border-radius: 8px;
-                padding: 8px 18px; font-size: 13px; font-weight: 600;
-                cursor: pointer; font-family: inherit;
-                transition: filter 0.15s, background 0.15s, border-color 0.15s;
-            }
-            .ul-modal .ul-btn:hover { filter: brightness(1.1); }
-            .ul-modal .ul-btn-secondary { background: transparent; color: var(--ul-fg); border: 1px solid var(--ul-border); }
-            .ul-modal .ul-btn-secondary:hover { background: rgba(148,163,184,0.12); }
-            .ul-modal .ul-btn-danger { background: transparent; color: var(--ul-danger); border: 1px solid var(--ul-danger); }
-            .ul-modal .ul-btn-danger:hover { background: rgba(220,38,38,0.12); }
-            .ul-modal .ul-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
-            .ul-modal .ul-stat {
-                background: var(--ul-card); border-radius: 10px; padding: 10px 12px;
-                border: 1px solid var(--ul-border);
-            }
-            .ul-modal .ul-stat-label {
-                font-size: 10px; color: var(--ul-muted);
-                text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600;
-            }
-            .ul-modal .ul-stat-value {
-                font-size: 18px; font-weight: 700; margin-top: 3px;
-                font-variant-numeric: tabular-nums;
-            }
-            .ul-modal .ul-details {
-                margin-top: 8px; border: 1px solid var(--ul-border);
-                border-radius: 10px; background: var(--ul-card); overflow: hidden;
-            }
-            .ul-modal .ul-details > summary {
-                padding: 10px 14px; cursor: pointer; font-size: 13px;
-                font-weight: 600; user-select: none; list-style: none;
-                display: flex; align-items: center; gap: 8px; color: var(--ul-fg);
-            }
-            .ul-modal .ul-details > summary::-webkit-details-marker { display: none; }
-            .ul-modal .ul-details > summary::before {
-                content: '▸'; color: var(--ul-muted);
-                transition: transform 0.15s; display: inline-block; font-size: 11px;
-            }
-            .ul-modal .ul-details[open] > summary::before { transform: rotate(90deg); }
-            .ul-modal .ul-details > summary .ul-count {
-                margin-left: auto; font-size: 11px; font-weight: 600;
-                color: var(--ul-muted); background: rgba(148,163,184,0.14);
-                padding: 2px 8px; border-radius: 10px; font-variant-numeric: tabular-nums;
-            }
-            .ul-modal .ul-services-list {
-                display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-                gap: 2px; padding: 4px 10px 12px;
-                border-top: 1px solid var(--ul-border);
-            }
-            .ul-modal .ul-service-item {
-                display: flex; align-items: center; gap: 8px;
-                padding: 7px 8px; border-radius: 6px; font-size: 12px;
-                cursor: pointer; color: var(--ul-fg);
-                transition: background 0.12s; user-select: none;
-            }
-            .ul-modal .ul-service-item:hover { background: rgba(148,163,184,0.1); }
-            .ul-modal .ul-services-list input[type="checkbox"] {
-                appearance: none; -webkit-appearance: none;
-                width: 16px; height: 16px; min-width: 16px; max-width: 16px;
-                border-radius: 4px; background: #475569; position: relative;
-                cursor: pointer; margin: 0; padding: 0; flex-shrink: 0;
-                transition: background 0.15s; box-shadow: none;
-            }
-            .ul-modal .ul-services-list input[type="checkbox"]::after {
-                content: ''; position: absolute; top: 1px; left: 5px;
-                width: 4px; height: 9px;
-                border: solid white; border-width: 0 2px 2px 0;
-                background: transparent; border-radius: 0; box-shadow: none;
-                transform: rotate(45deg) scale(0); transition: transform 0.12s;
-            }
-            .ul-modal .ul-services-list input[type="checkbox"]:checked { background: var(--ul-accent); }
-            .ul-modal .ul-services-list input[type="checkbox"]:checked::after { transform: rotate(45deg) scale(1); }
-        `;
-        (document.head || document.documentElement).appendChild(style);
-    }
-
-    // ============================================================
-    // PILL UI
-    // ============================================================
     const POSITION_STYLES = {
-        'bottom-right': { right: '12px', bottom: '12px', left: 'auto', top: 'auto' },
-        'bottom-left':  { left: '12px',  bottom: '12px', right: 'auto', top: 'auto' },
-        'top-right':    { right: '12px', top: '12px',   left: 'auto', bottom: 'auto' },
-        'top-left':     { left: '12px',  top: '12px',   right: 'auto', bottom: 'auto' },
+        'bottom-right': { right: '15px', bottom: '15px', left: 'auto', top: 'auto' },
+        'bottom-left':  { left: '15px',  bottom: '15px', right: 'auto', top: 'auto' },
+        'top-right':    { right: '15px', top: '15px',    left: 'auto', bottom: 'auto' },
+        'top-left':     { left: '15px',  top: '15px',    right: 'auto', bottom: 'auto' },
     };
 
-    let pillEl = null;
-    let pillPaint = null;
+    const QUICK_RANGE_PRESETS = [
+        { label: '+15–30s (Quick)', min: 15, max: 30 },
+        { label: '+30–90s (Balanced)', min: 30, max: 90 },
+        { label: '+60–120s (Generous)', min: 60, max: 120 },
+        { label: '+120–180s (Aggressive)', min: 120, max: 180 },
+    ];
 
-    function applyPillPosition() {
-        if (!pillEl) return;
-        const pos = POSITION_STYLES[settings.pillPosition] || POSITION_STYLES['bottom-right'];
-        Object.assign(pillEl.style, pos);
-    }
-    function applyPillVisibility() {
-        if (!pillEl) return;
-        pillEl.style.display = settings.pillVisible ? 'flex' : 'none';
-    }
-    function applyPillOpacity() {
-        if (!pillEl) return;
-        pillEl.style.opacity = String(settings.pillOpacity);
-    }
-    function applyPillAccent() {
-        if (!pillEl) return;
-        if (settings.timeBoostEnabled) {
-            pillEl.style.background = settings.accentColor;
-            pillEl.style.color      = '#ffffff';
-        } else {
-            pillEl.style.background = '#334155';
-            pillEl.style.color      = '#cbd5e1';
+    const QUICK_COLOR_SWATCHES = [
+        { name: 'Emerald', hex: '#16a34a' },
+        { name: 'Blue', hex: '#006fee' },
+        { name: 'Purple', hex: '#7828c8' },
+        { name: 'Cyan', hex: '#06b6d4' },
+        { name: 'Amber', hex: '#f5a524' },
+        { name: 'Rose', hex: '#f43f5e' },
+    ];
+
+    function ensureUIHost() {
+        if (uiShadowRoot && document.getElementById('__ul-heroui-host')) {
+            return uiShadowRoot;
         }
+
+        let host = document.getElementById('__ul-heroui-host');
+        if (!host) {
+            host = document.createElement('div');
+            host.id = '__ul-heroui-host';
+            host.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483645;';
+            (document.body || document.documentElement).appendChild(host);
+        }
+        uiHostEl = host;
+
+        if (!host.shadowRoot) {
+            uiShadowRoot = host.attachShadow({ mode: 'open' });
+        } else {
+            uiShadowRoot = host.shadowRoot;
+        }
+
+        let styleEl = uiShadowRoot.getElementById('__ul-heroui-styles');
+        if (!styleEl) {
+            styleEl = document.createElement('style');
+            styleEl.id = '__ul-heroui-styles';
+            uiShadowRoot.appendChild(styleEl);
+        }
+        styleEl.textContent = getHeroUIStyles();
+
+        let container = uiShadowRoot.getElementById('__ul-root');
+        if (!container) {
+            container = document.createElement('div');
+            container.id = '__ul-root';
+            container.className = 'heroui-root';
+            uiShadowRoot.appendChild(container);
+        }
+        uiContainerEl = container;
+
+        mountReactUI();
+        return uiShadowRoot;
     }
-    function formatRangeLabel() {
-        const a = settings.extraSecondsMin;
-        const b = settings.extraSecondsMax;
-        if (a === b) return `+${a}s`;
-        return `+${a}–${b}s`;
-    }
 
-    function installPillUI() {
-        if (!document.body) { setTimeout(installPillUI, 100); return; }
-        if (document.getElementById('__ul-pill')) return;
-
-        ensureStyles();
-
-        const pill = document.createElement('div');
-        pill.id = '__ul-pill';
-
-        const main = document.createElement('div');
-        main.className = 'ul-pill-main';
-
-        const row1 = document.createElement('div');
-        row1.className = 'ul-pill-row1';
-        const row2 = document.createElement('div');
-        row2.className = 'ul-pill-row2';
-        main.appendChild(row1);
-        main.appendChild(row2);
-
-        const gear = document.createElement('button');
-        gear.className = 'ul-pill-gear';
-        gear.type = 'button';
-        gear.title = 'Open settings';
-        gear.textContent = '⚙';
-
-        pill.appendChild(main);
-        pill.appendChild(gear);
-        document.body.appendChild(pill);
-        pillEl = pill;
-
-        pillPaint = () => {
-            const accent = settings.timeBoostEnabled ? settings.accentColor : '#334155';
-            pill.style.background = accent;
-            pill.style.color      = settings.timeBoostEnabled ? '#ffffff' : '#cbd5e1';
-            pill.style.opacity    = String(settings.pillOpacity);
-
-            if (settings.timeBoostEnabled) row1.textContent = `${formatRangeLabel()}  ON`;
-            else row1.textContent = `${formatRangeLabel()}  OFF`;
-
-            if (settings.showStats) {
-                row2.textContent =
-                    `🛡 blocked:${stats.blocked} · q:${stats.boosted}` +
-                    (stats.logImproperUseBlocked > 0 ? ` · liu:${stats.logImproperUseBlocked}` : '') +
-                    (accumulatedExtraSeconds > 0 ? ` · pending:+${accumulatedExtraSeconds}s` : '') +
-                    (stats.groupExtra > 0 ? ` · grp:+${stats.groupExtra}s` : '');
-            } else {
-                row2.textContent = '🛡 always on';
+    function getHeroUIStyles() {
+        return `
+            /* HeroUI v3 CSS Architecture & OKLCH Theming */
+            :host, .heroui-root {
+                --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
+                --ease-out-quad: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+                --ease-out-quart: cubic-bezier(0.165, 0.84, 0.44, 1);
+                --ease-out-fluid: cubic-bezier(0.16, 1, 0.3, 1);
+                --cursor-interactive: pointer;
+                --cursor-disabled: not-allowed;
+                --disabled-opacity: 0.5;
+                --focus: var(--accent);
+                --radius-sm: 6px;
+                --radius-md: 9px;
+                --radius-lg: 13px;
+                --radius-xl: 18px;
+                --radius-2xl: 22px;
+                --radius-3xl: 26px;
+                --radius-full: 9999px;
+                --field-radius: 11px;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+                -webkit-font-smoothing: antialiased;
+                box-sizing: border-box;
             }
 
-            const kbText = formatKeybind(settings.uiToggleKeybind);
-            main.title = `Click: toggle time boost | ${kbText}: hide/show pill`;
-        };
+            *, *::before, *::after {
+                box-sizing: inherit;
+            }
 
-        main.addEventListener('click', (e) => {
-            e.preventDefault(); e.stopPropagation();
-            settings.timeBoostEnabled = !settings.timeBoostEnabled;
-            saveSettings();
-            LOG('time-boost ' + (settings.timeBoostEnabled ? 'ENABLED' : 'DISABLED'));
-            pillPaint();
-            syncModalIfOpen();
-        });
+            .heroui-root[data-theme="dark"] {
+                --background: oklch(12% 0.005 285.823);
+                --foreground: oklch(0.985 0 0);
+                --surface: oklch(18% 0.006 285.89);
+                --surface-foreground: var(--foreground);
+                --surface-secondary: oklch(21.5% 0.006 286.14);
+                --surface-secondary-foreground: var(--foreground);
+                --surface-tertiary: oklch(25.5% 0.006 286.14);
+                --overlay: oklch(16.5% 0.006 285.89);
+                --overlay-foreground: var(--foreground);
+                --muted: oklch(72% 0.015 286.067);
+                --muted-foreground: oklch(56% 0.015 286);
+                --default: oklch(27.5% 0.006 286.033);
+                --default-foreground: oklch(0.98 0 0);
+                --default-hover: oklch(33% 0.008 286);
+                --default-soft: oklch(27.5% 0.006 286.033 / 0.55);
+                --accent: #16a34a;
+                --accent-hover: color-mix(in srgb, var(--accent) 84%, white);
+                --accent-foreground: #ffffff;
+                --accent-soft: color-mix(in srgb, var(--accent) 18%, transparent);
+                --accent-soft-foreground: var(--accent);
+                --success: #22c55e;
+                --success-foreground: #ffffff;
+                --success-soft: rgba(34, 197, 94, 0.16);
+                --warning: #f59e0b;
+                --warning-foreground: #111827;
+                --warning-soft: rgba(245, 158, 11, 0.16);
+                --danger: #ef4444;
+                --danger-hover: #dc2626;
+                --danger-foreground: #ffffff;
+                --danger-soft: rgba(239, 68, 68, 0.16);
+                --danger-soft-foreground: #ef4444;
+                --border: oklch(28% 0.006 286.033);
+                --border-hover: oklch(38% 0.008 286.033);
+                --separator: oklch(24% 0.006 286.033);
+                --field-background: oklch(14% 0.005 285.89);
+                --field-foreground: var(--foreground);
+                --field-border: oklch(30% 0.006 286.033);
+                --backdrop: rgba(0, 0, 0, 0.68);
+                --shadow-overlay: 0 24px 70px -12px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(255, 255, 255, 0.08);
+                --shadow-surface: 0 4px 18px -2px rgba(0, 0, 0, 0.45);
+                --shadow-pill: 0 10px 32px -4px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.12);
+                color-scheme: dark;
+            }
 
-        gear.addEventListener('click', (e) => {
-            e.preventDefault(); e.stopPropagation();
-            openSettingsModal();
-        });
+            .heroui-root[data-theme="light"] {
+                --background: oklch(0.985 0 0);
+                --foreground: oklch(0.18 0.005 285.89);
+                --surface: #ffffff;
+                --surface-foreground: var(--foreground);
+                --surface-secondary: #f8fafc;
+                --surface-secondary-foreground: var(--foreground);
+                --surface-tertiary: #f1f5f9;
+                --overlay: #ffffff;
+                --overlay-foreground: var(--foreground);
+                --muted: oklch(50% 0.015 286);
+                --muted-foreground: oklch(65% 0.015 286);
+                --default: #e2e8f0;
+                --default-foreground: #0f172a;
+                --default-hover: #cbd5e1;
+                --default-soft: rgba(226, 232, 240, 0.6);
+                --accent: #16a34a;
+                --accent-hover: color-mix(in srgb, var(--accent) 84%, black);
+                --accent-foreground: #ffffff;
+                --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+                --accent-soft-foreground: var(--accent);
+                --success: #16a34a;
+                --success-foreground: #ffffff;
+                --success-soft: rgba(22, 163, 74, 0.14);
+                --warning: #d97706;
+                --warning-foreground: #ffffff;
+                --warning-soft: rgba(217, 119, 6, 0.14);
+                --danger: #dc2626;
+                --danger-hover: #b91c1c;
+                --danger-foreground: #ffffff;
+                --danger-soft: rgba(220, 38, 38, 0.12);
+                --danger-soft-foreground: #dc2626;
+                --border: #e2e8f0;
+                --border-hover: #cbd5e1;
+                --separator: #e2e8f0;
+                --field-background: #ffffff;
+                --field-foreground: var(--foreground);
+                --field-border: #cbd5e1;
+                --backdrop: rgba(15, 23, 42, 0.52);
+                --shadow-overlay: 0 24px 64px -12px rgba(15, 23, 42, 0.22), 0 0 0 1px rgba(15, 23, 42, 0.08);
+                --shadow-surface: 0 4px 16px -2px rgba(15, 23, 42, 0.06);
+                --shadow-pill: 0 10px 32px -4px rgba(15, 23, 42, 0.16), 0 0 0 1px rgba(15, 23, 42, 0.08);
+                color-scheme: light;
+            }
 
-        pill.addEventListener('mouseenter', () => { pill.style.transform = 'scale(1.04)'; });
-        pill.addEventListener('mouseleave', () => { pill.style.transform = 'scale(1)'; });
+            /* Floating Status Pill Component (Shape-Shifting) */
+            .heroui-pill {
+                position: fixed;
+                z-index: 2147483646;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 6px 8px 6px 14px;
+                border-radius: var(--radius-full);
+                background: var(--surface);
+                color: var(--foreground);
+                border: 1px solid var(--border);
+                box-shadow: var(--shadow-pill);
+                backdrop-filter: blur(16px);
+                -webkit-backdrop-filter: blur(16px);
+                user-select: none;
+                font-size: 13px;
+                font-weight: 500;
+                line-height: 1.3;
+                pointer-events: auto;
+                cursor: pointer;
+                transition: transform 200ms var(--ease-out-fluid),
+                            box-shadow 200ms var(--ease-out),
+                            opacity 150ms ease,
+                            width 280ms cubic-bezier(0.16, 1, 0.3, 1),
+                            height 280ms cubic-bezier(0.16, 1, 0.3, 1),
+                            padding 280ms cubic-bezier(0.16, 1, 0.3, 1),
+                            border-radius 280ms cubic-bezier(0.16, 1, 0.3, 1);
+            }
+            .heroui-pill:hover {
+                transform: translateY(-2px) scale(1.03);
+                box-shadow: 0 14px 40px -4px rgba(0, 0, 0, 0.45), 0 0 0 1px var(--border-hover);
+            }
+            .heroui-pill:active {
+                transform: scale(0.96);
+            }
 
-        applyPillPosition();
-        applyPillVisibility();
-        applyPillOpacity();
-        pillPaint();
-        setInterval(() => { if (pillPaint) pillPaint(); }, 500);
-        LOG('Pill UI installed');
+            /* Minimal Mode: Compact circular button (Default) */
+            .heroui-pill--minimal {
+                width: 44px;
+                height: 44px;
+                padding: 0;
+                border-radius: 50%;
+                justify-content: center;
+                gap: 0;
+            }
+            .heroui-pill--minimal .heroui-pill__main {
+                display: none !important;
+            }
+            .heroui-pill--minimal .heroui-pill__gear {
+                width: 100%;
+                height: 100%;
+                border-radius: 50%;
+            }
+
+            .heroui-pill__main {
+                display: flex;
+                align-items: center;
+                gap: 9px;
+                cursor: pointer;
+            }
+            .heroui-pill__badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                padding: 4px 10px;
+                border-radius: var(--radius-full);
+                font-weight: 600;
+                font-size: 11.5px;
+                letter-spacing: 0.2px;
+                transition: background 150ms, color 150ms;
+            }
+            .heroui-pill__dot {
+                width: 6.5px;
+                height: 6.5px;
+                border-radius: 50%;
+                background: currentColor;
+                box-shadow: 0 0 8px currentColor;
+                animation: heroui-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+            }
+            @keyframes heroui-pulse {
+                0%, 100% { opacity: 1; transform: scale(1); }
+                50% { opacity: 0.35; transform: scale(0.8); }
+            }
+            .heroui-pill__stats {
+                font-size: 11.5px;
+                color: var(--muted);
+                font-weight: 500;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .heroui-pill__stat-item {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+            }
+
+            /* Crisp Settings Gear Buttons */
+            .heroui-pill__gear {
+                position: relative;
+                background: transparent;
+                border: none;
+                color: var(--muted);
+                cursor: pointer;
+                border-radius: var(--radius-full);
+                width: 32px;
+                height: 32px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0;
+                transition: background-color 150ms, color 150ms, transform 240ms var(--ease-out-fluid);
+            }
+            .heroui-pill__gear:hover {
+                background: var(--default-soft);
+                color: var(--foreground);
+                transform: rotate(60deg);
+            }
+            .heroui-pill__gear:active {
+                transform: scale(0.92);
+            }
+            .heroui-pill__indicator-dot {
+                position: absolute;
+                top: 4px;
+                right: 4px;
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: var(--accent);
+                box-shadow: 0 0 8px var(--accent);
+                display: none;
+                animation: heroui-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+            }
+
+            /* Modal Overlay & Fluid Open/Close Animations */
+            .modal__backdrop {
+                position: fixed;
+                inset: 0;
+                z-index: 2147483647;
+                background: var(--backdrop);
+                backdrop-filter: blur(12px);
+                -webkit-backdrop-filter: blur(12px);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 16px;
+                box-sizing: border-box;
+                pointer-events: auto;
+                animation: heroui-modal-fade-in 280ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+                will-change: opacity, backdrop-filter;
+            }
+            .modal__backdrop--closing {
+                pointer-events: none !important;
+                animation: heroui-modal-fade-out 220ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
+            }
+            @keyframes heroui-modal-fade-in {
+                0% {
+                    opacity: 0;
+                    backdrop-filter: blur(0px);
+                    -webkit-backdrop-filter: blur(0px);
+                }
+                100% {
+                    opacity: 1;
+                    backdrop-filter: blur(12px);
+                    -webkit-backdrop-filter: blur(12px);
+                }
+            }
+            @keyframes heroui-modal-fade-out {
+                0% {
+                    opacity: 1;
+                    backdrop-filter: blur(12px);
+                    -webkit-backdrop-filter: blur(12px);
+                }
+                100% {
+                    opacity: 0;
+                    backdrop-filter: blur(0px);
+                    -webkit-backdrop-filter: blur(0px);
+                }
+            }
+
+            .modal__container {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: min(1340px, 92vw);
+                height: min(920px, 93vh);
+            }
+
+            .modal__dialog {
+                width: 100%;
+                height: 100%;
+                max-height: 93vh;
+                background: var(--overlay);
+                color: var(--foreground);
+                border-radius: min(24px, var(--radius-3xl));
+                border: 1px solid var(--border);
+                box-shadow: var(--shadow-overlay);
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+                animation: heroui-modal-scale-in 280ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+                will-change: transform, opacity;
+            }
+            .modal__backdrop--closing .modal__dialog {
+                animation: heroui-modal-scale-out 220ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
+            }
+            @keyframes heroui-modal-scale-in {
+                0% {
+                    opacity: 0;
+                    transform: scale(0.94) translateY(14px);
+                    filter: blur(4px);
+                }
+                100% {
+                    opacity: 1;
+                    transform: scale(1) translateY(0);
+                    filter: blur(0);
+                }
+            }
+            @keyframes heroui-modal-scale-out {
+                0% {
+                    opacity: 1;
+                    transform: scale(1) translateY(0);
+                    filter: blur(0);
+                }
+                100% {
+                    opacity: 0;
+                    transform: scale(0.95) translateY(10px);
+                    filter: blur(3px);
+                }
+            }
+
+            /* Modal Header */
+            .modal__header {
+                display: flex;
+                flex-direction: column;
+                padding: 20px 28px 14px 28px;
+                background: var(--surface);
+                border-bottom: 1px solid var(--border);
+                flex-shrink: 0;
+                gap: 14px;
+            }
+            .modal__header-top {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            }
+            .modal__brand {
+                display: flex;
+                align-items: center;
+                gap: 14px;
+            }
+            .modal__icon {
+                width: 42px;
+                height: 42px;
+                border-radius: var(--radius-xl);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: var(--accent-soft);
+                color: var(--accent);
+                flex-shrink: 0;
+                box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.15);
+            }
+            .modal__title-box {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            .modal__heading {
+                margin: 0;
+                font-size: 17px;
+                font-weight: 700;
+                letter-spacing: -0.2px;
+                color: var(--foreground);
+            }
+            .modal__close-trigger {
+                color: var(--muted) !important;
+                border: none !important;
+                background: transparent !important;
+                flex-shrink: 0;
+            }
+            .modal__close-trigger:hover {
+                background: var(--default-soft) !important;
+                color: var(--foreground) !important;
+            }
+
+            .modal__footer {
+                display: flex;
+                align-items: center;
+                justify-content: flex-end;
+                gap: 10px;
+                padding: 14px 24px;
+                border-top: 1px solid var(--separator);
+                background: var(--surface);
+                border-bottom-left-radius: var(--radius-2xl);
+                border-bottom-right-radius: var(--radius-2xl);
+                flex-shrink: 0;
+            }
+
+            /* HeroUI Animated Tabs Component */
+            .tabs {
+                display: flex;
+                flex-direction: column;
+            }
+            .tabs__list-container {
+                display: flex;
+                width: 100%;
+            }
+            .tabs__list {
+                position: relative;
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                padding: 4px;
+                border-radius: var(--radius-xl);
+                background: var(--surface-secondary);
+                border: 1px solid var(--border);
+                overflow-x: auto;
+                scrollbar-width: none;
+            }
+            .tabs__list::-webkit-scrollbar {
+                display: none;
+            }
+            .tabs__indicator {
+                position: absolute;
+                top: 4px;
+                bottom: 4px;
+                left: 0;
+                border-radius: calc(var(--radius-xl) - 3px);
+                background: var(--surface);
+                border: 1px solid var(--border);
+                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 3px 10px -2px rgba(0, 0, 0, 0.18);
+                pointer-events: none;
+                z-index: 1;
+                transition: transform 280ms cubic-bezier(0.16, 1, 0.3, 1),
+                            width 280ms cubic-bezier(0.16, 1, 0.3, 1),
+                            opacity 160ms ease;
+                opacity: 0;
+            }
+            .tabs__tab {
+                position: relative;
+                z-index: 2;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+                padding: 8px 18px;
+                font-size: 13.5px;
+                font-weight: 500;
+                color: var(--muted);
+                background: transparent;
+                border: none;
+                border-radius: calc(var(--radius-xl) - 3px);
+                cursor: pointer;
+                transition: color 180ms ease, transform 120ms ease;
+                white-space: nowrap;
+                user-select: none;
+                outline: none;
+            }
+            .tabs__tab:hover {
+                color: var(--foreground);
+            }
+            .tabs__tab:active {
+                transform: scale(0.96);
+            }
+            .tabs__tab[data-selected="true"] {
+                color: var(--foreground);
+                font-weight: 600;
+            }
+
+            /* Modal Body & Direction-Aware Panel Transitions */
+            .modal__body {
+                position: relative;
+                padding: 16px 24px;
+                overflow: hidden;
+                flex: 1;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+            }
+
+            .tabs__panel {
+                display: none;
+                flex-direction: column;
+                gap: 16px;
+                width: 100%;
+                height: 100%;
+                min-height: 0;
+                overflow-y: auto;
+                padding-right: 6px;
+                scrollbar-width: thin;
+                scrollbar-color: var(--border) transparent;
+                will-change: transform, opacity, filter;
+            }
+            .tabs__panel::-webkit-scrollbar {
+                width: 6px;
+            }
+            .tabs__panel::-webkit-scrollbar-thumb {
+                background: var(--border);
+                border-radius: 4px;
+            }
+
+            .tabs__panel[data-active="true"] {
+                display: flex;
+            }
+            .tabs__panel[data-active="true"][data-direction="forward"] {
+                animation: heroui-tab-forward 280ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            }
+            .tabs__panel[data-active="true"][data-direction="backward"] {
+                animation: heroui-tab-backward 280ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            }
+
+            @keyframes heroui-tab-forward {
+                0% {
+                    opacity: 0;
+                    transform: translateX(24px) scale(0.995);
+                    filter: blur(2px);
+                }
+                100% {
+                    opacity: 1;
+                    transform: translateX(0) scale(1);
+                    filter: blur(0);
+                }
+            }
+
+            @keyframes heroui-tab-backward {
+                0% {
+                    opacity: 0;
+                    transform: translateX(-24px) scale(0.995);
+                    filter: blur(2px);
+                }
+                100% {
+                    opacity: 1;
+                    transform: translateX(0) scale(1);
+                    filter: blur(0);
+                }
+            }
+
+            /* Responsive 2-Column Dashboard Grid */
+            .grid-2col {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 12px;
+                align-items: start;
+                width: 100%;
+            }
+            .col-stack {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                min-width: 0;
+            }
+            @media (max-width: 960px) {
+                .grid-2col {
+                    grid-template-columns: 1fr;
+                }
+            }
+
+            /* Cards Component (Comfortable, Proportional Sizing) */
+            .card {
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+                padding: 16px 18px;
+                border-radius: var(--radius-xl);
+                border: 1px solid var(--border);
+                background: var(--surface);
+                transition: border-color 150ms;
+                flex-shrink: 0;
+            }
+            .card--compact {
+                padding: 12px 15px;
+                gap: 8px;
+            }
+            .card--compact .card__header {
+                gap: 2px;
+            }
+            .card--compact .card__title {
+                font-size: 13.5px;
+            }
+            .card--compact .card__description {
+                font-size: 11px;
+                line-height: 1.3;
+            }
+            .card--secondary {
+                background: var(--surface-secondary);
+            }
+            .card__header {
+                display: flex;
+                flex-direction: column;
+                gap: 3px;
+            }
+            .card__title {
+                font-size: 14px;
+                font-weight: 600;
+                color: var(--foreground);
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            }
+            .card__description {
+                font-size: 12.5px;
+                color: var(--muted);
+                line-height: 1.45;
+            }
+            .card__content {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+
+            /* Core Protection Compact Toggles */
+            .core-toggles-list {
+                display: flex;
+                flex-direction: column;
+                gap: 4px !important;
+            }
+            .core-toggles-list .switch,
+            .core-toggle-item.switch {
+                padding: 6px 12px;
+                border-radius: var(--radius-md);
+                gap: 10px;
+                min-height: 38px;
+                background: var(--surface);
+            }
+            .core-toggles-list .switch .switch__control,
+            .core-toggle-item .switch__control {
+                height: 19.5px;
+                width: 34px;
+            }
+            .core-toggles-list .switch .switch__thumb,
+            .core-toggle-item .switch__thumb {
+                height: 14.5px;
+                width: 14.5px;
+                margin-left: 2.5px;
+            }
+            .core-toggles-list .switch[data-selected="true"] .switch__thumb,
+            .core-toggle-item[data-selected="true"] .switch__thumb {
+                margin-left: calc(34px - 14.5px - 2.5px);
+            }
+            .core-toggles-list .switch .switch__content,
+            .core-toggle-item .switch__content {
+                gap: 1px;
+            }
+            .core-toggles-list .switch [data-slot="label"],
+            .core-toggle-item [data-slot="label"] {
+                font-size: 12.5px;
+                font-weight: 500;
+                line-height: 1.25;
+                color: var(--foreground);
+            }
+            .core-toggles-list .switch [data-slot="description"],
+            .core-toggle-item [data-slot="description"] {
+                font-size: 10.5px;
+                color: var(--muted);
+                line-height: 1.2;
+            }
+
+            /* Switch Component */
+            .switch {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+                cursor: pointer;
+                padding: 10px 14px;
+                border-radius: var(--radius-lg);
+                background: var(--surface);
+                border: 1px solid var(--border);
+                transition: background-color 150ms, border-color 150ms;
+                user-select: none;
+                outline: none;
+            }
+            .switch:hover {
+                background: var(--surface-tertiary);
+                border-color: var(--border-hover);
+            }
+            .switch:focus-visible {
+                border-color: var(--accent);
+                box-shadow: 0 0 0 2px var(--accent-soft);
+            }
+            .switch__control {
+                position: relative;
+                display: inline-flex;
+                align-items: center;
+                height: 20px;
+                width: 36px;
+                border-radius: 9999px;
+                background-color: var(--default);
+                transition: background-color 200ms var(--ease-smooth);
+                flex-shrink: 0;
+                order: 2;
+            }
+            .switch[data-selected="true"] .switch__control {
+                background-color: var(--accent);
+            }
+            .switch__thumb {
+                height: 15px;
+                width: 15px;
+                border-radius: 50%;
+                background-color: #ffffff;
+                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+                margin-left: 2.5px;
+                transition: margin-left 220ms var(--ease-out-fluid);
+            }
+            .switch[data-selected="true"] .switch__thumb {
+                margin-left: calc(36px - 15px - 2.5px);
+            }
+            .switch--sm {
+                padding: 6px 11px;
+                gap: 9px;
+                border-radius: var(--radius-md);
+                min-height: 38px;
+            }
+            .switch--sm .switch__control {
+                height: 19.5px;
+                width: 34px;
+            }
+            .switch--sm .switch__thumb {
+                height: 14.5px;
+                width: 14.5px;
+                margin-left: 2.5px;
+            }
+            .switch--sm[data-selected="true"] .switch__thumb {
+                margin-left: calc(34px - 14.5px - 2.5px);
+            }
+            .switch--sm .switch__content {
+                gap: 1px;
+            }
+            .switch--sm [data-slot="label"] {
+                font-size: 12.5px;
+                font-weight: 500;
+                line-height: 1.25;
+            }
+            .switch--sm [data-slot="description"] {
+                font-size: 10.5px;
+                line-height: 1.2;
+                color: var(--muted);
+            }
+            .switch__content {
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+                order: 1;
+                flex: 1;
+            }
+            .switch [data-slot="label"] {
+                font-size: 13px;
+                font-weight: 500;
+                color: var(--foreground);
+            }
+            .switch [data-slot="description"] {
+                font-size: 11px;
+                color: var(--muted);
+                line-height: 1.3;
+            }
+            .switch[data-disabled="true"] {
+                opacity: 0.55;
+                cursor: not-allowed;
+            }
+
+            /* Badge Component */
+            .badge {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+                font-weight: 600;
+                border-radius: var(--radius-full);
+                padding: 3px 9px;
+                font-size: 12px;
+                line-height: 1.25;
+            }
+            .badge--sm {
+                font-size: 10.5px;
+                padding: 2px 7px;
+            }
+            .badge--primary.badge--accent {
+                background: var(--accent);
+                color: var(--accent-foreground);
+            }
+            .badge--soft.badge--accent {
+                background: var(--accent-soft);
+                color: var(--accent-soft-foreground);
+            }
+            .badge--soft.badge--success {
+                background: var(--success-soft);
+                color: var(--success);
+            }
+            .badge--soft.badge--warning {
+                background: var(--warning-soft);
+                color: var(--warning);
+            }
+            .badge--soft.badge--danger {
+                background: var(--danger-soft);
+                color: var(--danger);
+            }
+            .badge--secondary {
+                background: var(--default);
+                color: var(--default-foreground);
+            }
+
+            /* ============================================================
+               HeroUI v3 Button & ButtonGroup Components (https://heroui.com/docs/react/components/button)
+               ============================================================ */
+            .button {
+                position: relative;
+                isolation: isolate;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+                height: 36px;
+                width: fit-content;
+                transform-origin: center;
+                border-radius: var(--radius-3xl, 24px);
+                padding: 0 16px;
+                font-size: 14px;
+                line-height: 20px;
+                font-weight: 500;
+                font-family: inherit;
+                white-space: nowrap;
+                outline: none;
+                user-select: none;
+                -webkit-tap-highlight-color: transparent;
+                cursor: var(--cursor-interactive, pointer);
+                border: 1px solid transparent;
+                transition:
+                    transform 250ms var(--ease-smooth),
+                    background-color 100ms var(--ease-out-quad),
+                    box-shadow 100ms var(--ease-out-quad),
+                    border-color 100ms var(--ease-out-quad),
+                    color 100ms var(--ease-out-quad);
+
+                /* Default tokens (fallback behavior) */
+                --button-bg: transparent;
+                --button-bg-hover: var(--button-bg);
+                --button-bg-pressed: var(--button-bg-hover);
+                --button-fg: currentColor;
+
+                background-color: var(--button-bg);
+                color: var(--button-fg);
+            }
+
+            @media (prefers-reduced-motion: reduce) {
+                .button {
+                    transition: none;
+                }
+            }
+
+            /* Interactive States */
+            @media (hover: hover) {
+                .button:hover,
+                .button[data-hovered="true"] {
+                    background-color: var(--button-bg-hover);
+                }
+            }
+
+            .button:active,
+            .button[data-pressed="true"] {
+                will-change: transform;
+                background-color: var(--button-bg-pressed);
+                transform: scale(0.97);
+            }
+
+            .button:focus-visible,
+            .button[data-focus-visible="true"] {
+                outline: none;
+                box-shadow: 0 0 0 2px var(--background), 0 0 0 4px var(--focus, var(--accent));
+                z-index: 2;
+            }
+
+            .button:disabled,
+            .button[aria-disabled="true"] {
+                opacity: var(--disabled-opacity, 0.5);
+                cursor: var(--cursor-disabled, not-allowed);
+                pointer-events: none;
+                transform: none !important;
+            }
+
+            .button[data-pending="true"] {
+                opacity: 0.75;
+                pointer-events: none;
+                cursor: default;
+            }
+
+            /* SVG Icon styling */
+            .button svg:not([data-slot="spinner"] svg, [data-slot="link-icon"] svg) {
+                pointer-events: none;
+                margin-left: -2px;
+                margin-right: -2px;
+                width: 16px;
+                height: 16px;
+                flex-shrink: 0;
+                align-self: center;
+            }
+
+            /* Size Variants */
+            .button--sm {
+                height: 32px;
+                padding: 0 12px;
+                font-size: 13px;
+                gap: 6px;
+                border-radius: var(--radius-3xl, 24px);
+            }
+            .button--sm:active,
+            .button--sm[data-pressed="true"] {
+                transform: scale(0.98);
+            }
+            .button--sm svg:not([data-slot="spinner"] svg, [data-slot="link-icon"] svg) {
+                width: 14px;
+                height: 14px;
+            }
+
+            .button--md {
+                height: 36px;
+                padding: 0 16px;
+                font-size: 14px;
+                gap: 8px;
+                border-radius: var(--radius-3xl, 24px);
+            }
+            .button--md:active,
+            .button--md[data-pressed="true"] {
+                transform: scale(0.97);
+            }
+
+            .button--lg {
+                height: 44px;
+                padding: 0 20px;
+                font-size: 15px;
+                gap: 10px;
+                border-radius: var(--radius-3xl, 24px);
+            }
+            .button--lg:active,
+            .button--lg[data-pressed="true"] {
+                transform: scale(0.96);
+            }
+            .button--lg svg:not([data-slot="spinner"] svg, [data-slot="link-icon"] svg) {
+                width: 18px;
+                height: 18px;
+            }
+
+            /* Variant Classes */
+            .button--primary {
+                --button-bg: var(--accent);
+                --button-bg-hover: var(--accent-hover);
+                --button-bg-pressed: var(--accent-hover);
+                --button-fg: var(--accent-foreground, #ffffff);
+                box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.08);
+                border-color: transparent;
+            }
+
+            .button--secondary {
+                --button-bg: var(--default);
+                --button-bg-hover: var(--default-hover);
+                --button-bg-pressed: var(--default-hover);
+                --button-fg: var(--foreground);
+                border-color: transparent;
+            }
+
+            .button--tertiary {
+                --button-bg: var(--default);
+                --button-bg-hover: var(--default-hover);
+                --button-bg-pressed: var(--default-hover);
+                --button-fg: var(--foreground);
+                border-color: transparent;
+            }
+
+            .button--outline {
+                --button-bg: transparent;
+                --button-bg-hover: color-mix(in srgb, var(--default) 60%, transparent);
+                --button-bg-pressed: var(--default);
+                --button-fg: var(--foreground);
+                border-color: var(--border);
+            }
+            .button--outline:hover,
+            .button--outline[data-hovered="true"] {
+                border-color: var(--border-hover, var(--border));
+            }
+
+            .button--ghost {
+                --button-bg: transparent;
+                --button-bg-hover: var(--default);
+                --button-bg-pressed: var(--default);
+                --button-fg: var(--foreground);
+                border-color: transparent;
+            }
+
+            .button--danger {
+                --button-bg: var(--danger);
+                --button-bg-hover: var(--danger-hover);
+                --button-bg-pressed: var(--danger-hover);
+                --button-fg: var(--danger-foreground, #ffffff);
+                box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.08);
+                border-color: transparent;
+            }
+
+            .button--danger-soft {
+                --button-bg: var(--danger-soft);
+                --button-bg-hover: color-mix(in srgb, var(--danger) 24%, transparent);
+                --button-bg-pressed: color-mix(in srgb, var(--danger) 28%, transparent);
+                --button-fg: var(--danger);
+                border-color: transparent;
+            }
+
+            /* Modifier Classes */
+            .button--icon-only {
+                padding: 0 !important;
+                border-radius: var(--radius-full, 9999px) !important;
+                width: 36px;
+                min-width: 36px;
+                height: 36px;
+            }
+            .button--icon-only.button--sm {
+                width: 32px;
+                min-width: 32px;
+                height: 32px;
+            }
+            .button--icon-only.button--lg {
+                width: 44px;
+                min-width: 44px;
+                height: 44px;
+            }
+            .button--icon-only svg:not([data-slot="spinner"] svg, [data-slot="link-icon"] svg) {
+                margin: 0;
+            }
+
+            .button--full-width {
+                width: 100%;
+            }
+
+            .button--capturing {
+                background: var(--accent) !important;
+                color: var(--accent-foreground, #ffffff) !important;
+                border-color: transparent !important;
+                animation: heroui-pulse 1.2s ease-in-out infinite;
+            }
+
+            /* Button Spinner */
+            .button__spinner {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                animation: heroui-spin 0.8s linear infinite;
+            }
+            @keyframes heroui-spin {
+                from { transform: rotate(0deg); }
+                to { transform: rotate(360deg); }
+            }
+
+            /* HeroUI v3 ButtonGroup */
+            .button-group {
+                display: inline-flex;
+                height: auto;
+                align-items: center;
+                justify-content: center;
+                gap: 0;
+            }
+            .button-group--horizontal {
+                flex-direction: row;
+            }
+            .button-group--vertical {
+                flex-direction: column;
+            }
+            .button-group .button {
+                border-radius: 0;
+            }
+            .button-group--horizontal .button:first-child {
+                border-top-left-radius: var(--radius-3xl, 24px);
+                border-bottom-left-radius: var(--radius-3xl, 24px);
+            }
+            .button-group--horizontal .button:last-child {
+                border-top-right-radius: var(--radius-3xl, 24px);
+                border-bottom-right-radius: var(--radius-3xl, 24px);
+            }
+            .button-group--horizontal .button:first-child:last-child {
+                border-radius: var(--radius-3xl, 24px);
+            }
+            .button-group--vertical .button:first-child {
+                border-top-left-radius: var(--radius-3xl, 24px);
+                border-top-right-radius: var(--radius-3xl, 24px);
+            }
+            .button-group--vertical .button:last-child {
+                border-bottom-left-radius: var(--radius-3xl, 24px);
+                border-bottom-right-radius: var(--radius-3xl, 24px);
+            }
+            .button-group--vertical .button:first-child:last-child {
+                border-radius: var(--radius-3xl, 24px);
+            }
+            .button-group .button:active,
+            .button-group .button[data-pressed="true"] {
+                transform: none;
+            }
+            .button-group .button:focus-visible,
+            .button-group .button[data-focus-visible="true"] {
+                z-index: 10;
+            }
+            .button-group--horizontal .button--outline:not(:first-child) {
+                margin-left: -1px;
+            }
+            .button-group--vertical .button--outline:not(:first-child) {
+                margin-top: -1px;
+            }
+            .button-group--full-width {
+                width: 100%;
+            }
+            .button-group--full-width .button {
+                flex: 1;
+            }
+
+            /* Form Elements */
+            .field-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 16px;
+                padding: 12px 16px;
+                border-radius: var(--radius-lg);
+                background: var(--surface);
+                border: 1px solid var(--border);
+            }
+            .field-row > label {
+                font-size: 13.5px;
+                font-weight: 500;
+                color: var(--foreground);
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+                flex: 1;
+            }
+            .field-row > label small {
+                font-size: 11.5px;
+                color: var(--muted);
+                font-weight: 400;
+            }
+            .select, .input {
+                background: var(--field-background);
+                color: var(--field-foreground);
+                border: 1px solid var(--field-border);
+                border-radius: var(--field-radius);
+                padding: 8px 14px;
+                font-size: 13px;
+                font-family: inherit;
+                transition: border-color 150ms, box-shadow 150ms;
+                outline: none;
+                min-width: 150px;
+                cursor: pointer;
+            }
+            .input {
+                cursor: text;
+            }
+            .select:focus, .input:focus {
+                border-color: var(--accent);
+                box-shadow: 0 0 0 2px var(--accent-soft);
+            }
+            .input[type="number"] {
+                -moz-appearance: textfield;
+            }
+            .input[type="number"]::-webkit-outer-spin-button,
+            .input[type="number"]::-webkit-inner-spin-button {
+                -webkit-appearance: none;
+                margin: 0;
+            }
+
+            /* Range & Quick Presets */
+            .preset-chips {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                flex-wrap: wrap;
+                margin-top: 6px;
+            }
+            .preset-chip {
+                padding: 5px 12px;
+                font-size: 11.5px;
+                font-weight: 600;
+                border-radius: var(--radius-full);
+                background: var(--default-soft);
+                color: var(--muted);
+                border: 1px solid var(--border);
+                cursor: pointer;
+                transition: background 150ms, color 150ms, border-color 150ms;
+            }
+            .preset-chip:hover {
+                background: var(--default-hover);
+                color: var(--foreground);
+                border-color: var(--border-hover);
+            }
+
+            /* Color Swatches */
+            .color-swatches {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .color-swatch {
+                width: 26px;
+                height: 26px;
+                border-radius: 50%;
+                border: 2px solid transparent;
+                cursor: pointer;
+                transition: transform 150ms, border-color 150ms;
+            }
+            .color-swatch:hover {
+                transform: scale(1.15);
+            }
+            .color-swatch[data-active="true"] {
+                border-color: #ffffff;
+                box-shadow: 0 0 0 2px var(--accent);
+            }
+
+            /* Services Filter & Grid */
+            .services-search-bar {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 8px;
+            }
+            .services-search-input {
+                flex: 1;
+                background: var(--field-background);
+                color: var(--field-foreground);
+                border: 1px solid var(--field-border);
+                border-radius: var(--field-radius);
+                padding: 7px 13px;
+                font-size: 12.5px;
+                outline: none;
+            }
+            .services-search-input:focus {
+                border-color: var(--accent);
+            }
+            .services-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+                gap: 7px;
+                max-height: 390px;
+                overflow-y: auto;
+                padding-right: 4px;
+                scrollbar-width: thin;
+                scrollbar-color: var(--border) transparent;
+            }
+            .service-tile {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 7px 12px;
+                min-height: 38px;
+                border-radius: var(--radius-md);
+                background: var(--surface);
+                border: 1px solid var(--border);
+                font-size: 12.5px;
+                cursor: pointer;
+                transition: background 120ms, border-color 120ms;
+                user-select: none;
+            }
+            .service-tile:hover {
+                background: var(--surface-tertiary);
+                border-color: var(--border-hover);
+            }
+            .service-tile__label {
+                font-weight: 500;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                padding-right: 8px;
+                flex: 1;
+            }
+            .service-tile .switch {
+                padding: 0;
+                border: none;
+                background: transparent;
+                flex-shrink: 0;
+                min-height: unset;
+            }
+            .service-tile .switch:hover {
+                background: transparent;
+            }
+            .service-tile .switch .switch__control {
+                height: 19.5px;
+                width: 34px;
+            }
+            .service-tile .switch .switch__thumb {
+                height: 14.5px;
+                width: 14.5px;
+                margin-left: 2.5px;
+            }
+            .service-tile .switch[data-selected="true"] .switch__thumb {
+                margin-left: calc(34px - 14.5px - 2.5px);
+            }
+            .service-tile[data-disabled="true"] {
+                opacity: 0.55;
+                cursor: not-allowed;
+            }
+
+            /* Statistics Tiles Grid */
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+                gap: 12px;
+            }
+            .stat-card {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius-lg);
+                padding: 16px 20px;
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                transition: transform 150ms, border-color 150ms;
+            }
+            .stat-card:hover {
+                transform: translateY(-2px);
+                border-color: var(--border-hover);
+            }
+            .stat-card__label {
+                font-size: 11px;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.6px;
+                color: var(--muted);
+            }
+            .stat-card__value {
+                font-size: 26px;
+                font-weight: 700;
+                color: var(--foreground);
+                font-variant-numeric: tabular-nums;
+            }
+
+            /* HeroUI v3 Dropdown */
+            .dropdown {
+                position: relative;
+                display: inline-flex;
+                width: auto;
+                flex-shrink: 0;
+            }
+            .dropdown__trigger-wrapper {
+                display: inline-flex;
+                width: auto;
+            }
+            .dropdown__trigger-btn {
+                display: inline-flex !important;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                width: auto !important;
+                min-width: 90px;
+                max-width: 240px;
+                height: 32px;
+                padding: 0 12px !important;
+                background: var(--surface) !important;
+                border: 1px solid var(--border) !important;
+                border-radius: var(--radius-3xl, 24px) !important;
+                color: var(--foreground) !important;
+                font-size: 13px !important;
+                font-weight: 500 !important;
+                cursor: pointer;
+                transition: all 150ms var(--ease-smooth);
+                text-align: left;
+                white-space: nowrap;
+            }
+            .dropdown__trigger-btn > span {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .dropdown__trigger-btn:hover {
+                background: var(--surface-tertiary) !important;
+                border-color: var(--border-hover) !important;
+            }
+            .dropdown__trigger-chevron {
+                width: 14px;
+                height: 14px;
+                flex-shrink: 0;
+                margin-left: 6px;
+                color: var(--muted);
+                transition: transform 180ms var(--ease-smooth);
+            }
+            .dropdown[data-open="true"] .dropdown__trigger-chevron {
+                transform: rotate(180deg);
+                color: var(--foreground);
+            }
+            .dropdown__popover {
+                position: absolute;
+                top: calc(100% + 5px);
+                right: 0;
+                left: auto;
+                min-width: 210px;
+                width: max-content;
+                max-width: 320px;
+                background: var(--overlay);
+                color: var(--overlay-foreground);
+                border: 1px solid var(--border);
+                border-radius: var(--radius-lg);
+                box-shadow: 0 12px 30px -4px rgba(0, 0, 0, 0.45), 0 4px 12px -2px rgba(0, 0, 0, 0.25);
+                z-index: 100;
+                overflow: hidden;
+                animation: dropdownIn 160ms cubic-bezier(0.16, 1, 0.3, 1);
+            }
+            @keyframes dropdownIn {
+                from { opacity: 0; transform: translateY(-5px) scale(0.98); }
+                to { opacity: 1; transform: translateY(0) scale(1); }
+            }
+            .dropdown__menu {
+                display: flex;
+                flex-direction: column;
+                padding: 5px;
+                gap: 2px;
+                max-height: 250px;
+                overflow-y: auto;
+            }
+            .dropdown__item {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 7px 11px;
+                border-radius: var(--radius-md);
+                cursor: pointer;
+                color: var(--foreground);
+                transition: background 120ms, color 120ms;
+                user-select: none;
+            }
+            .dropdown__item:hover {
+                background: var(--surface-tertiary);
+            }
+            .dropdown__item[data-selected="true"] {
+                background: var(--accent-soft);
+                color: var(--accent);
+            }
+            .dropdown__item-content {
+                display: flex;
+                flex-direction: column;
+                gap: 1px;
+            }
+            .dropdown__item-label {
+                font-weight: 500;
+                font-size: 12.5px;
+            }
+            .dropdown__item-description {
+                font-size: 11px;
+                color: var(--muted);
+            }
+            .dropdown__item-indicator {
+                font-size: 12px;
+                font-weight: 700;
+                color: var(--accent);
+                margin-left: 8px;
+            }
+
+            /* HeroUI v3 TagGroup & Tag */
+            .tag-group {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+            }
+            .tag-group__label {
+                font-size: 11.5px;
+                font-weight: 600;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }
+            .tag-group__list {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 6px;
+            }
+            .tag {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                padding: 5px 12px;
+                border-radius: var(--radius-full);
+                font-size: 12px;
+                font-weight: 500;
+                background: var(--surface);
+                color: var(--foreground);
+                border: 1px solid var(--border);
+                cursor: pointer;
+                transition: all 140ms var(--ease-smooth);
+                user-select: none;
+                outline: none;
+            }
+            .tag:hover {
+                background: var(--surface-tertiary);
+                border-color: var(--border-hover);
+                transform: translateY(-1px);
+            }
+            .tag[data-selected="true"] {
+                background: var(--accent);
+                color: var(--accent-foreground);
+                border-color: var(--accent);
+                box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 35%, transparent);
+            }
+
+            /* Modal Header TagGroup Tab Navigation */
+            .modal__tab-group {
+                margin-top: 6px;
+                width: 100%;
+            }
+            .modal__tab-tags {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                padding: 4px;
+                border-radius: var(--radius-xl);
+                background: var(--surface-secondary);
+                border: 1px solid var(--border);
+                width: fit-content;
+                max-width: 100%;
+                overflow-x: auto;
+                scrollbar-width: none;
+            }
+            .modal__tab-tags::-webkit-scrollbar {
+                display: none;
+            }
+            .modal__tab-tags .tag {
+                padding: 7px 16px;
+                font-size: 13px;
+                font-weight: 500;
+                border-radius: calc(var(--radius-xl) - 4px);
+                border: 1px solid transparent;
+                background: transparent;
+                color: var(--muted);
+                cursor: pointer;
+                transition: all 180ms var(--ease-smooth);
+                white-space: nowrap;
+            }
+            .modal__tab-tags .tag:hover {
+                color: var(--foreground);
+                background: var(--surface-tertiary);
+                border-color: transparent;
+                transform: none;
+            }
+            .modal__tab-tags .tag[data-selected="true"] {
+                background: var(--surface);
+                color: var(--foreground);
+                font-weight: 600;
+                border: 1px solid var(--border);
+                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 3px 10px -2px rgba(0, 0, 0, 0.18);
+            }
+            .modal__tab-tags .tag[data-selected="true"]:hover {
+                background: var(--surface);
+                border-color: var(--border-hover);
+            }
+
+            /* HeroUI v3 Slider */
+            .slider {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                width: 100%;
+                user-select: none;
+            }
+            .slider--inline {
+                display: inline-flex;
+                flex-direction: row;
+                align-items: center;
+                gap: 12px;
+                width: auto;
+            }
+            .slider-track {
+                position: relative;
+                height: 6px;
+                width: 140px;
+                border-radius: var(--radius-full);
+                background: var(--surface-secondary);
+                border: 1px solid var(--border);
+                cursor: pointer;
+                touch-action: none;
+            }
+            .slider-fill {
+                position: absolute;
+                top: 0;
+                left: 0;
+                height: 100%;
+                border-radius: var(--radius-full);
+                background: var(--accent);
+                pointer-events: none;
+            }
+            .slider-thumb {
+                position: absolute;
+                top: 50%;
+                width: 16px;
+                height: 16px;
+                border-radius: 50%;
+                background: #ffffff;
+                border: 2px solid var(--accent);
+                box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+                transform: translate(-50%, -50%);
+                cursor: grab;
+                transition: transform 120ms ease, box-shadow 120ms ease;
+                outline: none;
+            }
+            .slider-thumb:hover {
+                transform: translate(-50%, -50%) scale(1.18);
+            }
+            .slider-thumb[data-dragging="true"], .slider-thumb:active {
+                cursor: grabbing;
+                transform: translate(-50%, -50%) scale(1.22);
+                box-shadow: 0 0 0 4px var(--accent-soft);
+            }
+            .slider__output {
+                font-size: 13px;
+                font-weight: 700;
+                color: var(--foreground);
+                min-width: 44px;
+                text-align: right;
+                font-variant-numeric: tabular-nums;
+            }
+        `;
     }
 
-    // ============================================================
-    // SETTINGS MODAL
-    // ============================================================
-    let modalEl = null;
-    let modalStatsInterval = null;
-    let capturingKeybind = false;
-
-    function getEffectiveTheme() {
-        if (settings.theme === 'auto') {
-            try { return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'; }
+    function getEffectiveTheme(thm) {
+        const t = thm || settings.theme;
+        if (t === 'auto') {
+            try { return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark'; }
             catch { return 'dark'; }
         }
-        return settings.theme;
-    }
-
-    function applyModalTheme() {
-        if (!modalEl) return;
-        modalEl.setAttribute('data-theme', getEffectiveTheme());
-        modalEl.style.setProperty('--ul-accent', settings.accentColor);
-    }
-
-    function readInputValue(input) {
-        if (input.type === 'checkbox') return input.checked;
-        if (input.type === 'number' || input.type === 'range') {
-            const n = parseFloat(input.value);
-            return isNaN(n) ? null : n;
-        }
-        return input.value;
-    }
-    function writeInputValue(input, value) {
-        if (input.type === 'checkbox') input.checked = !!value;
-        else input.value = value;
-    }
-
-    function updateRangeLabels() {
-        if (!modalEl) return;
-        const po = modalEl.querySelector('#ul-val-pillOpacity');
-        if (po) po.textContent = Math.round(settings.pillOpacity * 100) + '%';
-        const hint = modalEl.querySelector('#ul-range-hint');
-        if (hint) {
-            const a = settings.extraSecondsMin;
-            const b = settings.extraSecondsMax;
-            hint.textContent = (a === b)
-                ? `Every question gets +${a}s.`
-                : `Each question rolls a random +${a}–${b}s.`;
-        }
-    }
-
-    function updateKeybindBtn() {
-        if (!modalEl) return;
-        const btn = modalEl.querySelector('#ul-keybind-btn');
-        if (!btn) return;
-        if (capturingKeybind) {
-            btn.textContent = 'Press a key…';
-            btn.classList.add('ul-capturing');
-        } else {
-            btn.textContent = formatKeybind(settings.uiToggleKeybind);
-            btn.classList.remove('ul-capturing');
-        }
-    }
-
-    function updateServicesCount() {
-        if (!modalEl) return;
-        const el = modalEl.querySelector('#ul-services-count');
-        if (!el) return;
-        let on = 0, total = 0;
-        for (const k in TELEMETRY_SERVICES) {
-            total++;
-            if (settings.telemetryServices[k]) on++;
-        }
-        el.textContent = `${on}/${total}`;
-    }
-
-    function buildServicesList() {
-        if (!modalEl) return;
-        const container = modalEl.querySelector('#ul-services-list');
-        if (!container) return;
-        container.innerHTML = '';
-
-        for (const key in TELEMETRY_SERVICES) {
-            const svc = TELEMETRY_SERVICES[key];
-            const label = document.createElement('label');
-            label.className = 'ul-service-item';
-            label.title = svc.hosts.join(', ');
-
-            const input = document.createElement('input');
-            input.type = 'checkbox';
-            input.dataset.service = key;
-            input.checked = !!settings.telemetryServices[key];
-            // Jitsu is controlled by its own dedicated toggle — mark the checkbox disabled.
-            if (key === 'jitsu') {
-                input.disabled = true;
-                input.title = 'Controlled by "Suppress Jitsu telemetry" above';
-                label.title = input.title;
-            }
-
-            input.addEventListener('change', () => {
-                if (key === 'jitsu') return;
-                settings.telemetryServices[key] = input.checked;
-                if (!applyingPreset) settings.telemetryPreset = 'custom';
-                saveSettings();
-                updateServicesCount();
-                const presetEl = modalEl.querySelector('[data-setting="telemetryPreset"]');
-                if (presetEl) presetEl.value = settings.telemetryPreset;
-                LOG(`service "${svc.label}" ${input.checked ? 'ENABLED' : 'DISABLED'}`,
-                    `(${svc.hosts.join(', ')})`);
-            });
-
-            const span = document.createElement('span');
-            span.textContent = svc.label + (key === 'jitsu' ? '  (see toggle above)' : '');
-
-            label.appendChild(input);
-            label.appendChild(span);
-            container.appendChild(label);
-        }
-    }
-
-    function syncModalInputs() {
-        if (!modalEl) return;
-        modalEl.querySelectorAll('[data-setting]').forEach((input) => {
-            const key = input.dataset.setting;
-            if (!(key in settings)) return;
-            writeInputValue(input, settings[key]);
-        });
-        modalEl.querySelectorAll('[data-service]').forEach((input) => {
-            input.checked = !!settings.telemetryServices[input.dataset.service];
-        });
-        updateRangeLabels();
-        updateKeybindBtn();
-        updateServicesCount();
-        applyModalTheme();
-    }
-    function syncModalIfOpen() { if (modalEl) syncModalInputs(); }
-
-    function updateModalStats() {
-        if (!modalEl) return;
-        const set = (k, v) => {
-            const el = modalEl.querySelector(`[data-stat="${k}"]`);
-            if (el) el.textContent = v;
-        };
-        set('apiPosts',  stats.apiPosts);
-        set('blocked',   stats.blocked);
-        set('logImproperUseBlocked', stats.logImproperUseBlocked);
-        set('boosted',   stats.boosted);
-        set('pending',   accumulatedExtraSeconds + 's');
-        set('groupExtra', stats.groupExtra + 's');
-        set('fullscreenBlocked', stats.fullscreenBlocked);
-        set('consoleSuppressed', stats.consoleSuppressed);
-        set('jitsuPackets', stats.jitsuPackets);
+        return t;
     }
 
     function applySettingChange(key, value) {
@@ -1909,17 +3116,7 @@
             }
             saveSettings();
             LOG('telemetry preset:', value);
-            VLOG('preset expanded to:', {
-                services: Object.keys(TELEMETRY_SERVICES).filter((k) => k !== 'jitsu' && settings.telemetryServices[k]),
-                suppressJitsu:        settings.suppressJitsu,
-                blockLogImproperUse: settings.blockLogImproperUse,
-                blockDomElements:    settings.blockDomElements,
-                blockWebSockets:     settings.blockWebSockets,
-                blockSendBeacon:     settings.blockSendBeacon,
-                spoofVisibility:     settings.spoofVisibility,
-                suppressConsoleNoise: settings.suppressConsoleNoise,
-            });
-            syncModalInputs();
+            if (reactSetSettings) reactSetSettings(Object.assign({}, settings));
             return;
         }
 
@@ -1927,35 +3124,16 @@
 
         if (key === 'extraSecondsMin' || key === 'extraSecondsMax') {
             normalizeRange(settings);
-            if (modalEl) {
-                const minEl = modalEl.querySelector('[data-setting="extraSecondsMin"]');
-                const maxEl = modalEl.querySelector('[data-setting="extraSecondsMax"]');
-                if (minEl) minEl.value = settings.extraSecondsMin;
-                if (maxEl) maxEl.value = settings.extraSecondsMax;
-            }
         }
 
         if (!applyingPreset && INDIVIDUAL_TELEMETRY_SETTINGS.has(key)) {
             settings.telemetryPreset = 'custom';
-            if (modalEl) {
-                const presetEl = modalEl.querySelector('[data-setting="telemetryPreset"]');
-                if (presetEl) presetEl.value = 'custom';
-            }
         }
 
         saveSettings();
         LOG('setting changed:', key, '=', value);
 
         switch (key) {
-            case 'timeBoostEnabled':
-                applyPillAccent();
-                if (pillPaint) pillPaint();
-                break;
-            case 'extraSecondsMin':
-            case 'extraSecondsMax':
-                updateRangeLabels();
-                if (pillPaint) pillPaint();
-                break;
             case 'suppressJitsu':
                 LOG('Jitsu telemetry ' + (value ? 'SUPPRESSED (blocked + logged)' : 'ALLOWED (passed through + logged)'));
                 break;
@@ -1966,350 +3144,1666 @@
                 ensureDarkModeStyles();
                 applyDarkMode();
                 break;
-            case 'pillVisible':  applyPillVisibility(); break;
-            case 'pillPosition': applyPillPosition();  break;
-            case 'pillOpacity':  applyPillOpacity();   break;
-            case 'showStats':    if (pillPaint) pillPaint(); break;
-            case 'theme':
-            case 'accentColor':
-                applyModalTheme();
-                if (pillPaint) pillPaint();
-                break;
-            case 'uiToggleKeybind':
-                updateKeybindBtn();
-                if (pillPaint) pillPaint();
-                break;
             case 'logLevel':
                 LOG('log level set to:', value);
                 break;
         }
+
+        if (reactSetSettings) reactSetSettings(Object.assign({}, settings));
     }
 
     function openSettingsModal() {
-        if (modalEl) return;
-        if (!document.body) return;
-
-        ensureStyles();
-        capturingKeybind = false;
-
-        const overlay = document.createElement('div');
-        overlay.id = '__ul-settings-overlay';
-        overlay.innerHTML = `
-            <div class="ul-modal" id="__ul-modal" data-theme="dark">
-                <header class="ul-header">
-                    <div class="ul-title">
-                        <span class="ul-logo">⚙️</span>
-                        <h2>UpLearn Control Panel</h2>
-                    </div>
-                    <button class="ul-close" data-action="close" title="Close (Esc)" aria-label="Close">✕</button>
-                </header>
-                <div class="ul-body">
-
-                    <section class="ul-section">
-                        <h3>🛡 Telemetry Blocking</h3>
-                        <p class="ul-desc">Pick a preset or fine-tune exactly what gets blocked. Changes apply instantly.</p>
-
-                        <div class="ul-row">
-                            <label for="ul-set-telemetryPreset">Preset
-                                <small>Off · Simple (LogImproperUse only) · Harsh (block everything)</small>
-                            </label>
-                            <select id="ul-set-telemetryPreset" data-setting="telemetryPreset">
-                                <option value="off">Off</option>
-                                <option value="simple">Simple</option>
-                                <option value="harsh">Harsh</option>
-                                <option value="custom">Custom</option>
-                            </select>
-                        </div>
-
-                        <div class="ul-row">
-                            <label for="ul-set-blockLogImproperUse">Block LogImproperUse requests
-                                <small>Drops UpLearn improper-use telemetry sent to the API (logged distinctly in console)</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-blockLogImproperUse" data-setting="blockLogImproperUse">
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-blockDomElements">Block DOM telemetry injection
-                                <small>Hooks script/iframe src &amp; purges injected tags from blocked hosts</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-blockDomElements" data-setting="blockDomElements">
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-blockWebSockets">Block telemetry WebSockets
-                                <small>Kills Intercom / analytics socket connections</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-blockWebSockets" data-setting="blockWebSockets">
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-blockSendBeacon">Block telemetry sendBeacon
-                                <small>Drops beacon-style telemetry pings</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-blockSendBeacon" data-setting="blockSendBeacon">
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-spoofVisibility">Spoof visibility / focus
-                                <small>Page always believes it is visible &amp; focused</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-spoofVisibility" data-setting="spoofVisibility">
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-suppressConsoleNoise">Suppress site's telemetry console noise
-                                <small>Silences <code>[J-ERROR]</code>, Jitsu "Failed to send data", Apollo <code>go.apollo.dev/c/err</code> warnings, and any message mentioning a blocked host. DevTools network-tab errors cannot be suppressed.</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-suppressConsoleNoise" data-setting="suppressConsoleNoise">
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-suppressJitsu">Suppress Jitsu telemetry
-                                <small><strong>Checked:</strong> requests to <code>jitsu.uplearn.co.uk</code> are blocked (No progress analytics are sent). <strong>Unchecked:</strong> they pass through and every packet is logged to the console so you can inspect exactly what is being sent.</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-suppressJitsu" data-setting="suppressJitsu">
-                        </div>
-
-                        <details class="ul-details">
-                            <summary>Third-party services <span class="ul-count" id="ul-services-count">0/0</span></summary>
-                            <div class="ul-services-list" id="ul-services-list"></div>
-                        </details>
-                    </section>
-
-                    <section class="ul-section">
-                        <h3>⏱ Time Boost</h3>
-                        <p class="ul-desc">Add extra time to your quiz answer submissions. Quiz questions and group completion are always boosted automatically.</p>
-                        <div class="ul-row">
-                            <label for="ul-set-timeBoostEnabled">Enable time boost
-                                <small>Master switch for the +time feature</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-timeBoostEnabled" data-setting="timeBoostEnabled">
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-extraSecondsMin">Extra seconds range
-                                <small>Random extra time added to each question</small>
-                                <span class="ul-hint" id="ul-range-hint"></span>
-                            </label>
-                            <div class="ul-range-group">
-                                <input type="number" class="ul-num-sm" id="ul-set-extraSecondsMin"
-                                       data-setting="extraSecondsMin" min="1" max="3600" step="1" inputmode="numeric">
-                                <span class="ul-range-sep">to</span>
-                                <input type="number" class="ul-num-sm" id="ul-set-extraSecondsMax"
-                                       data-setting="extraSecondsMax" min="1" max="3600" step="1" inputmode="numeric">
-                                <span class="ul-range-unit">s</span>
-                            </div>
-                        </div>
-                    </section>
-
-                    <section class="ul-section">
-                        <h3>🖥 Page Behaviour</h3>
-                        <div class="ul-row">
-                            <label for="ul-set-disableAutoFullscreen">Disable auto fullscreen
-                                <small>Blocks the site from silently entering fullscreen mode</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-disableAutoFullscreen" data-setting="disableAutoFullscreen">
-                        </div>
-                    </section>
-
-                    <section class="ul-section">
-                        <h3>🌙 Appearance</h3>
-                        <div class="ul-row">
-                            <label for="ul-set-darkMode">Dark mode
-                                <small>Soft dark theme — consistent across all pages, top bar preserved</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-darkMode" data-setting="darkMode">
-                        </div>
-                    </section>
-
-                    <section class="ul-section">
-                        <h3>🎨 Interface</h3>
-                        <div class="ul-row">
-                            <label for="ul-set-pillVisible">Show control pill
-                                <small>Hide/show the floating status pill</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-pillVisible" data-setting="pillVisible">
-                        </div>
-                        <div class="ul-row">
-                            <label>Toggle-pill keybind
-                                <small>Press to show/hide the pill. Click to record a new one.</small>
-                            </label>
-                            <div class="ul-keybind-group">
-                                <button type="button" class="ul-keybind-btn" id="ul-keybind-btn">Right Ctrl</button>
-                                <button type="button" class="ul-keybind-clear" id="ul-keybind-clear" title="Clear keybind">✕</button>
-                            </div>
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-pillPosition">Pill position</label>
-                            <select id="ul-set-pillPosition" data-setting="pillPosition">
-                                <option value="bottom-right">Bottom right</option>
-                                <option value="bottom-left">Bottom left</option>
-                                <option value="top-right">Top right</option>
-                                <option value="top-left">Top left</option>
-                            </select>
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-pillOpacity">Pill opacity</label>
-                            <div style="display:flex;align-items:center;gap:12px;">
-                                <input type="range" id="ul-set-pillOpacity" data-setting="pillOpacity" min="0.2" max="1" step="0.05">
-                                <span class="ul-val" id="ul-val-pillOpacity">100%</span>
-                            </div>
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-showStats">Show live stats on pill
-                                <small>Displays blocked / boosted counts on the pill</small>
-                            </label>
-                            <input type="checkbox" id="ul-set-showStats" data-setting="showStats">
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-theme">Panel theme</label>
-                            <select id="ul-set-theme" data-setting="theme">
-                                <option value="dark">Dark</option>
-                                <option value="light">Light</option>
-                                <option value="auto">Auto (follow system)</option>
-                            </select>
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-accentColor">Accent colour</label>
-                            <input type="color" id="ul-set-accentColor" data-setting="accentColor">
-                        </div>
-                        <div class="ul-row">
-                            <label for="ul-set-logLevel">Console logging
-                                <small>Verbose shows grouped block reports with full details &amp; bodies</small>
-                            </label>
-                            <select id="ul-set-logLevel" data-setting="logLevel">
-                                <option value="silent">Silent</option>
-                                <option value="normal">Normal</option>
-                                <option value="verbose">Verbose</option>
-                            </select>
-                        </div>
-                    </section>
-
-                    <section class="ul-section">
-                        <h3>📊 Stats</h3>
-                        <p class="ul-desc">Live counters for this session.</p>
-                        <div class="ul-stats">
-                            <div class="ul-stat"><div class="ul-stat-label">API POSTs</div><div class="ul-stat-value" data-stat="apiPosts">0</div></div>
-                            <div class="ul-stat"><div class="ul-stat-label">Blocked</div><div class="ul-stat-value" data-stat="blocked">0</div></div>
-                            <div class="ul-stat"><div class="ul-stat-label">LogImproperUse</div><div class="ul-stat-value" data-stat="logImproperUseBlocked">0</div></div>
-                            <div class="ul-stat"><div class="ul-stat-label">Boosted</div><div class="ul-stat-value" data-stat="boosted">0</div></div>
-                            <div class="ul-stat"><div class="ul-stat-label">Pending bonus</div><div class="ul-stat-value" data-stat="pending">0s</div></div>
-                            <div class="ul-stat"><div class="ul-stat-label">Group bonus</div><div class="ul-stat-value" data-stat="groupExtra">0s</div></div>
-                            <div class="ul-stat"><div class="ul-stat-label">FS Blocked</div><div class="ul-stat-value" data-stat="fullscreenBlocked">0</div></div>
-                            <div class="ul-stat"><div class="ul-stat-label">Console muted</div><div class="ul-stat-value" data-stat="consoleSuppressed">0</div></div>
-                            <div class="ul-stat"><div class="ul-stat-label">Jitsu packets</div><div class="ul-stat-value" data-stat="jitsuPackets">0</div></div>
-                        </div>
-                        <div style="margin-top:10px;">
-                            <button class="ul-btn ul-btn-secondary" data-action="reset-stats">Reset stats</button>
-                        </div>
-                    </section>
-
-                </div>
-                <footer class="ul-footer">
-                    <button class="ul-btn ul-btn-danger" data-action="reset-all">Reset all settings</button>
-                    <div class="ul-spacer"></div>
-                    <button class="ul-btn" data-action="close">Done</button>
-                </footer>
-            </div>
-        `;
-        document.body.appendChild(overlay);
-        modalEl = overlay.querySelector('#__ul-modal');
-
-        buildServicesList();
-
-        overlay.querySelectorAll('[data-setting]').forEach((input) => {
-            const key = input.dataset.setting;
-            const handler = () => {
-                const val = readInputValue(input);
-                if (val === null) return;
-                applySettingChange(key, val);
-            };
-            input.addEventListener('change', handler);
-            if (input.type === 'range') input.addEventListener('input', handler);
-            if (input.type === 'number') {
-                input.addEventListener('blur', () => {
-                    applySettingChange(key, readInputValue(input));
-                });
-                input.addEventListener('keydown', (e) => {
-                    if (e.key === 'Enter') {
-                        e.preventDefault();
-                        applySettingChange(key, readInputValue(input));
-                        input.blur();
-                    }
-                });
-            }
-        });
-
-        const kbBtn   = overlay.querySelector('#ul-keybind-btn');
-        const kbClear = overlay.querySelector('#ul-keybind-clear');
-
-        kbBtn.addEventListener('click', (e) => {
-            e.preventDefault(); e.stopPropagation();
-            capturingKeybind = !capturingKeybind;
-            updateKeybindBtn();
-            LOG('keybind capture ' + (capturingKeybind ? 'started' : 'cancelled'));
-        });
-        kbClear.addEventListener('click', (e) => {
-            e.preventDefault(); e.stopPropagation();
-            if (capturingKeybind) { capturingKeybind = false; updateKeybindBtn(); return; }
-            applySettingChange('uiToggleKeybind', { code: null, ctrl: false, shift: false, alt: false, meta: false });
-            LOG('keybind cleared');
-        });
-
-        overlay.addEventListener('click', (e) => {
-            const actionEl = e.target.closest('[data-action]');
-            if (actionEl) {
-                const action = actionEl.dataset.action;
-                if (action === 'close') { closeSettingsModal(); return; }
-                if (action === 'reset-all') {
-                    if (confirm('Reset all settings to defaults?')) {
-                        Object.assign(settings, DEFAULT_SETTINGS);
-                        settings.telemetryServices = buildDefaultTelemetryServices();
-                        settings.uiToggleKeybind = Object.assign({}, DEFAULT_KEYBIND);
-                        normalizeRange(settings);
-                        saveSettings();
-                        buildServicesList();
-                        syncModalInputs();
-                        applyPillPosition();
-                        applyPillVisibility();
-                        applyPillOpacity();
-                        applyDarkMode();
-                        if (pillPaint) pillPaint();
-                        LOG('settings reset to defaults');
-                    }
-                    return;
-                }
-                if (action === 'reset-stats') {
-                    stats.apiPosts = 0; stats.seen = 0; stats.boosted = 0;
-                    stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
-                    stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
-                    stats.jitsuPackets = 0;
-                    accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
-                    updateModalStats();
-                    if (pillPaint) pillPaint();
-                    LOG('stats reset');
-                    return;
-                }
-                return;
-            }
-            if (e.target === overlay) closeSettingsModal();
-        });
-
-        overlay.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' && !capturingKeybind) {
-                e.stopPropagation();
-                closeSettingsModal();
-            }
-        });
-        overlay.tabIndex = -1;
-        overlay.focus();
-
-        syncModalInputs();
-        updateModalStats();
-        modalStatsInterval = setInterval(updateModalStats, 400);
-        LOG('Settings modal opened');
+        if (reactSetModalOpen) {
+            reactSetModalOpen(true);
+        } else {
+            ensureUIHost();
+            setTimeout(() => { if (reactSetModalOpen) reactSetModalOpen(true); }, 50);
+        }
     }
 
     function closeSettingsModal() {
-        capturingKeybind = false;
-        const overlay = document.getElementById('__ul-settings-overlay');
-        if (overlay) overlay.remove();
-        modalEl = null;
-        if (modalStatsInterval) { clearInterval(modalStatsInterval); modalStatsInterval = null; }
-        LOG('Settings modal closed');
+        if (reactSetModalOpen) reactSetModalOpen(false);
+    }
+
+    function syncModalIfOpen() {
+        if (reactSetSettings) reactSetSettings(Object.assign({}, settings));
+    }
+
+    // ============================================================
+    // HEROUI v3 REACT COMPOUND COMPONENTS
+    // ============================================================
+    const html = (typeof htm !== 'undefined' && typeof React !== 'undefined')
+        ? htm.bind(React.createElement)
+        : null;
+
+    // ============================================================
+    // HEROUI V3 BUTTON & BUTTON GROUP COMPONENTS
+    // Documentation: https://heroui.com/docs/react/components/button
+    // ============================================================
+    const Spinner = ({ size = 'sm', color = 'current', className = '' }) => {
+        const px = size === 'sm' ? 14 : size === 'lg' ? 20 : 16;
+        return html`
+            <span className=${`button__spinner ${className}`} data-slot="spinner" style=${{ display: 'inline-flex', width: `${px}px`, height: `${px}px` }}>
+                <svg width=${px} height=${px} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" style=${{ color: color === 'current' ? 'currentColor' : color }}>
+                    <path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48l2.83-2.83" opacity="0.3" />
+                    <path d="M12 2a10 10 0 0 1 10 10" />
+                </svg>
+            </span>
+        `;
+    };
+
+    const Button = ({
+        variant = 'primary',
+        size = 'md',
+        fullWidth = false,
+        isDisabled = false,
+        disabled = false,
+        isPending = false,
+        isIconOnly = false,
+        onPress,
+        onClick,
+        className = '',
+        title = '',
+        style = {},
+        slot = '',
+        type = 'button',
+        children,
+        ...restProps
+    }) => {
+        const [isHovered, setIsHovered] = React.useState(false);
+        const [isPressed, setIsPressed] = React.useState(false);
+        const [isFocused, setIsFocused] = React.useState(false);
+        const [isFocusVisible, setIsFocusVisible] = React.useState(false);
+
+        const effectiveDisabled = Boolean(isDisabled || disabled);
+
+        const handlePress = (e) => {
+            if (effectiveDisabled || isPending) {
+                e.preventDefault();
+                return;
+            }
+            if (onPress) onPress(e);
+            else if (onClick) onClick(e);
+        };
+
+        const classes = [
+            'button',
+            `button--${variant}`,
+            `button--${size}`,
+            fullWidth ? 'button--full-width' : '',
+            isIconOnly ? 'button--icon-only' : '',
+            className
+        ].filter(Boolean).join(' ');
+
+        const renderProps = {
+            isPending,
+            isPressed,
+            isHovered,
+            isFocused,
+            isFocusVisible,
+            isDisabled: effectiveDisabled,
+        };
+
+        const content = typeof children === 'function' ? children(renderProps) : children;
+
+        return html`
+            <button
+                type=${type}
+                className=${classes}
+                title=${title}
+                disabled=${effectiveDisabled}
+                data-slot="button"
+                slot=${slot || undefined}
+                data-hovered=${isHovered ? 'true' : undefined}
+                data-pressed=${isPressed ? 'true' : undefined}
+                data-focus-visible=${isFocusVisible ? 'true' : undefined}
+                data-pending=${isPending ? 'true' : undefined}
+                aria-disabled=${effectiveDisabled ? 'true' : undefined}
+                onClick=${handlePress}
+                onPointerDown=${() => !effectiveDisabled && setIsPressed(true)}
+                onPointerUp=${() => setIsPressed(false)}
+                onPointerCancel=${() => setIsPressed(false)}
+                onMouseEnter=${() => setIsHovered(true)}
+                onMouseLeave=${() => { setIsHovered(false); setIsPressed(false); }}
+                onFocus=${() => { setIsFocused(true); setIsFocusVisible(true); }}
+                onBlur=${() => { setIsFocused(false); setIsFocusVisible(false); }}
+                style=${style}
+                ...${restProps}
+            >
+                ${isPending && (typeof children !== 'function') ? html`
+                    <${Spinner} size=${size === 'lg' ? 'md' : 'sm'} color="current" />
+                ` : null}
+                ${content}
+            </button>
+        `;
+    };
+
+    const ButtonGroup = ({ orientation = 'horizontal', fullWidth = false, size = 'md', className = '', children }) => html`
+        <div 
+            className=${`button-group button-group--${orientation} ${fullWidth ? 'button-group--full-width' : ''} ${className}`}
+            role="group"
+            data-slot="button-group"
+        >
+            ${children}
+        </div>
+    `;
+    ButtonGroup.Separator = () => html`<span className="button-group__separator" aria-hidden="true"></span>`;
+
+    // --- Modal Compound Component (HeroUI v3) ---
+    const Modal = ({ isOpen, isClosing, onClose, children }) => {
+        if (!isOpen && !isClosing) return null;
+        return children;
+    };
+    Modal.Backdrop = ({ isClosing, onClose, children }) => html`
+        <div 
+            id="__ul-settings-overlay"
+            className=${`modal__backdrop modal__backdrop--blur ${isClosing ? 'modal__backdrop--closing' : ''}`}
+            onClick=${(e) => {
+                if (e.target && e.target.id === '__ul-settings-overlay') onClose();
+            }}
+        >
+            ${children}
+        </div>
+    `;
+    Modal.Container = ({ children }) => html`
+        <div className="modal__container" data-placement="center">${children}</div>
+    `;
+    Modal.Dialog = ({ children }) => html`
+        <div 
+            className="modal__dialog modal__dialog--lg modal__dialog--scroll-inside" 
+            role="dialog" 
+            aria-modal="true"
+            onClick=${(e) => e.stopPropagation()}
+        >
+            ${children}
+        </div>
+    `;
+    Modal.Header = ({ children }) => html`<header className="modal__header">${children}</header>`;
+    Modal.Brand = ({ children }) => html`<div className="modal__brand">${children}</div>`;
+    Modal.Icon = ({ children }) => html`<div className="modal__icon">${children}</div>`;
+    Modal.Heading = ({ children }) => html`<div className="modal__title-box"><h2 className="modal__heading">${children}</h2></div>`;
+    Modal.CloseTrigger = ({ onPress }) => html`
+        <${Button} 
+            type="button" 
+            variant="ghost" 
+            size="sm" 
+            isIconOnly 
+            className="modal__close-trigger" 
+            onPress=${onPress} 
+            title="Close (Esc)"
+            aria-label="Close modal"
+        >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18"></line>
+                <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+        <//>
+    `;
+    Modal.Footer = ({ children }) => html`<footer className="modal__footer">${children}</footer>`;
+    Modal.Body = ({ children }) => html`<div className="modal__body modal__body--scroll-inside">${children}</div>`;
+
+    // --- Tabs Compound Component (HeroUI v3) ---
+    const Tabs = ({ children }) => html`<div className="tabs tabs--secondary">${children}</div>`;
+    Tabs.ListContainer = ({ children }) => html`<div className="tabs__list-container">${children}</div>`;
+    Tabs.List = ({ innerRef, children }) => html`<div className="tabs__list" role="tablist" ref=${innerRef}>${children}</div>`;
+    Tabs.Tab = ({ id, isSelected, onPress, innerRef, children }) => html`
+        <button 
+            type="button" 
+            className="tabs__tab" 
+            role="tab" 
+            data-tab=${id} 
+            data-selected=${isSelected ? 'true' : 'false'}
+            onClick=${onPress}
+            ref=${innerRef}
+        >
+            ${children}
+        </button>
+    `;
+    Tabs.Indicator = ({ style }) => html`<div className="tabs__indicator" style=${style}></div>`;
+    Tabs.Panel = ({ id, activeTab, direction, children }) => {
+        const isActive = id === activeTab;
+        return html`
+            <div 
+                className="tabs__panel" 
+                data-tab=${id} 
+                data-active=${isActive ? 'true' : undefined}
+                data-direction=${direction}
+                style=${isActive ? {} : { display: 'none' }}
+            >
+                ${children}
+            </div>
+        `;
+    };
+
+    // --- Switch Compound Component (HeroUI v3) ---
+    const Switch = ({ isSelected, onChange, size = 'md', isDisabled = false, className = '', children, onClick }) => {
+        const toggle = (e) => {
+            if (isDisabled) return;
+            if (e) e.stopPropagation();
+            if (onClick) onClick(e);
+            if (onChange) onChange(!isSelected);
+        };
+        const onKeyDown = (e) => {
+            if (isDisabled) return;
+            if (e.key === ' ' || e.key === 'Enter') {
+                e.preventDefault();
+                toggle(e);
+            }
+        };
+        return html`
+            <div 
+                className=${`switch switch--${size} ${className}`.trim()}
+                role="switch" 
+                tabIndex=${isDisabled ? '-1' : '0'}
+                data-selected=${isSelected ? 'true' : 'false'}
+                data-disabled=${isDisabled ? 'true' : undefined}
+                aria-checked=${isSelected ? 'true' : 'false'}
+                aria-disabled=${isDisabled ? 'true' : undefined}
+                onClick=${toggle}
+                onKeyDown=${onKeyDown}
+            >
+                ${children}
+            </div>
+        `;
+    };
+    Switch.Control = ({ children }) => html`<div className="switch__control">${children || html`<div className="switch__thumb"></div>`}</div>`;
+    Switch.Thumb = ({ children }) => html`<div className="switch__thumb">${children}</div>`;
+    Switch.Content = ({ children }) => html`<div className="switch__content">${children}</div>`;
+    Switch.Label = ({ children }) => html`<div data-slot="label">${children}</div>`;
+    Switch.Description = ({ children }) => html`<div data-slot="description">${children}</div>`;
+
+    // --- Card Compound Component (HeroUI v3) ---
+    const Card = ({ variant = 'secondary', className = '', children }) => html`
+        <div className=${`card card--${variant} ${className}`}>${children}</div>
+    `;
+    Card.Header = ({ className = '', children }) => html`<div className=${`card__header ${className}`.trim()}>${children}</div>`;
+    Card.Title = ({ className = '', children }) => html`<div className=${`card__title ${className}`.trim()}>${children}</div>`;
+    Card.Description = ({ className = '', children }) => html`<div className=${`card__description ${className}`.trim()}>${children}</div>`;
+    Card.Content = ({ className = '', children }) => html`<div className=${`card__content ${className}`.trim()}>${children}</div>`;
+
+    // --- Badge Component (HeroUI v3) ---
+    const Badge = ({ size = 'sm', variant = 'primary', color = '', className = '', children }) => html`
+        <span className=${`badge badge--${size} badge--${variant} ${color ? `badge--${color}` : ''} ${className}`}>
+            ${children}
+        </span>
+    `;
+
+    // --- Dropdown Compound Component (HeroUI v3) ---
+    const DropdownContext = (typeof React !== 'undefined') ? React.createContext(null) : null;
+
+    const Dropdown = ({ selectedKey, onSelectionChange, className = '', children }) => {
+        const [isOpen, setIsOpen] = React.useState(false);
+        const dropdownRef = React.useRef(null);
+
+        React.useEffect(() => {
+            if (!isOpen) return;
+            const handleDocClick = (e) => {
+                if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
+                    setIsOpen(false);
+                }
+            };
+            window.addEventListener('click', handleDocClick);
+            return () => window.removeEventListener('click', handleDocClick);
+        }, [isOpen]);
+
+        const contextValue = React.useMemo(() => ({
+            isOpen,
+            setIsOpen,
+            selectedKey,
+            onSelectionChange: (key) => {
+                if (onSelectionChange) onSelectionChange(key);
+                setIsOpen(false);
+            }
+        }), [isOpen, selectedKey, onSelectionChange]);
+
+        return html`
+            <div ref=${dropdownRef} className=${`dropdown ${className}`} data-open=${isOpen ? 'true' : 'false'}>
+                <${DropdownContext.Provider} value=${contextValue}>
+                    ${children}
+                <//>
+            </div>
+        `;
+    };
+
+    Dropdown.Trigger = ({ children }) => {
+        const ctx = React.useContext(DropdownContext);
+        return html`
+            <div 
+                className="dropdown__trigger-wrapper"
+                onClick=${(e) => {
+                    e.stopPropagation();
+                    if (ctx) ctx.setIsOpen(!ctx.isOpen);
+                }}
+            >
+                ${children}
+            </div>
+        `;
+    };
+
+    Dropdown.Popover = ({ children }) => {
+        const ctx = React.useContext(DropdownContext);
+        if (!ctx || !ctx.isOpen) return null;
+        return html`
+            <div className="dropdown__popover" onClick=${(e) => e.stopPropagation()}>
+                ${children}
+            </div>
+        `;
+    };
+
+    Dropdown.Menu = ({ children }) => html`<div className="dropdown__menu" role="menu">${children}</div>`;
+
+    Dropdown.Item = ({ id, variant, children }) => {
+        const ctx = React.useContext(DropdownContext);
+        const isSelected = ctx && ctx.selectedKey === id;
+        return html`
+            <div 
+                className=${`dropdown__item ${variant === 'danger' ? 'dropdown__item--danger' : ''}`}
+                role="menuitem"
+                data-selected=${isSelected ? 'true' : 'false'}
+                onClick=${() => {
+                    if (ctx && ctx.onSelectionChange) ctx.onSelectionChange(id);
+                }}
+            >
+                <div className="dropdown__item-content">${children}</div>
+                ${isSelected ? html`<span className="dropdown__item-indicator">✓</span>` : null}
+            </div>
+        `;
+    };
+    Dropdown.Item.Label = ({ children }) => html`<div className="dropdown__item-label">${children}</div>`;
+    Dropdown.Item.Description = ({ children }) => html`<div className="dropdown__item-description">${children}</div>`;
+
+    // --- TagGroup Compound Component (HeroUI v3) ---
+    const TagGroupContext = (typeof React !== 'undefined') ? React.createContext(null) : null;
+
+    const TagGroup = ({ ariaLabel, selectionMode = 'single', selectedKeys, onSelectionChange, className = '', children }) => {
+        const contextValue = React.useMemo(() => ({
+            selectedKeys: selectedKeys || [],
+            selectionMode,
+            onSelect: (id) => {
+                if (onSelectionChange) onSelectionChange(id);
+            }
+        }), [selectedKeys, selectionMode, onSelectionChange]);
+
+        return html`
+            <div className=${`tag-group ${className}`.trim()} role="group" aria-label=${ariaLabel}>
+                <${TagGroupContext.Provider} value=${contextValue}>
+                    ${children}
+                <//>
+            </div>
+        `;
+    };
+    TagGroup.Label = ({ className = '', children }) => html`<div className=${`tag-group__label ${className}`.trim()}>${children}</div>`;
+    TagGroup.List = ({ className = '', children }) => html`<div className=${`tag-group__list ${className}`.trim()}>${children}</div>`;
+
+    const Tag = ({ id, onPress, onClick, className = '', children }) => {
+        const ctx = React.useContext(TagGroupContext);
+        const isSelected = ctx ? ctx.selectedKeys.includes(id) : false;
+        return html`
+            <div 
+                className=${`tag ${className}`.trim()} 
+                role="button"
+                tabIndex="0"
+                data-id=${id}
+                data-selected=${isSelected ? 'true' : 'false'}
+                onClick=${() => {
+                    if (onPress) onPress(id);
+                    else if (onClick) onClick(id);
+                    else if (ctx) ctx.onSelect(id);
+                }}
+                onKeyDown=${(e) => {
+                    if (e.key === ' ' || e.key === 'Enter') {
+                        e.preventDefault();
+                        if (onPress) onPress(id);
+                        else if (onClick) onClick(id);
+                        else if (ctx) ctx.onSelect(id);
+                    }
+                }}
+            >
+                ${children}
+            </div>
+        `;
+    };
+    TagGroup.Tag = Tag;
+
+    const PRESET_OPTIONS = [
+        { id: 'off', label: 'Off', desc: 'Allows all telemetry traffic without blocking' },
+        { id: 'simple', label: 'Simple', desc: 'Silently blocks LogImproperUse only' },
+        { id: 'harsh', label: 'Harsh', desc: 'Aggressive network & script suppression' },
+        { id: 'custom', label: 'Custom', desc: 'Individually selected tracker blockers' },
+    ];
+
+    const PILL_MODE_OPTIONS = [
+        { id: 'minimal', label: 'Settings Button Only', desc: 'Cleanest floating circle button (Default)' },
+        { id: 'boost', label: 'Time Boost & Settings', desc: 'Shows active boost status & settings' },
+        { id: 'compact', label: 'Compact Details', desc: 'Shows boost status & blocked network count' },
+        { id: 'full', label: 'Full Details', desc: 'Shows full metrics and boosted questions' },
+    ];
+
+    const PILL_POS_OPTIONS = [
+        { id: 'bottom-right', label: 'Bottom Right', desc: 'Floats in the bottom-right corner' },
+        { id: 'bottom-left', label: 'Bottom Left', desc: 'Floats in the bottom-left corner' },
+        { id: 'top-right', label: 'Top Right', desc: 'Floats in the top-right corner' },
+        { id: 'top-left', label: 'Top Left', desc: 'Floats in the top-left corner' },
+    ];
+
+    const THEME_OPTIONS = [
+        { id: 'dark', label: 'Dark', desc: 'HeroUI high-contrast dark theme' },
+        { id: 'light', label: 'Light', desc: 'HeroUI clean light theme' },
+        { id: 'auto', label: 'Auto (System)', desc: 'Matches system dark/light preference' },
+    ];
+
+    const LOG_LEVEL_OPTIONS = [
+        { id: 'silent', label: 'Silent', desc: 'Mutes all console logs' },
+        { id: 'normal', label: 'Normal', desc: 'Logs key operations and warnings' },
+        { id: 'verbose', label: 'Verbose', desc: 'Full network packets and grouped reports' },
+    ];
+
+    // --- Slider Compound Component (HeroUI v3) ---
+    const SliderContext = (typeof React !== 'undefined') ? React.createContext(null) : null;
+
+    const Slider = ({
+        value,
+        defaultValue = 0,
+        minValue = 0,
+        maxValue = 100,
+        step = 1,
+        isDisabled = false,
+        onChange,
+        className = '',
+        children,
+    }) => {
+        const [internalValue, setInternalValue] = React.useState(typeof value !== 'undefined' ? value : defaultValue);
+        const [isDragging, setIsDragging] = React.useState(false);
+        const trackRef = React.useRef(null);
+
+        const curVal = typeof value !== 'undefined' ? value : internalValue;
+        const percentage = Math.max(0, Math.min(100, ((curVal - minValue) / (maxValue - minValue)) * 100));
+
+        const triggerChange = React.useCallback((nextVal) => {
+            const clamped = Math.max(minValue, Math.min(maxValue, parseFloat(nextVal.toFixed(4))));
+            setInternalValue(clamped);
+            if (onChange) onChange(clamped);
+        }, [minValue, maxValue, onChange]);
+
+        const updateFromPointer = React.useCallback((clientX) => {
+            if (!trackRef.current || isDisabled) return;
+            const rect = trackRef.current.getBoundingClientRect();
+            if (rect.width <= 0) return;
+            const pos = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+            let raw = minValue + pos * (maxValue - minValue);
+            if (step) {
+                raw = Math.round((raw - minValue) / step) * step + minValue;
+            }
+            triggerChange(raw);
+        }, [minValue, maxValue, step, isDisabled, triggerChange]);
+
+        const handlePointerDown = (e) => {
+            if (isDisabled) return;
+            e.preventDefault();
+            setIsDragging(true);
+            updateFromPointer(e.clientX);
+
+            const onMove = (ev) => updateFromPointer(ev.clientX);
+            const onUp = () => {
+                setIsDragging(false);
+                window.removeEventListener('pointermove', onMove);
+                window.removeEventListener('pointerup', onUp);
+            };
+            window.addEventListener('pointermove', onMove);
+            window.addEventListener('pointerup', onUp);
+        };
+
+        const handleKeyDown = (e) => {
+            if (isDisabled) return;
+            if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+                e.preventDefault();
+                triggerChange(curVal + step);
+            } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+                e.preventDefault();
+                triggerChange(curVal - step);
+            } else if (e.key === 'Home') {
+                e.preventDefault();
+                triggerChange(minValue);
+            } else if (e.key === 'End') {
+                e.preventDefault();
+                triggerChange(maxValue);
+            }
+        };
+
+        const contextValue = React.useMemo(() => ({
+            value: curVal,
+            minValue,
+            maxValue,
+            percentage,
+            isDragging,
+            isDisabled,
+            trackRef,
+            handlePointerDown,
+            handleKeyDown,
+        }), [curVal, minValue, maxValue, percentage, isDragging, isDisabled]);
+
+        return html`
+            <div 
+                className=${`slider ${className}`.trim()}
+                data-disabled=${isDisabled ? 'true' : undefined}
+                data-dragging=${isDragging ? 'true' : undefined}
+            >
+                <${SliderContext.Provider} value=${contextValue}>
+                    ${children}
+                <//>
+            </div>
+        `;
+    };
+
+    Slider.Output = ({ className = '', children }) => {
+        const ctx = React.useContext(SliderContext);
+        return html`
+            <output className=${`slider__output ${className}`.trim()}>
+                ${children ? children : `${Math.round(ctx ? ctx.percentage : 0)}%`}
+            </output>
+        `;
+    };
+
+    Slider.Track = ({ className = '', children }) => {
+        const ctx = React.useContext(SliderContext);
+        return html`
+            <div 
+                ref=${ctx ? ctx.trackRef : null}
+                className=${`slider-track ${className}`.trim()}
+                onPointerDown=${ctx ? ctx.handlePointerDown : null}
+            >
+                ${children}
+            </div>
+        `;
+    };
+
+    Slider.Fill = ({ className = '' }) => {
+        const ctx = React.useContext(SliderContext);
+        const width = ctx ? `${ctx.percentage}%` : '0%';
+        return html`<div className=${`slider-fill ${className}`.trim()} style=${{ width }}></div>`;
+    };
+
+    Slider.Thumb = ({ className = '' }) => {
+        const ctx = React.useContext(SliderContext);
+        const left = ctx ? `${ctx.percentage}%` : '0%';
+        return html`
+            <div 
+                className=${`slider-thumb ${className}`.trim()}
+                role="slider"
+                tabIndex="0"
+                aria-valuenow=${ctx ? ctx.value : 0}
+                aria-valuemin=${ctx ? ctx.minValue : 0}
+                aria-valuemax=${ctx ? ctx.maxValue : 100}
+                data-dragging=${ctx && ctx.isDragging ? 'true' : undefined}
+                onKeyDown=${ctx ? ctx.handleKeyDown : null}
+                style=${{ left }}
+            ></div>
+        `;
+    };
+
+    // --- ServiceTile Component (HeroUI v3 Switch) ---
+    const ServiceTile = ({ serviceKey, service, isChecked, onToggle }) => html`
+        <div 
+            className="service-tile"
+            data-service=${serviceKey}
+            data-checked=${isChecked ? 'true' : 'false'}
+            title=${service.hosts.join(', ')}
+            onClick=${onToggle}
+        >
+            <span className="service-tile__label">${service.label}</span>
+            <${Switch} 
+                isSelected=${isChecked} 
+                onChange=${onToggle}
+                size="sm"
+                className="service-tile__switch"
+            >
+                <${Switch.Control}>
+                    <${Switch.Thumb} />
+                <//>
+            <//>
+        </div>
+    `;
+
+    // --- StatusPill Component (Floating UI) ---
+    const StatusPill = ({ currentSettings, currentStats, accumulatedBonus, onToggleBoost, onOpenSettings }) => {
+        if (!currentSettings.pillVisible) return null;
+        const mode = currentSettings.pillMode || 'minimal';
+        const isMinimal = mode === 'minimal';
+        const isCompact = mode === 'compact';
+        const isFull    = mode === 'full';
+        const enabled   = currentSettings.timeBoostEnabled;
+
+        const pos = POSITION_STYLES[currentSettings.pillPosition] || POSITION_STYLES['bottom-right'];
+        const pillStyle = Object.assign({}, pos, {
+            opacity: String(currentSettings.pillOpacity),
+            display: 'flex',
+        });
+
+        const rangeLabel = currentSettings.extraSecondsMin === currentSettings.extraSecondsMax
+            ? `+${currentSettings.extraSecondsMin}s`
+            : `+${currentSettings.extraSecondsMin}–${currentSettings.extraSecondsMax}s`;
+
+        const kbText = formatKeybind(currentSettings.uiToggleKeybind);
+        const tooltip = isMinimal
+            ? `UpLearn Control Panel (${kbText}) | Boost: ${enabled ? 'ON' : 'OFF'}`
+            : `Click badge: toggle time boost | Click gear: Control Panel | ${kbText}: hide/show`;
+
+        return html`
+            <div 
+                id="__ul-pill"
+                className=${`heroui-pill ${isMinimal ? 'heroui-pill--minimal' : ''}`}
+                data-mode=${mode}
+                style=${pillStyle}
+                title=${tooltip}
+                onClick=${(e) => {
+                    if (isMinimal) {
+                        e.preventDefault(); e.stopPropagation();
+                        onOpenSettings();
+                    }
+                }}
+            >
+                <div 
+                    className="heroui-pill__main"
+                    onClick=${(e) => {
+                        if (!isMinimal) {
+                            e.preventDefault(); e.stopPropagation();
+                            onToggleBoost();
+                        }
+                    }}
+                >
+                    <span className=${`heroui-pill__badge badge badge--sm ${enabled ? 'badge--primary badge--accent' : 'badge--secondary'}`}>
+                        <span className="heroui-pill__dot"></span>
+                        <span className="heroui-pill__label">${rangeLabel} ${enabled ? 'Active' : 'Paused'}</span>
+                    </span>
+                    <span className="heroui-pill__stats">
+                        <span 
+                            className="heroui-pill__stat-item" 
+                            style=${{ display: (isCompact || isFull) ? 'inline-flex' : 'none' }}
+                        >
+                            🛡 ${currentStats.blocked}
+                        </span>
+                        <span 
+                            className="heroui-pill__stat-item"
+                            style=${{ display: isFull ? 'inline-flex' : 'none' }}
+                        >
+                            ⚡ ${currentStats.boosted}${accumulatedBonus > 0 ? ` (+${accumulatedBonus}s)` : ''}
+                        </span>
+                    </span>
+                </div>
+                <button 
+                    type="button" 
+                    className="heroui-pill__gear" 
+                    title="Open UpLearn Settings (Ctrl+Shift+U)"
+                    onClick=${(e) => {
+                        e.preventDefault(); e.stopPropagation();
+                        onOpenSettings();
+                    }}
+                >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                    </svg>
+                    <span className="heroui-pill__indicator-dot" style=${{ display: enabled ? 'block' : 'none' }}></span>
+                </button>
+            </div>
+        `;
+    };
+
+    // --- SettingsModal Component (HeroUI v3 Dialog) ---
+    const SettingsModal = ({
+        isOpen,
+        isClosing,
+        onClose,
+        currentSettings,
+        currentStats,
+        accumulatedBonus,
+        isCapturingKeybind,
+        onStartCaptureKeybind,
+        onClearKeybind,
+        onUpdateSetting,
+        onResetAllSettings,
+        onResetStats,
+    }) => {
+        const { useState, useMemo } = React;
+        const [activeTab, setActiveTab] = useState('telemetry');
+        const [tabDirection, setTabDirection] = useState('forward');
+        const [servicesFilter, setServicesFilter] = useState('');
+
+        const TAB_KEYS = ['telemetry', 'timeboost', 'preferences', 'stats'];
+
+        const handleTabClick = (targetTab) => {
+            if (targetTab === activeTab) return;
+            const curIdx = TAB_KEYS.indexOf(activeTab);
+            const targetIdx = TAB_KEYS.indexOf(targetTab);
+            setTabDirection(targetIdx > curIdx ? 'forward' : 'backward');
+            setActiveTab(targetTab);
+        };
+
+        // Filter services
+        const { filteredServicesList, activeServicesCount, totalServicesCount } = useMemo(() => {
+            const q = servicesFilter.toLowerCase().trim();
+            let active = 0, total = 0;
+            const list = [];
+            for (const key in TELEMETRY_SERVICES) {
+                if (key === 'jitsu') continue;
+                total++;
+                const svc = TELEMETRY_SERVICES[key];
+                const checked = !!currentSettings.telemetryServices[key];
+                if (checked) active++;
+                if (!q || svc.label.toLowerCase().includes(q) || svc.hosts.some(h => h.toLowerCase().includes(q))) {
+                    list.push({ key, svc, checked });
+                }
+            }
+            return { filteredServicesList: list, activeServicesCount: active, totalServicesCount: total };
+        }, [servicesFilter, currentSettings.telemetryServices]);
+
+        const handleToggleService = (key) => {
+            const next = !currentSettings.telemetryServices[key];
+            const updated = Object.assign({}, currentSettings.telemetryServices, { [key]: next });
+            currentSettings.telemetryServices[key] = next;
+            if (!applyingPreset) currentSettings.telemetryPreset = 'custom';
+            saveSettings();
+            onUpdateSetting('telemetryServices', updated);
+            LOG(`service "${TELEMETRY_SERVICES[key].label}" ${next ? 'ENABLED' : 'DISABLED'}`);
+        };
+
+        const handleEnableAllServices = () => {
+            const updated = {};
+            for (const k in TELEMETRY_SERVICES) {
+                if (k !== 'jitsu') {
+                    settings.telemetryServices[k] = true;
+                    updated[k] = true;
+                }
+            }
+            settings.telemetryPreset = 'custom';
+            saveSettings();
+            onUpdateSetting('telemetryServices', updated);
+            onUpdateSetting('telemetryPreset', 'custom');
+        };
+
+        const handleDisableAllServices = () => {
+            const updated = {};
+            for (const k in TELEMETRY_SERVICES) {
+                if (k !== 'jitsu') {
+                    settings.telemetryServices[k] = false;
+                    updated[k] = false;
+                }
+            }
+            settings.telemetryPreset = 'custom';
+            saveSettings();
+            onUpdateSetting('telemetryServices', updated);
+            onUpdateSetting('telemetryPreset', 'custom');
+        };
+
+        const rangeHint = (currentSettings.extraSecondsMin === currentSettings.extraSecondsMax)
+            ? `Every question receives +${currentSettings.extraSecondsMin}s.`
+            : `Each question rolls random +${currentSettings.extraSecondsMin}–${currentSettings.extraSecondsMax}s.`;
+
+        return html`
+            <${Modal} isOpen=${isOpen} isClosing=${isClosing} onClose=${onClose}>
+                <${Modal.Backdrop} isClosing=${isClosing} onClose=${onClose}>
+                    <${Modal.Container}>
+                        <${Modal.Dialog}>
+                            
+                            <!-- Header -->
+                            <${Modal.Header}>
+                                <div className="modal__header-top">
+                                    <${Modal.Brand}>
+                                        <${Modal.Icon}>
+                                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                                <circle cx="12" cy="12" r="3"></circle>
+                                                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                                            </svg>
+                                        <//>
+                                        <${Modal.Heading}>UpLearn Control Panel<//>
+                                    <//>
+                                    <${Modal.CloseTrigger} onPress=${onClose} />
+                                </div>
+
+                                <!-- Tabs Navigation via TagGroup -->
+                                <${TagGroup} 
+                                    ariaLabel="Panel Navigation"
+                                    selectionMode="single"
+                                    selectedKeys=${[activeTab]}
+                                    onSelectionChange=${handleTabClick}
+                                    className="modal__tab-group"
+                                >
+                                    <${TagGroup.List} className="modal__tab-tags">
+                                        <${Tag} id="telemetry">
+                                            <span>🛡 Telemetry</span>
+                                        <//>
+                                        <${Tag} id="timeboost">
+                                            <span>⏱ Time Boost</span>
+                                        <//>
+                                        <${Tag} id="preferences">
+                                            <span>🎨 Preferences</span>
+                                        <//>
+                                        <${Tag} id="stats">
+                                            <span>📊 Statistics</span>
+                                        <//>
+                                    <//>
+                                <//>
+                            <//>
+
+                            <!-- Body -->
+                            <${Modal.Body}>
+
+                                <!-- Tab 1: Telemetry -->
+                                <${Tabs.Panel} id="telemetry" activeTab=${activeTab} direction=${tabDirection}>
+                                    <div className="grid-2col">
+                                        <div className="col-stack">
+                                            <${Card} className="card--compact">
+                                                <${Card.Header}>
+                                                    <${Card.Title}>
+                                                        <span>Blocking Preset</span>
+                                                        <${Badge} variant="soft" color="accent">Smart Filters<//>
+                                                    <//>
+                                                    <${Card.Description}>Pick a ready-made preset or customize your active blockers.<//>
+                                                <//>
+                                                <${Card.Content}>
+                                                    <div className="field-row">
+                                                        <label>Active Preset
+                                                            <small>Off · Simple (LogImproperUse only) · Harsh (Block all) · Custom</small>
+                                                        </label>
+                                                        <${Dropdown} 
+                                                            selectedKey=${currentSettings.telemetryPreset}
+                                                            onSelectionChange=${(val) => onUpdateSetting('telemetryPreset', val)}
+                                                        >
+                                                            <${Dropdown.Trigger}>
+                                                                <${Button} variant="secondary" className="dropdown__trigger-btn">
+                                                                    <span>${PRESET_OPTIONS.find(o => o.id === currentSettings.telemetryPreset)?.label || 'Custom'}</span>
+                                                                    <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                                                                <//>
+                                                            <//>
+                                                            <${Dropdown.Popover}>
+                                                                <${Dropdown.Menu}>
+                                                                    ${PRESET_OPTIONS.map(opt => html`
+                                                                        <${Dropdown.Item} id=${opt.id} key=${opt.id}>
+                                                                            <${Dropdown.Item.Label}>${opt.label}<//>
+                                                                            <${Dropdown.Item.Description}>${opt.desc}<//>
+                                                                        <//>
+                                                                    `)}
+                                                                <//>
+                                                            <//>
+                                                        <//>
+                                                    </div>
+                                                <//>
+                                            <//>
+
+                                            <${Card} className="card--compact">
+                                                <${Card.Header}>
+                                                    <${Card.Title}>Core Protection Toggles<//>
+                                                    <${Card.Description}>Fine-grained control over network intercepts and client spoofing.<//>
+                                                <//>
+                                                <${Card.Content} className="core-toggles-list">
+                                                    <${Switch} 
+                                                        size="sm"
+                                                        isSelected=${currentSettings.blockLogImproperUse}
+                                                        onChange=${(v) => onUpdateSetting('blockLogImproperUse', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>Block LogImproperUse requests<//>
+                                                            <${Switch.Description}>Silently drops UpLearn improper-use telemetry sent to API<//>
+                                                        <//>
+                                                    <//>
+
+                                                    <${Switch} 
+                                                        size="sm"
+                                                        isSelected=${currentSettings.blockDomElements}
+                                                        onChange=${(v) => onUpdateSetting('blockDomElements', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>Block DOM telemetry injection<//>
+                                                            <${Switch.Description}>Hooks script/iframe src and purges blocked tracker nodes<//>
+                                                        <//>
+                                                    <//>
+
+                                                    <${Switch} 
+                                                        size="sm"
+                                                        isSelected=${currentSettings.blockWebSockets}
+                                                        onChange=${(v) => onUpdateSetting('blockWebSockets', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>Block telemetry WebSockets<//>
+                                                            <${Switch.Description}>Terminates analytics & Intercom WebSocket connections<//>
+                                                        <//>
+                                                    <//>
+
+                                                    <${Switch} 
+                                                        size="sm"
+                                                        isSelected=${currentSettings.blockSendBeacon}
+                                                        onChange=${(v) => onUpdateSetting('blockSendBeacon', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>Block telemetry sendBeacon<//>
+                                                            <${Switch.Description}>Drops background beacon-style telemetry packets<//>
+                                                        <//>
+                                                    <//>
+
+                                                    <${Switch} 
+                                                        size="sm"
+                                                        isSelected=${currentSettings.spoofVisibility}
+                                                        onChange=${(v) => onUpdateSetting('spoofVisibility', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>Spoof visibility & focus<//>
+                                                            <${Switch.Description}>Ensures page always believes it is focused & visible<//>
+                                                        <//>
+                                                    <//>
+
+                                                    <${Switch} 
+                                                        size="sm"
+                                                        isSelected=${currentSettings.suppressConsoleNoise}
+                                                        onChange=${(v) => onUpdateSetting('suppressConsoleNoise', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>Suppress site's console noise<//>
+                                                            <${Switch.Description}>Mutes [J-ERROR], Jitsu send errors, and blocked-host spam<//>
+                                                        <//>
+                                                    <//>
+
+                                                    <${Switch} 
+                                                        size="sm"
+                                                        isSelected=${currentSettings.suppressJitsu}
+                                                        onChange=${(v) => onUpdateSetting('suppressJitsu', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>Suppress Jitsu telemetry<//>
+                                                            <${Switch.Description}>Checked: blocks jitsu.uplearn.co.uk. Unchecked: logs inspected packets.<//>
+                                                        <//>
+                                                    <//>
+                                                <//>
+                                            <//>
+                                        </div>
+
+                                        <div className="col-stack">
+                                            <${Card} className="card--compact">
+                                                <${Card.Header}>
+                                                    <${Card.Title}>
+                                                        <span>Third-Party Telemetry Services</span>
+                                                        <${Badge} variant="soft" color="accent">${activeServicesCount}/${totalServicesCount} Active<//>
+                                                    <//>
+                                                    <${Card.Description}>Toggle individual analytics trackers. Changes auto-switch preset to Custom.<//>
+                                                <//>
+                                                <${Card.Content}>
+                                                    <div className="services-search-bar">
+                                                        <input 
+                                                            type="text" 
+                                                            className="services-search-input" 
+                                                            placeholder="Search service name or hostname…"
+                                                            value=${servicesFilter}
+                                                            onInput=${(e) => setServicesFilter(e.target.value)}
+                                                        />
+                                                        <${Button} variant="secondary" size="sm" onPress=${handleEnableAllServices}>
+                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                                                <polyline points="20 6 9 17 4 12"></polyline>
+                                                            </svg>
+                                                            <span>Enable All</span>
+                                                        <//>
+                                                        <${Button} variant="outline" size="sm" onPress=${handleDisableAllServices}>
+                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                                                <line x1="18" y1="6" x2="6" y2="18"></line>
+                                                                <line x1="6" y1="6" x2="18" y2="18"></line>
+                                                            </svg>
+                                                            <span>Disable All</span>
+                                                        <//>
+                                                    </div>
+                                                    <div className="services-grid">
+                                                        ${filteredServicesList.map(({ key, svc, checked }) => html`
+                                                            <${ServiceTile} 
+                                                                key=${key}
+                                                                serviceKey=${key} 
+                                                                service=${svc} 
+                                                                isChecked=${checked} 
+                                                                onToggle=${() => handleToggleService(key)}
+                                                            />
+                                                        `)}
+                                                    </div>
+                                                <//>
+                                            <//>
+                                        </div>
+                                    </div>
+                                <//>
+
+                                <!-- Tab 2: Time Boost -->
+                                <${Tabs.Panel} id="timeboost" activeTab=${activeTab} direction=${tabDirection}>
+                                    <div className="grid-2col">
+                                        <div className="col-stack">
+                                            <${Card}>
+                                                <${Card.Header}>
+                                                    <${Card.Title}>
+                                                        <span>Master Booster Switch</span>
+                                                        <${Badge} variant="soft" color="success">TimeSpent<//>
+                                                    <//>
+                                                    <${Card.Description}>Automatically adds extra time spent to quiz submissions and group summaries.<//>
+                                                <//>
+                                                <${Card.Content}>
+                                                    <${Switch} 
+                                                        isSelected=${currentSettings.timeBoostEnabled}
+                                                        onChange=${(v) => onUpdateSetting('timeBoostEnabled', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>Enable time boost<//>
+                                                            <${Switch.Description}>Injects calculated time bonuses into AnswerProgressQuizQuestion API calls<//>
+                                                        <//>
+                                                    <//>
+                                                <//>
+                                            <//>
+
+                                            <${Card}>
+                                                <${Card.Header}>
+                                                    <${Card.Title}>Random Duration Range<//>
+                                                    <${Card.Description}>${rangeHint}<//>
+                                                <//>
+                                                <${Card.Content}>
+                                                    <div className="field-row">
+                                                        <label>Extra Seconds Range
+                                                            <small>Minimum and maximum extra seconds added per question</small>
+                                                        </label>
+                                                        <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                                            <input 
+                                                                type="number" 
+                                                                className="input" 
+                                                                style=${{ width: '78px', textAlign: 'center' }} 
+                                                                min="1" 
+                                                                max="3600"
+                                                                value=${currentSettings.extraSecondsMin}
+                                                                onChange=${(e) => {
+                                                                    const val = parseInt(e.target.value, 10);
+                                                                    if (!isNaN(val)) onUpdateSetting('extraSecondsMin', val);
+                                                                }}
+                                                            />
+                                                            <span style=${{ color: 'var(--muted)', fontWeight: 600 }}>to</span>
+                                                            <input 
+                                                                type="number" 
+                                                                className="input" 
+                                                                style=${{ width: '78px', textAlign: 'center' }} 
+                                                                min="1" 
+                                                                max="3600"
+                                                                value=${currentSettings.extraSecondsMax}
+                                                                onChange=${(e) => {
+                                                                    const val = parseInt(e.target.value, 10);
+                                                                    if (!isNaN(val)) onUpdateSetting('extraSecondsMax', val);
+                                                                }}
+                                                            />
+                                                            <span style=${{ color: 'var(--muted)', fontWeight: 600 }}>s</span>
+                                                        </div>
+                                                    </div>
+
+
+                                                    <div style=${{ marginTop: '8px' }}>
+                                                        <${TagGroup} 
+                                                            ariaLabel="Quick Range Presets" 
+                                                            selectedKeys=${[
+                                                                QUICK_RANGE_PRESETS.find(p => p.min === currentSettings.extraSecondsMin && p.max === currentSettings.extraSecondsMax)?.label
+                                                            ].filter(Boolean)}
+                                                            onSelectionChange=${(label) => {
+                                                                const p = QUICK_RANGE_PRESETS.find(item => item.label === label);
+                                                                if (p) {
+                                                                    onUpdateSetting('extraSecondsMin', p.min);
+                                                                    onUpdateSetting('extraSecondsMax', p.max);
+                                                                }
+                                                            }}
+                                                        >
+                                                            <${TagGroup.Label}>Quick Range Presets<//>
+                                                            <${TagGroup.List}>
+                                                                ${QUICK_RANGE_PRESETS.map((p, idx) => html`
+                                                                    <${Tag} id=${p.label} key=${idx}>
+                                                                        <span>${p.label}</span>
+                                                                    <//>
+                                                                `)}
+                                                            <//>
+                                                        <//>
+                                                    </div>
+                                                <//>
+                                            <//>
+                                        </div>
+
+                                        <div className="col-stack">
+                                            <${Card}>
+                                                <${Card.Header}>
+                                                    <${Card.Title}>
+                                                        <span>Boost Automation Insights</span>
+                                                        <${Badge} variant="soft" color="accent">Active Session<//>
+                                                    <//>
+                                                    <${Card.Description}>How UpLearn measures engagement and how the booster works.<//>
+                                                <//>
+                                                <${Card.Content}>
+                                                    <div style=${{ fontSize: '12.5px', color: 'var(--muted)', lineHeight: '1.6' }}>
+                                                        UpLearn logs seconds spent on each quiz question and sums them upon finishing a lesson or group. When active, every answered question receives a randomized bonus within your configured range, maintaining realistic, organic engagement scores without tripping detection heuristics.
+                                                    </div>
+                                                    <div style=${{ marginTop: '8px', padding: '12px 14px', background: 'var(--surface)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                                        <span style=${{ fontSize: '12.5px', fontWeight: 500, color: 'var(--foreground)' }}>Cumulative Session Bonus</span>
+                                                        <${Badge} variant="primary" color="accent">${accumulatedBonus}s<//>
+                                                    </div>
+                                                <//>
+                                            <//>
+                                        </div>
+                                    </div>
+                                <//>
+
+                                <!-- Tab 3: Preferences -->
+                                <${Tabs.Panel} id="preferences" activeTab=${activeTab} direction=${tabDirection}>
+                                    <div className="grid-2col">
+                                        <div className="col-stack">
+                                            <${Card}>
+                                                <${Card.Header}>
+                                                    <${Card.Title}>Status Pill Appearance & Detail<//>
+                                                    <${Card.Description}>Control how much information shows on the floating pill and how it shapes itself.<//>
+                                                <//>
+                                                <${Card.Content}>
+                                                    <div className="field-row">
+                                                        <label>Pill Information Display
+                                                            <small>Select how much info is displayed. The pill dynamically adapts its shape.</small>
+                                                        </label>
+                                                        <${Dropdown} 
+                                                            selectedKey=${currentSettings.pillMode}
+                                                            onSelectionChange=${(val) => onUpdateSetting('pillMode', val)}
+                                                        >
+                                                            <${Dropdown.Trigger}>
+                                                                <${Button} variant="secondary" className="dropdown__trigger-btn">
+                                                                    <span>${PILL_MODE_OPTIONS.find(o => o.id === currentSettings.pillMode)?.label || currentSettings.pillMode}</span>
+                                                                    <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                                                                <//>
+                                                            <//>
+                                                            <${Dropdown.Popover}>
+                                                                <${Dropdown.Menu}>
+                                                                    ${PILL_MODE_OPTIONS.map(opt => html`
+                                                                        <${Dropdown.Item} id=${opt.id} key=${opt.id}>
+                                                                            <${Dropdown.Item.Label}>${opt.label}<//>
+                                                                            <${Dropdown.Item.Description}>${opt.desc}<//>
+                                                                        <//>
+                                                                    `)}
+                                                                <//>
+                                                            <//>
+                                                        <//>
+                                                    </div>
+
+                                                    <div className="field-row">
+                                                        <label>Pill Dock Position
+                                                            <small>Corner of the screen where the status pill floats</small>
+                                                        </label>
+                                                        <${Dropdown} 
+                                                            selectedKey=${currentSettings.pillPosition}
+                                                            onSelectionChange=${(val) => onUpdateSetting('pillPosition', val)}
+                                                        >
+                                                            <${Dropdown.Trigger}>
+                                                                <${Button} variant="secondary" className="dropdown__trigger-btn">
+                                                                    <span>${PILL_POS_OPTIONS.find(o => o.id === currentSettings.pillPosition)?.label || currentSettings.pillPosition}</span>
+                                                                    <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                                                                <//>
+                                                            <//>
+                                                            <${Dropdown.Popover}>
+                                                                <${Dropdown.Menu}>
+                                                                    ${PILL_POS_OPTIONS.map(opt => html`
+                                                                        <${Dropdown.Item} id=${opt.id} key=${opt.id}>
+                                                                            <${Dropdown.Item.Label}>${opt.label}<//>
+                                                                            <${Dropdown.Item.Description}>${opt.desc}<//>
+                                                                        <//>
+                                                                    `)}
+                                                                <//>
+                                                            <//>
+                                                        <//>
+                                                    </div>
+
+                                                    <div className="field-row">
+                                                        <label>Pill Opacity
+                                                            <small>Adjust background transparency</small>
+                                                        </label>
+                                                        <${Slider} 
+                                                            value=${currentSettings.pillOpacity}
+                                                            minValue=${0.2}
+                                                            maxValue=${1}
+                                                            step=${0.05}
+                                                            onChange=${(val) => onUpdateSetting('pillOpacity', val)}
+                                                            className="slider--inline"
+                                                        >
+                                                            <${Slider.Track}>
+                                                                <${Slider.Fill} />
+                                                                <${Slider.Thumb} />
+                                                            <//>
+                                                            <${Slider.Output}>
+                                                                ${Math.round(currentSettings.pillOpacity * 100)}%
+                                                            <//>
+                                                        <//>
+                                                    </div>
+                                                <//>
+                                            <//>
+
+                                            <${Card}>
+                                                <${Card.Header}>
+                                                    <${Card.Title}>Page Experience<//>
+                                                    <${Card.Description}>Quality of life tweaks for the UpLearn learning environment.<//>
+                                                <//>
+                                                <${Card.Content}>
+                                                    <${Switch} 
+                                                        isSelected=${currentSettings.disableAutoFullscreen}
+                                                        onChange=${(v) => onUpdateSetting('disableAutoFullscreen', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>Disable auto fullscreen<//>
+                                                            <${Switch.Description}>Blocks the website from silently forcing fullscreen mode<//>
+                                                        <//>
+                                                    <//>
+
+                                                    <${Switch} 
+                                                        isSelected=${currentSettings.darkMode}
+                                                        onChange=${(v) => onUpdateSetting('darkMode', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>UpLearn Dark Mode<//>
+                                                            <${Switch.Description}>Soft high-contrast dark theme across all lesson and quiz pages<//>
+                                                        <//>
+                                                    <//>
+                                                <//>
+                                            <//>
+                                        </div>
+
+                                        <div className="col-stack">
+                                            <${Card}>
+                                                <${Card.Header}>
+                                                    <${Card.Title}>Theme & Accent Color<//>
+                                                    <${Card.Description}>Customize color palette and visual styling.<//>
+                                                <//>
+                                                <${Card.Content}>
+                                                    <div className="field-row">
+                                                        <label>Control Panel Theme</label>
+                                                        <${Dropdown} 
+                                                            selectedKey=${currentSettings.theme}
+                                                            onSelectionChange=${(val) => onUpdateSetting('theme', val)}
+                                                        >
+                                                            <${Dropdown.Trigger}>
+                                                                <${Button} variant="secondary" className="dropdown__trigger-btn">
+                                                                    <span>${THEME_OPTIONS.find(o => o.id === currentSettings.theme)?.label || currentSettings.theme}</span>
+                                                                    <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                                                                <//>
+                                                            <//>
+                                                            <${Dropdown.Popover}>
+                                                                <${Dropdown.Menu}>
+                                                                    ${THEME_OPTIONS.map(opt => html`
+                                                                        <${Dropdown.Item} id=${opt.id} key=${opt.id}>
+                                                                            <${Dropdown.Item.Label}>${opt.label}<//>
+                                                                            <${Dropdown.Item.Description}>${opt.desc}<//>
+                                                                        <//>
+                                                                    `)}
+                                                                <//>
+                                                            <//>
+                                                        <//>
+                                                    </div>
+
+                                                    <div className="field-row">
+                                                        <label>Theme Accent Color
+                                                            <small>Primary color for switches, active badges, and highlights</small>
+                                                        </label>
+                                                        <div style=${{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                                                            <div className="color-swatches">
+                                                                ${QUICK_COLOR_SWATCHES.map((c, idx) => html`
+                                                                    <div 
+                                                                        key=${idx}
+                                                                        className="color-swatch"
+                                                                        style=${{ backgroundColor: c.hex }}
+                                                                        title=${c.name}
+                                                                        data-active=${c.hex.toLowerCase() === currentSettings.accentColor.toLowerCase() ? 'true' : 'false'}
+                                                                        onClick=${() => onUpdateSetting('accentColor', c.hex)}
+                                                                    ></div>
+                                                                `)}
+                                                            </div>
+                                                            <input 
+                                                                type="color" 
+                                                                style=${{ width: '36px', height: '28px', border: '1px solid var(--border)', borderRadius: '6px', background: 'transparent', cursor: 'pointer', padding: '1px' }}
+                                                                value=${currentSettings.accentColor}
+                                                                onChange=${(e) => onUpdateSetting('accentColor', e.target.value)}
+                                                            />
+                                                        </div>
+                                                    </div>
+                                                <//>
+                                            <//>
+
+                                            <${Card}>
+                                                <${Card.Header}>
+                                                    <${Card.Title}>Shortcuts & Logging<//>
+                                                    <${Card.Description}>Configure hotkeys and developer diagnostics.<//>
+                                                <//>
+                                                <${Card.Content}>
+                                                    <div className="field-row">
+                                                        <label>Toggle-Pill Keybind
+                                                            <small>Global keyboard shortcut to show or hide the pill</small>
+                                                        </label>
+                                                        <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                                            <${Button} 
+                                                                variant="secondary" 
+                                                                size="sm"
+                                                                className=${isCapturingKeybind ? 'button--capturing' : ''}
+                                                                onPress=${onStartCaptureKeybind}
+                                                            >
+                                                                ${isCapturingKeybind ? 'Press any key…' : formatKeybind(currentSettings.uiToggleKeybind)}
+                                                            <//>
+                                                            <${Button} 
+                                                                variant="outline" 
+                                                                size="sm"
+                                                                isIconOnly
+                                                                title="Clear keybind"
+                                                                aria-label="Clear keybind"
+                                                                onPress=${onClearKeybind}
+                                                            >
+                                                                ✕
+                                                            <//>
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="field-row">
+                                                        <label>Console Logging Level
+                                                            <small>Verbose inspects bodies and prints grouped block reports</small>
+                                                        </label>
+                                                        <${Dropdown} 
+                                                            selectedKey=${currentSettings.logLevel}
+                                                            onSelectionChange=${(val) => onUpdateSetting('logLevel', val)}
+                                                        >
+                                                            <${Dropdown.Trigger}>
+                                                                <${Button} variant="secondary" className="dropdown__trigger-btn">
+                                                                    <span>${LOG_LEVEL_OPTIONS.find(o => o.id === currentSettings.logLevel)?.label || currentSettings.logLevel}</span>
+                                                                    <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                                                                <//>
+                                                            <//>
+                                                            <${Dropdown.Popover}>
+                                                                <${Dropdown.Menu}>
+                                                                    ${LOG_LEVEL_OPTIONS.map(opt => html`
+                                                                        <${Dropdown.Item} id=${opt.id} key=${opt.id}>
+                                                                            <${Dropdown.Item.Label}>${opt.label}<//>
+                                                                            <${Dropdown.Item.Description}>${opt.desc}<//>
+                                                                        <//>
+                                                                    `)}
+                                                                <//>
+                                                            <//>
+                                                        <//>
+                                                    </div>
+
+                                                    <div style=${{ marginTop: '6px', paddingTop: '12px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                                        <div>
+                                                            <div style=${{ fontSize: '12.5px', fontWeight: 600, color: 'var(--foreground)' }}>Reset All Preferences</div>
+                                                            <div style=${{ fontSize: '11px', color: 'var(--muted)' }}>Restore all settings & services to factory defaults</div>
+                                                        </div>
+                                                        <${Button} variant="danger-soft" size="sm" onPress=${onResetAllSettings}>
+                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                                                <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
+                                                                <path d="M21 3v5h-5"></path>
+                                                                <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
+                                                                <path d="M8 16H3v5"></path>
+                                                            </svg>
+                                                            <span>Reset All Settings</span>
+                                                        <//>
+                                                    </div>
+                                                <//>
+                                            <//>
+                                        </div>
+                                    </div>
+                                <//>
+
+                                <!-- Tab 4: Statistics -->
+                                <${Tabs.Panel} id="stats" activeTab=${activeTab} direction=${tabDirection}>
+                                    <${Card}>
+                                        <${Card.Header}>
+                                            <${Card.Title}>
+                                                <span>Session Telemetry & Boost Activity</span>
+                                                <${Badge} variant="soft" color="accent">Real-Time<//>
+                                            <//>
+                                            <${Card.Description}>Live metric counters accumulated in this browser session.<//>
+                                        <//>
+                                        <${Card.Content}>
+                                            <div className="stats-grid">
+                                                <div className="stat-card">
+                                                    <span className="stat-card__label">Blocked</span>
+                                                    <span className="stat-card__value">${currentStats.blocked}</span>
+                                                </div>
+                                                <div className="stat-card">
+                                                    <span className="stat-card__label">Boosted Qs</span>
+                                                    <span className="stat-card__value">${currentStats.boosted}</span>
+                                                </div>
+                                                <div className="stat-card">
+                                                    <span className="stat-card__label">Improper Use</span>
+                                                    <span className="stat-card__value">${currentStats.logImproperUseBlocked}</span>
+                                                </div>
+                                                <div className="stat-card">
+                                                    <span className="stat-card__label">Jitsu Packets</span>
+                                                    <span className="stat-card__value">${currentStats.jitsuPackets}</span>
+                                                </div>
+                                                <div className="stat-card">
+                                                    <span className="stat-card__label">Pending Bonus</span>
+                                                    <span className="stat-card__value">${accumulatedBonus}s</span>
+                                                </div>
+                                                <div className="stat-card">
+                                                    <span className="stat-card__label">Group Bonus</span>
+                                                    <span className="stat-card__value">${currentStats.groupExtra}s</span>
+                                                </div>
+                                                <div className="stat-card">
+                                                    <span className="stat-card__label">FS Blocked</span>
+                                                    <span className="stat-card__value">${currentStats.fullscreenBlocked}</span>
+                                                </div>
+                                                <div className="stat-card">
+                                                    <span className="stat-card__label">Console Muted</span>
+                                                    <span className="stat-card__value">${currentStats.consoleSuppressed}</span>
+                                                </div>
+                                                <div className="stat-card">
+                                                    <span className="stat-card__label">API Posts</span>
+                                                    <span className="stat-card__value">${currentStats.apiPosts}</span>
+                                                </div>
+                                            </div>
+
+                                            <div style=${{ marginTop: '16px', display: 'flex', justifyContent: 'flex-end' }}>
+                                                <${Button} variant="secondary" size="sm" onPress=${onResetStats}>
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                                        <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
+                                                        <path d="M21 3v5h-5"></path>
+                                                        <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
+                                                        <path d="M8 16H3v5"></path>
+                                                    </svg>
+                                                    <span>Reset Session Statistics</span>
+                                                <//>
+                                            </div>
+                                        <//>
+                                    <//>
+                                <//>
+
+                            <//>
+
+                            <!-- Modal Footer with HeroUI v3 Actions -->
+                            <${Modal.Footer}>
+                                <${Button} variant="secondary" size="sm" onPress=${onClose}>Close<//>
+                                <${Button} variant="primary" size="sm" onPress=${onClose}>Done<//>
+                            <//>
+
+                        <//>
+                    <//>
+                <//>
+            <//>
+        `;
+    };
+
+    // --- Root App Component ---
+    const App = () => {
+        const { useState, useEffect, useCallback } = React;
+        const [appSettings, setAppSettings] = useState(Object.assign({}, settings));
+        const [appStats, setAppStats] = useState(Object.assign({}, stats));
+        const [accumulatedBonus, setAccumulatedBonus] = useState(accumulatedExtraSeconds);
+        const [isModalOpen, setIsModalOpen] = useState(false);
+        const [isClosing, setIsClosing] = useState(false);
+        const [isCapturing, setIsCapturing] = useState(false);
+
+        // Register bridges for global callbacks
+        useEffect(() => {
+            reactSetSettings = setAppSettings;
+            reactSetStats = (st) => {
+                setAppStats(Object.assign({}, st));
+                if (typeof st.accumulated !== 'undefined') setAccumulatedBonus(st.accumulated);
+            };
+            reactSetModalOpen = (open) => {
+                if (open) {
+                    setIsClosing(false);
+                    setIsModalOpen(true);
+                    isModalOpenGlobal = true;
+                } else {
+                    setIsClosing(true);
+                    setTimeout(() => {
+                        setIsModalOpen(false);
+                        setIsClosing(false);
+                        isModalOpenGlobal = false;
+                    }, 240);
+                }
+            };
+            reactSetCapturingKeybind = setIsCapturing;
+
+            return () => {
+                reactSetSettings = null;
+                reactSetStats = null;
+                reactSetModalOpen = null;
+                reactSetCapturingKeybind = null;
+            };
+        }, []);
+
+        // Real-time live stats update interval
+        useEffect(() => {
+            const interval = setInterval(() => {
+                setAppStats(Object.assign({}, stats));
+                setAccumulatedBonus(accumulatedExtraSeconds);
+            }, 400);
+            return () => clearInterval(interval);
+        }, []);
+
+        const handleCloseModal = useCallback(() => {
+            if (isClosing) return;
+            setIsClosing(true);
+            setTimeout(() => {
+                setIsModalOpen(false);
+                setIsClosing(false);
+                isModalOpenGlobal = false;
+            }, 240);
+        }, [isClosing]);
+
+        const handleToggleBoost = useCallback(() => {
+            const next = !settings.timeBoostEnabled;
+            applySettingChange('timeBoostEnabled', next);
+            LOG('time-boost ' + (next ? 'ENABLED' : 'DISABLED'));
+        }, []);
+
+        const handleStartCaptureKeybind = useCallback(() => {
+            capturingKeybind = !capturingKeybind;
+            setIsCapturing(capturingKeybind);
+            LOG('keybind capture ' + (capturingKeybind ? 'started' : 'cancelled'));
+        }, []);
+
+        const handleClearKeybind = useCallback(() => {
+            if (capturingKeybind) {
+                capturingKeybind = false;
+                setIsCapturing(false);
+                return;
+            }
+            applySettingChange('uiToggleKeybind', { code: null, ctrl: false, shift: false, alt: false, meta: false });
+            LOG('keybind cleared');
+        }, []);
+
+        const handleResetAllSettings = useCallback(() => {
+            if (confirm('Reset all UpLearn settings to defaults?')) {
+                Object.assign(settings, DEFAULT_SETTINGS);
+                settings.telemetryServices = buildDefaultTelemetryServices();
+                settings.uiToggleKeybind = Object.assign({}, DEFAULT_KEYBIND);
+                normalizeRange(settings);
+                saveSettings();
+                applyDarkMode();
+                setAppSettings(Object.assign({}, settings));
+                LOG('settings reset to defaults');
+            }
+        }, []);
+
+        const handleResetStats = useCallback(() => {
+            stats.apiPosts = 0; stats.seen = 0; stats.boosted = 0;
+            stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
+            stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
+            stats.jitsuPackets = 0;
+            accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
+            setAppStats(Object.assign({}, stats));
+            setAccumulatedBonus(0);
+            LOG('stats reset');
+        }, []);
+
+        // Sync theme attribute & accent CSS variable on root container
+        const effectiveTheme = getEffectiveTheme(appSettings.theme);
+        useEffect(() => {
+            if (uiContainerEl) {
+                uiContainerEl.setAttribute('data-theme', effectiveTheme);
+                uiContainerEl.style.setProperty('--accent', appSettings.accentColor);
+            }
+        }, [effectiveTheme, appSettings.accentColor]);
+
+        return html`
+            <div className="heroui-react-wrapper">
+                <${StatusPill} 
+                    currentSettings=${appSettings}
+                    currentStats=${appStats}
+                    accumulatedBonus=${accumulatedBonus}
+                    onToggleBoost=${handleToggleBoost}
+                    onOpenSettings=${() => reactSetModalOpen(true)}
+                />
+                <${SettingsModal} 
+                    isOpen=${isModalOpen}
+                    isClosing=${isClosing}
+                    onClose=${handleCloseModal}
+                    currentSettings=${appSettings}
+                    currentStats=${appStats}
+                    accumulatedBonus=${accumulatedBonus}
+                    isCapturingKeybind=${isCapturing}
+                    onStartCaptureKeybind=${handleStartCaptureKeybind}
+                    onClearKeybind=${handleClearKeybind}
+                    onUpdateSetting=${applySettingChange}
+                    onResetAllSettings=${handleResetAllSettings}
+                    onResetStats=${handleResetStats}
+                />
+            </div>
+        `;
+    };
+
+    function mountReactUI() {
+        if (reactRootInstance || !uiContainerEl) return;
+        if (typeof ReactDOM === 'undefined' || typeof React === 'undefined' || typeof htm === 'undefined') {
+            nativeConsole.error('[UL] React, ReactDOM, or HTM not loaded from @require.');
+            return;
+        }
+        try {
+            reactRootInstance = ReactDOM.createRoot(uiContainerEl);
+            reactRootInstance.render(html`<${App} />`);
+            LOG('HeroUI v3 React UI mounted');
+        } catch (err) {
+            nativeConsole.error('[UL] Error mounting React UI:', err);
+        }
     }
 
     // ============================================================
@@ -2320,26 +4814,31 @@
             e.preventDefault(); e.stopPropagation();
             if (e.code === 'Escape') {
                 capturingKeybind = false;
-                updateKeybindBtn();
+                if (reactSetCapturingKeybind) reactSetCapturingKeybind(false);
                 LOG('keybind capture cancelled');
                 return;
             }
             const kb = captureKeybindFromEvent(e);
             applySettingChange('uiToggleKeybind', kb);
             capturingKeybind = false;
-            updateKeybindBtn();
+            if (reactSetCapturingKeybind) reactSetCapturingKeybind(false);
             LOG('keybind set to:', formatKeybind(kb));
+            return;
+        }
+        if (e.key === 'Escape' && isModalOpenGlobal && !capturingKeybind) {
+            e.preventDefault();
+            closeSettingsModal();
             return;
         }
         if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === 'KeyU') {
             e.preventDefault();
-            openSettingsModal();
+            if (isModalOpenGlobal) closeSettingsModal();
+            else openSettingsModal();
             return;
         }
         if (matchesKeybind(e, settings.uiToggleKeybind) && !e.repeat) {
             settings.pillVisible = !settings.pillVisible;
             saveSettings();
-            applyPillVisibility();
             syncModalIfOpen();
             LOG('pill ' + (settings.pillVisible ? 'SHOWN' : 'HIDDEN'));
         }
@@ -2348,7 +4847,7 @@
     // ============================================================
     // BOOTSTRAP
     // ============================================================
-    function bootstrap() { installPillUI(); }
+    function bootstrap() { ensureUIHost(); }
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', bootstrap, { once: true });
     } else {
