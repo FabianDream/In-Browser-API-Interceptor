@@ -7,6 +7,7 @@
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
 // @grant        none
+// @inject-into  page
 // @noframes
 //
 // @webRequest   [{"selector":{"include":"://openreplay.uplearn.co.uk/"},"action":"cancel"}]
@@ -149,6 +150,50 @@
     const API_HOST    = 'web.uplearn.co.uk';
     const API_PATH_RE = /\/api\/?$/;
 
+    const TELEMETRY_HOSTS = [
+        'openreplay.uplearn.co.uk',
+        'jitsu.uplearn.co.uk',
+        'ingest.us.sentry.io',
+        'sentry.io',
+        'static.cloudflareinsights.com',
+        'cloudflareinsights.com',
+        'api-iam.intercom.io',
+        'widget.intercom.io',
+        'js.intercomcdn.com',
+        'nexus-websocket-.intercom.io',
+        'intercom.io',
+        'intercomcdn.com',
+        'googletagmanager.com',
+        'google-analytics.com',
+        'analytics.google.com',
+        'connect.facebook.net',
+        'facebook.net',
+        'sc-static.net',
+        'bat.bing.com',
+        'bzrcdn.openai.com',
+        'fullstory.com',
+        'hotjar.com',
+        'mixpanel.com',
+        'segment.io',
+        'amplitude.com',
+        'posthog.com',
+    ];
+
+    function hostOf(url) {
+        try {
+            return new URL(url, location.href).hostname.toLowerCase();
+        } catch {
+            return '';
+        }
+    }
+
+    function isTelemetryUrl(url) {
+        if (!url) return false;
+        const h = hostOf(url);
+        if (!h) return false;
+        return TELEMETRY_HOSTS.some((t) => h === t || h.endsWith('.' + t) || h.includes(t));
+    }
+
     function isTargetApi(url) {
         try {
             const u = new URL(url, location.href);
@@ -157,6 +202,87 @@
     }
 
     const stats = { apiPosts: 0, seen: 0, boosted: 0, blocked: 0, groupExtra: 0, fullscreenBlocked: 0 };
+
+    // ============================================================
+    // TELEMETRY: DOM & SCRIPT/IFRAME INJECTION BLOCKER
+    // ============================================================
+    function hookSrcProperty(proto, tag) {
+        const desc = Object.getOwnPropertyDescriptor(proto, 'src');
+        if (desc && desc.set) {
+            Object.defineProperty(proto, 'src', {
+                get: desc.get,
+                set(val) {
+                    if (isTelemetryUrl(val)) {
+                        LOG(`blocked <${tag}> src:`, val);
+                        return '';
+                    }
+                    return desc.set.call(this, val);
+                },
+                configurable: true,
+            });
+        }
+    }
+
+    try { hookSrcProperty(HTMLScriptElement.prototype, 'script'); } catch {}
+    try { hookSrcProperty(HTMLIFrameElement.prototype, 'iframe'); } catch {}
+
+    try {
+        const origSetAttribute = Element.prototype.setAttribute;
+        Element.prototype.setAttribute = function (name, value) {
+            if (typeof name === 'string' && name.toLowerCase() === 'src' && isTelemetryUrl(value)) {
+                LOG('blocked setAttribute(src):', value);
+                return;
+            }
+            return origSetAttribute.apply(this, arguments);
+        };
+    } catch (e) { WARN('setAttribute patch failed', e); }
+
+    // Remove any static or dynamically appended tracker elements
+    try {
+        const domObserver = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                for (const node of m.addedNodes) {
+                    if (node.nodeType !== Node.ELEMENT_NODE) continue;
+                    const tag = node.tagName.toLowerCase();
+                    if (tag === 'script' || tag === 'iframe') {
+                        const src = node.src || node.getAttribute('src');
+                        if (isTelemetryUrl(src)) {
+                            LOG(`purged <${tag}> from DOM:`, src);
+                            node.remove();
+                        }
+                    }
+                }
+            }
+        });
+        domObserver.observe(document.documentElement || document, { childList: true, subtree: true });
+    } catch (e) { WARN('DOM observer failed', e); }
+
+    // ============================================================
+    // TELEMETRY: WEBSOCKET BLOCKER (Intercom / Analytics sockets)
+    // ============================================================
+    try {
+        const OrigWebSocket = window.WebSocket;
+        if (OrigWebSocket) {
+            window.WebSocket = function (url, protocols) {
+                if (isTelemetryUrl(url)) {
+                    LOG('blocked WebSocket connection:', url);
+                    const dummy = new EventTarget();
+                    dummy.readyState = 3; // CLOSED
+                    dummy.send = () => {};
+                    dummy.close = () => {};
+                    setTimeout(() => {
+                        try {
+                            dummy.dispatchEvent(new Event('error'));
+                            dummy.dispatchEvent(new CloseEvent('close', { code: 1006, reason: 'Blocked' }));
+                        } catch {}
+                    }, 0);
+                    return dummy;
+                }
+                return new OrigWebSocket(url, protocols);
+            };
+            window.WebSocket.prototype = OrigWebSocket.prototype;
+        }
+    } catch (e) { WARN('websocket patch failed', e); }
 
     // ============================================================
     // DARK MODE  (consistent soft partial-invert on #root only)
@@ -414,6 +540,12 @@
                           : String(input);
                 const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
 
+                // --- Telemetry URL hard block (all methods) ---
+                if (isTelemetryUrl(url)) {
+                    LOG('blocked telemetry fetch:', url);
+                    return Promise.resolve(new Response('', { status: 204, statusText: 'No Content' }));
+                }
+
                 if (method === 'POST' && isTargetApi(url)) {
                     stats.apiPosts++;
                     let body = init && typeof init.body === 'string' ? init.body : null;
@@ -477,6 +609,29 @@
         OrigXHR.prototype.send = function (body) {
             try {
                 const method = (this.__ul_method || '').toUpperCase();
+
+                // --- Telemetry URL hard block (all methods) ---
+                if (isTelemetryUrl(this.__ul_url)) {
+                    LOG('blocked telemetry xhr:', this.__ul_url);
+                    const self = this;
+                    Object.defineProperty(self, 'readyState',   { value: 4, configurable: true });
+                    Object.defineProperty(self, 'status',       { value: 204, configurable: true });
+                    Object.defineProperty(self, 'statusText',   { value: 'No Content', configurable: true });
+                    Object.defineProperty(self, 'responseText', { value: '', configurable: true });
+                    Object.defineProperty(self, 'response', {
+                        get() { return self.responseType === 'json' ? null : ''; },
+                        configurable: true
+                    });
+                    setTimeout(() => {
+                        try {
+                            self.dispatchEvent(new Event('readystatechange'));
+                            self.dispatchEvent(new ProgressEvent('load'));
+                            self.dispatchEvent(new ProgressEvent('loadend'));
+                        } catch {}
+                    }, 0);
+                    return;
+                }
+
                 if (method === 'POST' && isTargetApi(this.__ul_url)) {
                     stats.apiPosts++;
 
@@ -514,6 +669,22 @@
                 WARN('xhr interceptor error:', e);
             }
             return origSend.call(this, body);
+        };
+    }
+
+    // ============================================================
+    // SEND-BEACON INTERCEPTOR
+    // ============================================================
+    if (navigator.sendBeacon) {
+        const origBeacon = navigator.sendBeacon.bind(navigator);
+        navigator.sendBeacon = function (url, data) {
+            try {
+                if (isTelemetryUrl(url)) {
+                    LOG('blocked sendBeacon:', url);
+                    return true;
+                }
+            } catch {}
+            return origBeacon(url, data);
         };
     }
 

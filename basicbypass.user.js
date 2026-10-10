@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         UpLearn Telemetry + Fullscreen + Tab-Switch Blocker
 // @namespace    https://github.com/local/uplearn-blocker
-// @version      1.0.0
-// @description  Blocks telemetry (LogImproperUse + analytics hosts), blocks auto-fullscreen, and hides tab-switch/blur/focus-out detection.
+// @version      1.1.0
+// @description  Blocks telemetry, third-party trackers, auto-fullscreen, and tab-switch/blur detection across all userscript managers.
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
 // @grant        none
+// @inject-into  page
 // @noframes
 //
 // @webRequest   [{"selector":{"include":"://openreplay.uplearn.co.uk/"},"action":"cancel"}]
@@ -33,7 +34,7 @@
     LOG('blocker loaded on', location.host);
 
     // ============================================================
-    // 1. TELEMETRY BLOCKING
+    // 1. TELEMETRY HOST DEFINITIONS
     // ============================================================
     const API_HOST    = 'web.uplearn.co.uk';
     const API_PATH_RE = /\/api\/?$/;
@@ -48,6 +49,7 @@
         'api-iam.intercom.io',
         'widget.intercom.io',
         'js.intercomcdn.com',
+        'nexus-websocket-.intercom.io',
         'intercom.io',
         'intercomcdn.com',
         'googletagmanager.com',
@@ -67,11 +69,15 @@
     ];
 
     function hostOf(url) {
-        try { return new URL(url, location.href).hostname.toLowerCase(); }
-        catch { return ''; }
+        try {
+            return new URL(url, location.href).hostname.toLowerCase();
+        } catch {
+            return '';
+        }
     }
 
     function isTelemetryUrl(url) {
+        if (!url) return false;
         const h = hostOf(url);
         if (!h) return false;
         return TELEMETRY_HOSTS.some((t) => h === t || h.endsWith('.' + t) || h.includes(t));
@@ -81,7 +87,9 @@
         try {
             const u = new URL(url, location.href);
             return u.host === API_HOST && API_PATH_RE.test(u.pathname);
-        } catch { return false; }
+        } catch {
+            return false;
+        }
     }
 
     function bodyLooksLikeLogImproperUse(body) {
@@ -90,7 +98,9 @@
             try {
                 if (body instanceof URLSearchParams) body = body.toString();
                 else return false;
-            } catch { return false; }
+            } catch {
+                return false;
+            }
         }
         if (!/LogImproperUse|logImproperUse/i.test(body)) return false;
         try {
@@ -99,7 +109,9 @@
             if (/LogImproperUse/i.test(op)) return true;
             const q = parsed && parsed.query;
             if (typeof q === 'string' && /LogImproperUse|logImproperUse/i.test(q)) return true;
-        } catch { /* not JSON — substring match stands */ }
+        } catch {
+            /* not JSON — regex match stands */
+        }
         return true;
     }
 
@@ -107,18 +119,92 @@
         return new Response(JSON.stringify({ data: { logImproperUse: true } }), {
             status: 200,
             statusText: 'OK',
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Content-Type': 'application/json' },
         });
     }
 
-    // ---------- fetch ----------
+    // ============================================================
+    // 2. DOM & SCRIPT/IFRAME INJECTION BLOCKER (Universal @webRequest Alternative)
+    // ============================================================
+    function hookSrcProperty(proto, tag) {
+        const desc = Object.getOwnPropertyDescriptor(proto, 'src');
+        if (desc && desc.set) {
+            Object.defineProperty(proto, 'src', {
+                get: desc.get,
+                set(val) {
+                    if (isTelemetryUrl(val)) {
+                        LOG(`blocked <${tag}> src:`, val);
+                        return '';
+                    }
+                    return desc.set.call(this, val);
+                },
+                configurable: true,
+            });
+        }
+    }
+
+    hookSrcProperty(HTMLScriptElement.prototype, 'script');
+    hookSrcProperty(HTMLIFrameElement.prototype, 'iframe');
+
+    const origSetAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function (name, value) {
+        if (typeof name === 'string' && name.toLowerCase() === 'src' && isTelemetryUrl(value)) {
+            LOG('blocked setAttribute(src):', value);
+            return;
+        }
+        return origSetAttribute.apply(this, arguments);
+    };
+
+    // Remove any static or dynamically appended tracker elements
+    const domObserver = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+            for (const node of m.addedNodes) {
+                if (node.nodeType !== Node.ELEMENT_NODE) continue;
+                const tag = node.tagName.toLowerCase();
+                if (tag === 'script' || tag === 'iframe') {
+                    const src = node.src || node.getAttribute('src');
+                    if (isTelemetryUrl(src)) {
+                        LOG(`purged <${tag}> from DOM:`, src);
+                        node.remove();
+                    }
+                }
+            }
+        }
+    });
+
+    domObserver.observe(document.documentElement || document, { childList: true, subtree: true });
+
+    // ============================================================
+    // 3. WEBSOCKET BLOCKER (Intercom / Analytics Sockets)
+    // ============================================================
+    const OrigWebSocket = window.WebSocket;
+    if (OrigWebSocket) {
+        window.WebSocket = function (url, protocols) {
+            if (isTelemetryUrl(url)) {
+                LOG('blocked WebSocket connection:', url);
+                const dummy = new EventTarget();
+                dummy.readyState = 3; // CLOSED
+                dummy.send = () => {};
+                dummy.close = () => {};
+                setTimeout(() => {
+                    dummy.dispatchEvent(new Event('error'));
+                    dummy.dispatchEvent(new CloseEvent('close', { code: 1006, reason: 'Blocked' }));
+                }, 0);
+                return dummy;
+            }
+            return new OrigWebSocket(url, protocols);
+        };
+        window.WebSocket.prototype = OrigWebSocket.prototype;
+    }
+
+    // ============================================================
+    // 4. FETCH / XHR / SEND-BEACON INTERCEPTORS
+    // ============================================================
     const origFetch = window.fetch;
     if (origFetch) {
         window.fetch = function (input, init) {
             try {
-                const url = typeof input === 'string' ? input
-                          : (input && input.url) ? input.url
-                          : String(input);
+                const url = typeof input === 'string' ? input : (input && input.url) ? input.url : String(input);
 
                 if (isTelemetryUrl(url)) {
                     LOG('blocked telemetry fetch:', url);
@@ -130,7 +216,6 @@
                 if (method === 'POST' && isTargetApi(url)) {
                     let body = init && typeof init.body === 'string' ? init.body : null;
 
-                    // Body hidden inside a Request object.
                     if (body == null && typeof Request !== 'undefined' && input instanceof Request) {
                         const ct = (input.headers.get('content-type') || '').toLowerCase();
                         if (ct.includes('application/json')) {
@@ -159,7 +244,6 @@
         };
     }
 
-    // ---------- XHR ----------
     const OrigXHR = window.XMLHttpRequest;
     if (OrigXHR) {
         const origOpen = OrigXHR.prototype.open;
@@ -179,16 +263,12 @@
                 if (isTelemetryUrl(url)) {
                     LOG('blocked telemetry xhr:', url);
                     const self = this;
-                    const payload = '';
-                    Object.defineProperty(self, 'readyState',   { value: 4,    configurable: true });
-                    Object.defineProperty(self, 'status',       { value: 204,  configurable: true });
+                    Object.defineProperty(self, 'readyState',   { value: 4, configurable: true });
+                    Object.defineProperty(self, 'status',       { value: 204, configurable: true });
                     Object.defineProperty(self, 'statusText',   { value: 'No Content', configurable: true });
-                    Object.defineProperty(self, 'responseText', { value: payload, configurable: true });
-                    Object.defineProperty(self, 'response', {
-                        get() {
-                            if (self.responseType === 'json') return null;
-                            return payload;
-                        },
+                    Object.defineProperty(self, 'responseText', { value: '', configurable: true });
+                    Object.defineProperty(self, 'response',     {
+                        get() { return self.responseType === 'json' ? null : ''; },
                         configurable: true
                     });
                     setTimeout(() => {
@@ -205,15 +285,12 @@
                     LOG('dropped LogImproperUse (xhr)');
                     const self = this;
                     const payload = JSON.stringify({ data: { logImproperUse: true } });
-                    Object.defineProperty(self, 'readyState',   { value: 4,   configurable: true });
+                    Object.defineProperty(self, 'readyState',   { value: 4, configurable: true });
                     Object.defineProperty(self, 'status',       { value: 200, configurable: true });
                     Object.defineProperty(self, 'statusText',   { value: 'OK', configurable: true });
                     Object.defineProperty(self, 'responseText', { value: payload, configurable: true });
-                    Object.defineProperty(self, 'response', {
-                        get() {
-                            if (self.responseType === 'json') return { data: { logImproperUse: true } };
-                            return payload;
-                        },
+                    Object.defineProperty(self, 'response',     {
+                        get() { return self.responseType === 'json' ? { data: { logImproperUse: true } } : payload; },
                         configurable: true
                     });
                     setTimeout(() => {
@@ -232,7 +309,6 @@
         };
     }
 
-    // ---------- sendBeacon ----------
     if (navigator.sendBeacon) {
         const origBeacon = navigator.sendBeacon.bind(navigator);
         navigator.sendBeacon = function (url, data) {
@@ -247,7 +323,7 @@
     }
 
     // ============================================================
-    // 2. AUTO FULLSCREEN BLOCKER
+    // 5. FULLSCREEN BLOCKER
     // ============================================================
     const FULLSCREEN_METHODS = [
         'requestFullscreen',
@@ -269,17 +345,12 @@
                         document.exitFullscreen().catch(() => {});
                     }
                 } catch {}
-                return Promise.reject(new DOMException(
-                    'Fullscreen request blocked by userscript',
-                    'NotAllowedError'
-                ));
+                return Promise.reject(new DOMException('Fullscreen request blocked by userscript', 'NotAllowedError'));
             };
             wrapped.__ul_patched = true;
             wrapped.__ul_orig    = orig;
             try {
-                Object.defineProperty(proto, name, {
-                    value: wrapped, writable: true, configurable: true,
-                });
+                Object.defineProperty(proto, name, { value: wrapped, writable: true, configurable: true });
             } catch {
                 proto[name] = wrapped;
             }
@@ -288,28 +359,20 @@
     installFullscreenBlocker();
 
     // ============================================================
-    // 3. TAB-SWITCH / VISIBILITY / FOCUS DETECTION BLOCKER
+    // 6. TAB-SWITCH / VISIBILITY / FOCUS DETECTION BLOCKER
     // ============================================================
     function patchVisibilityProps() {
         try {
-            Object.defineProperty(document, 'visibilityState', {
-                get: () => 'visible', configurable: true
-            });
-            Object.defineProperty(document, 'webkitVisibilityState', {
-                get: () => 'visible', configurable: true
-            });
-            Object.defineProperty(document, 'hidden', {
-                get: () => false, configurable: true
-            });
-            Object.defineProperty(document, 'webkitHidden', {
-                get: () => false, configurable: true
-            });
+            Object.defineProperty(document, 'visibilityState',       { get: () => 'visible', configurable: true });
+            Object.defineProperty(document, 'webkitVisibilityState', { get: () => 'visible', configurable: true });
+            Object.defineProperty(document, 'hidden',                { get: () => false, configurable: true });
+            Object.defineProperty(document, 'webkitHidden',          { get: () => false, configurable: true });
         } catch (e) { WARN('visibility patch failed', e); }
     }
     patchVisibilityProps();
 
     function installHasFocusPatch() {
-        try { document.hasFocus = function () { return true; }; } catch {}
+        try { document.hasFocus = () => true; } catch {}
     }
     installHasFocusPatch();
 
@@ -322,7 +385,6 @@
         'freeze',
     ]);
 
-    // Swallow page-registered listeners for those events.
     try {
         const origProtoAdd = EventTarget.prototype.addEventListener;
         EventTarget.prototype.addEventListener = function (type, listener, options) {
@@ -333,7 +395,6 @@
         };
     } catch (e) { WARN('addEventListener patch failed', e); }
 
-    // Kill anything that still fires (capture phase, before page handlers).
     const KILL = (e) => {
         e.stopImmediatePropagation();
         e.stopPropagation();
@@ -345,7 +406,6 @@
         } catch {}
     });
 
-    // Neutralise on* handler properties.
     ['onblur', 'onfocusout', 'onpagehide', 'onvisibilitychange'].forEach((prop) => {
         try {
             Object.defineProperty(window,   prop, { get: () => null, set: () => {}, configurable: true });
@@ -353,7 +413,6 @@
         } catch {}
     });
 
-    // Re-assert periodically (SPA navigations / late patches).
     setInterval(() => {
         patchVisibilityProps();
         installHasFocusPatch();
