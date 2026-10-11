@@ -105,6 +105,7 @@
     };
 
     const INDIVIDUAL_TELEMETRY_SETTINGS = new Set([
+        'telemetryServices',
         'blockLogImproperUse', 'spoofVisibility', 'blockWebSockets',
         'blockSendBeacon', 'blockDomElements', 'suppressConsoleNoise',
     ]);
@@ -187,9 +188,27 @@
 
     const settings = loadSettings();
 
-    function saveSettings() {
-        try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+    let saveSettingsTimer = null;
+    function saveSettings(immediate = false) {
+        if (immediate) {
+            if (saveSettingsTimer) {
+                clearTimeout(saveSettingsTimer);
+                saveSettingsTimer = null;
+            }
+            try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+            return;
+        }
+        if (!saveSettingsTimer) {
+            saveSettingsTimer = setTimeout(() => {
+                saveSettingsTimer = null;
+                try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+            }, 150);
+        }
     }
+    try {
+        window.addEventListener('beforeunload', () => saveSettings(true));
+        window.addEventListener('pagehide', () => saveSettings(true));
+    } catch {}
 
     // ============================================================
     // PRESETS
@@ -261,9 +280,16 @@
     const API_PATH_RE = /\/api\/?$/;
     const JITSU_HOSTS = TELEMETRY_SERVICES.jitsu.hosts;
 
+    const hostCache = new Map();
     function hostOf(url) {
-        try { return new URL(url, location.href).hostname.toLowerCase(); }
-        catch { return ''; }
+        if (!url || typeof url !== 'string') return '';
+        let h = hostCache.get(url);
+        if (h !== undefined) return h;
+        try { h = new URL(url, location.href).hostname.toLowerCase(); }
+        catch { h = ''; }
+        if (hostCache.size > 250) hostCache.clear();
+        hostCache.set(url, h);
+        return h;
     }
 
     function isJitsuHost(h) {
@@ -326,6 +352,8 @@
     function isTelemetryUrl(url) { return !!matchTelemetryService(url); }
 
     function isTargetApi(url) {
+        if (!url || typeof url !== 'string') return false;
+        if (!url.includes(API_HOST) && !url.startsWith('/api')) return false;
         try {
             const u = new URL(url, location.href);
             return u.host === API_HOST && API_PATH_RE.test(u.pathname);
@@ -759,7 +787,7 @@
         const has = html.classList.contains('ul-dark-mode');
         if (settings.darkMode && !has) html.classList.add('ul-dark-mode');
         else if (!settings.darkMode && has) html.classList.remove('ul-dark-mode');
-    }, 500);
+    }, 3000);
 
     // ============================================================
     // LOGIMPROPERUSE DETECTION
@@ -976,15 +1004,21 @@
         btn = btn || document.getElementById(MANUAL_BUTTON_ID);
         if (!btn) return;
 
-        if (queuedSeconds !== null) {
-            btn.textContent = '\u23F1 +' + formatSeconds(queuedSeconds);
-            btn.classList.add('us-active');
-            btn.title = 'Extra: +' + toIso(queuedSeconds) +
-                        ' (added on top of UpLearn\'s own timeSpent). Click to edit.';
-        } else {
-            btn.textContent = '\u23F1 Add time';
-            btn.classList.remove('us-active');
-            btn.title = 'Set extra time added on top of UpLearn\'s own timeSpent';
+        const nextText = (queuedSeconds !== null) ? ('\u23F1 +' + formatSeconds(queuedSeconds)) : '\u23F1 Add time';
+        if (btn.textContent !== nextText) {
+            btn.textContent = nextText;
+        }
+
+        const nextActive = queuedSeconds !== null;
+        if (btn.classList.contains('us-active') !== nextActive) {
+            btn.classList.toggle('us-active', nextActive);
+        }
+
+        const nextTitle = (queuedSeconds !== null)
+            ? 'Extra: +' + toIso(queuedSeconds) + ' (added on top of UpLearn\'s own timeSpent). Click to edit.'
+            : 'Set extra time added on top of UpLearn\'s own timeSpent';
+        if (btn.title !== nextTitle) {
+            btn.title = nextTitle;
         }
 
         if (pulse) {
@@ -1166,7 +1200,19 @@
     }
 
     let manualBtnScheduled = false;
-    function scheduleEnsureButton() {
+    function scheduleEnsureButton(mutations) {
+        if (!settings.manualTimeButtonEnabled) return;
+        if (mutations && Array.isArray(mutations)) {
+            let onlyOurHost = true;
+            for (let i = 0; i < mutations.length; i++) {
+                const target = mutations[i].target;
+                if (!target || (!target.id?.includes('__ul-') && (!target.closest || !target.closest('#__ul-heroui-host')))) {
+                    onlyOurHost = false;
+                    break;
+                }
+            }
+            if (onlyOurHost) return;
+        }
         if (manualBtnScheduled) return;
         manualBtnScheduled = true;
         setTimeout(() => {
@@ -1181,9 +1227,8 @@
             observer.observe(document.documentElement || document, {
                 childList: true,
                 subtree: true,
-                characterData: true,
             });
-            setInterval(ensureButton, 3000);
+            setInterval(ensureButton, 4000);
         } catch (e) {
             WARN('mutation observer for manual button failed', e);
         }
@@ -1707,7 +1752,7 @@
     setInterval(() => {
         patchVisibilityProps();
         installHasFocusPatch();
-    }, 2000);
+    }, 5000);
 
     // ============================================================
     // AUTO FULLSCREEN BLOCKER
@@ -2024,8 +2069,7 @@
                 color: var(--foreground);
                 border: 1px solid var(--border);
                 box-shadow: var(--shadow-pill);
-                backdrop-filter: blur(16px);
-                -webkit-backdrop-filter: blur(16px);
+                transform: translateZ(0);
                 user-select: none;
                 font-size: 13px;
                 font-weight: 500;
@@ -2152,44 +2196,27 @@
                 inset: 0;
                 z-index: 2147483647;
                 background: var(--backdrop);
-                backdrop-filter: blur(12px);
-                -webkit-backdrop-filter: blur(12px);
                 display: flex;
                 align-items: center;
                 justify-content: center;
                 padding: 16px;
                 box-sizing: border-box;
                 pointer-events: auto;
-                animation: heroui-modal-fade-in 280ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
-                will-change: opacity, backdrop-filter;
+                animation: heroui-modal-fade-in 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+                will-change: opacity;
+                transform: translateZ(0);
             }
             .modal__backdrop--closing {
                 pointer-events: none !important;
-                animation: heroui-modal-fade-out 220ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
+                animation: heroui-modal-fade-out 180ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
             }
             @keyframes heroui-modal-fade-in {
-                0% {
-                    opacity: 0;
-                    backdrop-filter: blur(0px);
-                    -webkit-backdrop-filter: blur(0px);
-                }
-                100% {
-                    opacity: 1;
-                    backdrop-filter: blur(12px);
-                    -webkit-backdrop-filter: blur(12px);
-                }
+                0% { opacity: 0; }
+                100% { opacity: 1; }
             }
             @keyframes heroui-modal-fade-out {
-                0% {
-                    opacity: 1;
-                    backdrop-filter: blur(12px);
-                    -webkit-backdrop-filter: blur(12px);
-                }
-                100% {
-                    opacity: 0;
-                    backdrop-filter: blur(0px);
-                    -webkit-backdrop-filter: blur(0px);
-                }
+                0% { opacity: 1; }
+                100% { opacity: 0; }
             }
 
             .modal__container {
@@ -2212,34 +2239,31 @@
                 display: flex;
                 flex-direction: column;
                 overflow: hidden;
-                animation: heroui-modal-scale-in 280ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+                animation: heroui-modal-scale-in 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
                 will-change: transform, opacity;
+                transform: translateZ(0);
             }
             .modal__backdrop--closing .modal__dialog {
-                animation: heroui-modal-scale-out 220ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
+                animation: heroui-modal-scale-out 180ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
             }
             @keyframes heroui-modal-scale-in {
                 0% {
                     opacity: 0;
-                    transform: scale(0.94) translateY(14px);
-                    filter: blur(4px);
+                    transform: scale(0.96) translateY(10px);
                 }
                 100% {
                     opacity: 1;
                     transform: scale(1) translateY(0);
-                    filter: blur(0);
                 }
             }
             @keyframes heroui-modal-scale-out {
                 0% {
                     opacity: 1;
                     transform: scale(1) translateY(0);
-                    filter: blur(0);
                 }
                 100% {
                     opacity: 0;
-                    transform: scale(0.95) translateY(10px);
-                    filter: blur(3px);
+                    transform: scale(0.97) translateY(6px);
                 }
             }
 
@@ -2404,7 +2428,8 @@
                 padding-right: 6px;
                 scrollbar-width: thin;
                 scrollbar-color: var(--border) transparent;
-                will-change: transform, opacity, filter;
+                will-change: transform, opacity;
+                transform: translateZ(0);
             }
             .tabs__panel::-webkit-scrollbar {
                 width: 6px;
@@ -2418,35 +2443,31 @@
                 display: flex;
             }
             .tabs__panel[data-active="true"][data-direction="forward"] {
-                animation: heroui-tab-forward 280ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+                animation: heroui-tab-forward 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
             }
             .tabs__panel[data-active="true"][data-direction="backward"] {
-                animation: heroui-tab-backward 280ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+                animation: heroui-tab-backward 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
             }
 
             @keyframes heroui-tab-forward {
                 0% {
                     opacity: 0;
-                    transform: translateX(24px) scale(0.995);
-                    filter: blur(2px);
+                    transform: translateX(16px);
                 }
                 100% {
                     opacity: 1;
-                    transform: translateX(0) scale(1);
-                    filter: blur(0);
+                    transform: translateX(0);
                 }
             }
 
             @keyframes heroui-tab-backward {
                 0% {
                     opacity: 0;
-                    transform: translateX(-24px) scale(0.995);
-                    filter: blur(2px);
+                    transform: translateX(-16px);
                 }
                 100% {
                     opacity: 1;
-                    transform: translateX(0) scale(1);
-                    filter: blur(0);
+                    transform: translateX(0);
                 }
             }
 
@@ -3308,6 +3329,8 @@
                 box-shadow: 0 12px 30px -4px rgba(0, 0, 0, 0.45), 0 4px 12px -2px rgba(0, 0, 0, 0.25);
                 z-index: 100;
                 overflow: hidden;
+                will-change: transform, opacity;
+                transform: translateZ(0);
                 animation: dropdownIn 160ms cubic-bezier(0.16, 1, 0.3, 1);
             }
             @keyframes dropdownIn {
@@ -3535,6 +3558,7 @@
 
     function applySettingChange(key, value) {
         if (key === 'telemetryPreset') {
+            if (value === settings.telemetryPreset && value !== 'custom') return;
             if (value !== 'custom') {
                 applyingPreset = true;
                 applyTelemetryPreset(value);
@@ -3547,6 +3571,8 @@
             if (reactSetSettings) reactSetSettings(Object.assign({}, settings));
             return;
         }
+
+        if (settings[key] === value) return;
 
         settings[key] = value;
 
@@ -3628,7 +3654,7 @@
         `;
     };
 
-    const Button = ({
+    const Button = React.memo(({
         variant = 'primary',
         size = 'md',
         fullWidth = false,
@@ -3646,11 +3672,6 @@
         children,
         ...restProps
     }) => {
-        const [isHovered, setIsHovered] = React.useState(false);
-        const [isPressed, setIsPressed] = React.useState(false);
-        const [isFocused, setIsFocused] = React.useState(false);
-        const [isFocusVisible, setIsFocusVisible] = React.useState(false);
-
         const effectiveDisabled = Boolean(isDisabled || disabled);
 
         const handlePress = (e) => {
@@ -3671,16 +3692,10 @@
             className
         ].filter(Boolean).join(' ');
 
-        const renderProps = {
+        const content = typeof children === 'function' ? children({
             isPending,
-            isPressed,
-            isHovered,
-            isFocused,
-            isFocusVisible,
             isDisabled: effectiveDisabled,
-        };
-
-        const content = typeof children === 'function' ? children(renderProps) : children;
+        }) : children;
 
         return html`
             <button
@@ -3690,19 +3705,9 @@
                 disabled=${effectiveDisabled}
                 data-slot="button"
                 slot=${slot || undefined}
-                data-hovered=${isHovered ? 'true' : undefined}
-                data-pressed=${isPressed ? 'true' : undefined}
-                data-focus-visible=${isFocusVisible ? 'true' : undefined}
                 data-pending=${isPending ? 'true' : undefined}
                 aria-disabled=${effectiveDisabled ? 'true' : undefined}
                 onClick=${handlePress}
-                onPointerDown=${() => !effectiveDisabled && setIsPressed(true)}
-                onPointerUp=${() => setIsPressed(false)}
-                onPointerCancel=${() => setIsPressed(false)}
-                onMouseEnter=${() => setIsHovered(true)}
-                onMouseLeave=${() => { setIsHovered(false); setIsPressed(false); }}
-                onFocus=${() => { setIsFocused(true); setIsFocusVisible(true); }}
-                onBlur=${() => { setIsFocused(false); setIsFocusVisible(false); }}
                 style=${style}
                 ...${restProps}
             >
@@ -3712,7 +3717,7 @@
                 ${content}
             </button>
         `;
-    };
+    });
 
     const ButtonGroup = ({ orientation = 'horizontal', fullWidth = false, size = 'md', className = '', children }) => html`
         <div 
@@ -3796,7 +3801,7 @@
         </button>
     `;
     Tabs.Indicator = ({ style }) => html`<div className="tabs__indicator" style=${style}></div>`;
-    Tabs.Panel = ({ id, activeTab, direction, children }) => {
+    Tabs.Panel = React.memo(({ id, activeTab, direction, children }) => {
         const isActive = id === activeTab;
         return html`
             <div 
@@ -3809,10 +3814,10 @@
                 ${children}
             </div>
         `;
-    };
+    });
 
     // --- Switch Compound Component (HeroUI v3) ---
-    const Switch = ({ isSelected, onChange, size = 'md', isDisabled = false, className = '', children, onClick }) => {
+    const Switch = React.memo(({ isSelected, onChange, size = 'md', isDisabled = false, className = '', children, onClick }) => {
         const toggle = (e) => {
             if (isDisabled) return;
             if (e) e.stopPropagation();
@@ -3828,7 +3833,7 @@
         };
         return html`
             <div 
-                className=${`switch switch--${size} ${className}`.trim()}
+                className=${`switch switch--${size} ${className}`.trim()} 
                 role="switch" 
                 tabIndex=${isDisabled ? '-1' : '0'}
                 data-selected=${isSelected ? 'true' : 'false'}
@@ -3841,7 +3846,7 @@
                 ${children}
             </div>
         `;
-    };
+    });
     Switch.Control = ({ children }) => html`<div className="switch__control">${children || html`<div className="switch__thumb"></div>`}</div>`;
     Switch.Thumb = ({ children }) => html`<div className="switch__thumb">${children}</div>`;
     Switch.Content = ({ children }) => html`<div className="switch__content">${children}</div>`;
@@ -3849,32 +3854,33 @@
     Switch.Description = ({ children }) => html`<div data-slot="description">${children}</div>`;
 
     // --- Card Compound Component (HeroUI v3) ---
-    const Card = ({ variant = 'secondary', className = '', children }) => html`
+    const Card = React.memo(({ variant = 'secondary', className = '', children }) => html`
         <div className=${`card card--${variant} ${className}`}>${children}</div>
-    `;
+    `);
     Card.Header = ({ className = '', children }) => html`<div className=${`card__header ${className}`.trim()}>${children}</div>`;
     Card.Title = ({ className = '', children }) => html`<div className=${`card__title ${className}`.trim()}>${children}</div>`;
     Card.Description = ({ className = '', children }) => html`<div className=${`card__description ${className}`.trim()}>${children}</div>`;
     Card.Content = ({ className = '', children }) => html`<div className=${`card__content ${className}`.trim()}>${children}</div>`;
 
     // --- Badge Component (HeroUI v3) ---
-    const Badge = ({ size = 'sm', variant = 'primary', color = '', className = '', children }) => html`
+    const Badge = React.memo(({ size = 'sm', variant = 'primary', color = '', className = '', children }) => html`
         <span className=${`badge badge--${size} badge--${variant} ${color ? `badge--${color}` : ''} ${className}`}>
             ${children}
         </span>
-    `;
+    `);
 
     // --- Dropdown Compound Component (HeroUI v3) ---
     const DropdownContext = (typeof React !== 'undefined') ? React.createContext(null) : null;
 
-    const Dropdown = ({ selectedKey, onSelectionChange, className = '', children }) => {
+    const Dropdown = React.memo(({ selectedKey, onSelectionChange, className = '', children }) => {
         const [isOpen, setIsOpen] = React.useState(false);
         const dropdownRef = React.useRef(null);
 
         React.useEffect(() => {
             if (!isOpen) return;
             const handleDocClick = (e) => {
-                if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
+                const target = (e.composedPath && e.composedPath()[0]) || e.target;
+                if (dropdownRef.current && !dropdownRef.current.contains(target)) {
                     setIsOpen(false);
                 }
             };
@@ -3899,7 +3905,7 @@
                 <//>
             </div>
         `;
-    };
+    });
 
     Dropdown.Trigger = ({ children }) => {
         const ctx = React.useContext(DropdownContext);
@@ -3928,7 +3934,7 @@
 
     Dropdown.Menu = ({ children }) => html`<div className="dropdown__menu" role="menu">${children}</div>`;
 
-    Dropdown.Item = ({ id, variant, children }) => {
+    Dropdown.Item = React.memo(({ id, variant, children }) => {
         const ctx = React.useContext(DropdownContext);
         const isSelected = ctx && ctx.selectedKey === id;
         return html`
@@ -3944,14 +3950,14 @@
                 ${isSelected ? html`<span className="dropdown__item-indicator">✓</span>` : null}
             </div>
         `;
-    };
+    });
     Dropdown.Item.Label = ({ children }) => html`<div className="dropdown__item-label">${children}</div>`;
     Dropdown.Item.Description = ({ children }) => html`<div className="dropdown__item-description">${children}</div>`;
 
     // --- TagGroup Compound Component (HeroUI v3) ---
     const TagGroupContext = (typeof React !== 'undefined') ? React.createContext(null) : null;
 
-    const TagGroup = ({ ariaLabel, selectionMode = 'single', selectedKeys, onSelectionChange, className = '', children }) => {
+    const TagGroup = React.memo(({ ariaLabel, selectionMode = 'single', selectedKeys, onSelectionChange, className = '', children }) => {
         const contextValue = React.useMemo(() => ({
             selectedKeys: selectedKeys || [],
             selectionMode,
@@ -3967,11 +3973,11 @@
                 <//>
             </div>
         `;
-    };
+    });
     TagGroup.Label = ({ className = '', children }) => html`<div className=${`tag-group__label ${className}`.trim()}>${children}</div>`;
     TagGroup.List = ({ className = '', children }) => html`<div className=${`tag-group__list ${className}`.trim()}>${children}</div>`;
 
-    const Tag = ({ id, onPress, onClick, className = '', children }) => {
+    const Tag = React.memo(({ id, onPress, onClick, className = '', children }) => {
         const ctx = React.useContext(TagGroupContext);
         const isSelected = ctx ? ctx.selectedKeys.includes(id) : false;
         return html`
@@ -3998,7 +4004,7 @@
                 ${children}
             </div>
         `;
-    };
+    });
     TagGroup.Tag = Tag;
 
     const PRESET_OPTIONS = [
@@ -4037,7 +4043,7 @@
     // --- Slider Compound Component (HeroUI v3) ---
     const SliderContext = (typeof React !== 'undefined') ? React.createContext(null) : null;
 
-    const Slider = ({
+    const Slider = React.memo(({
         value,
         defaultValue = 0,
         minValue = 0,
@@ -4051,59 +4057,100 @@
         const [internalValue, setInternalValue] = React.useState(typeof value !== 'undefined' ? value : defaultValue);
         const [isDragging, setIsDragging] = React.useState(false);
         const trackRef = React.useRef(null);
+        const isDraggingRef = React.useRef(false);
+        const latestValRef = React.useRef(internalValue);
 
-        const curVal = typeof value !== 'undefined' ? value : internalValue;
+        // Keep internal value in sync with external value when not dragging
+        React.useEffect(() => {
+            if (!isDraggingRef.current && typeof value !== 'undefined') {
+                setInternalValue(value);
+                latestValRef.current = value;
+            }
+        }, [value]);
+
+        const curVal = isDragging ? internalValue : (typeof value !== 'undefined' ? value : internalValue);
         const percentage = Math.max(0, Math.min(100, ((curVal - minValue) / (maxValue - minValue)) * 100));
 
-        const triggerChange = React.useCallback((nextVal) => {
+        const triggerChange = React.useCallback((nextVal, commit = false) => {
             const clamped = Math.max(minValue, Math.min(maxValue, parseFloat(nextVal.toFixed(4))));
+            latestValRef.current = clamped;
             setInternalValue(clamped);
-            if (onChange) onChange(clamped);
-        }, [minValue, maxValue, onChange]);
-
-        const updateFromPointer = React.useCallback((clientX) => {
-            if (!trackRef.current || isDisabled) return;
-            const rect = trackRef.current.getBoundingClientRect();
-            if (rect.width <= 0) return;
-            const pos = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-            let raw = minValue + pos * (maxValue - minValue);
-            if (step) {
-                raw = Math.round((raw - minValue) / step) * step + minValue;
+            if (commit && onChange) {
+                onChange(clamped);
             }
-            triggerChange(raw);
-        }, [minValue, maxValue, step, isDisabled, triggerChange]);
-
-        const handlePointerDown = (e) => {
-            if (isDisabled) return;
-            e.preventDefault();
-            setIsDragging(true);
-            updateFromPointer(e.clientX);
-
-            const onMove = (ev) => updateFromPointer(ev.clientX);
-            const onUp = () => {
-                setIsDragging(false);
-                window.removeEventListener('pointermove', onMove);
-                window.removeEventListener('pointerup', onUp);
-            };
-            window.addEventListener('pointermove', onMove);
-            window.addEventListener('pointerup', onUp);
-        };
+        }, [minValue, maxValue, onChange]);
 
         const handleKeyDown = (e) => {
             if (isDisabled) return;
-            if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+            let next = null;
+            if (e.key === 'ArrowRight' || e.key === 'ArrowUp') next = curVal + step;
+            else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') next = curVal - step;
+            else if (e.key === 'Home') next = minValue;
+            else if (e.key === 'End') next = maxValue;
+            if (next !== null) {
                 e.preventDefault();
-                triggerChange(curVal + step);
-            } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
-                e.preventDefault();
-                triggerChange(curVal - step);
-            } else if (e.key === 'Home') {
-                e.preventDefault();
-                triggerChange(minValue);
-            } else if (e.key === 'End') {
-                e.preventDefault();
-                triggerChange(maxValue);
+                triggerChange(next, true);
             }
+        };
+
+        const handlePointerDown = (e) => {
+            if (isDisabled || !trackRef.current) return;
+            e.preventDefault();
+            isDraggingRef.current = true;
+            setIsDragging(true);
+
+            // Cache bounding rect ONCE on pointerdown to prevent layout reflows during move
+            const rect = trackRef.current.getBoundingClientRect();
+            const width = rect.width;
+            const left = rect.left;
+
+            const calcValFromClientX = (clientX) => {
+                if (width <= 0) return minValue;
+                const pos = Math.max(0, Math.min(1, (clientX - left) / width));
+                let raw = minValue + pos * (maxValue - minValue);
+                if (step) {
+                    raw = Math.round((raw - minValue) / step) * step + minValue;
+                }
+                return Math.max(minValue, Math.min(maxValue, parseFloat(raw.toFixed(4))));
+            };
+
+            const initialVal = calcValFromClientX(e.clientX);
+            triggerChange(initialVal, false);
+
+            let rafId = null;
+            let latestClientX = e.clientX;
+
+            const onMove = (ev) => {
+                latestClientX = ev.clientX;
+                if (rafId) return;
+                rafId = requestAnimationFrame(() => {
+                    rafId = null;
+                    if (!isDraggingRef.current) return;
+                    const nextVal = calcValFromClientX(latestClientX);
+                    triggerChange(nextVal, false);
+                    // Live DOM fast-path preview on floating pill without whole-app React re-renders
+                    try {
+                        const pillEl = (uiShadowRoot && uiShadowRoot.getElementById('__ul-pill')) || document.getElementById('__ul-pill');
+                        if (pillEl) pillEl.style.opacity = String(nextVal);
+                    } catch {}
+                });
+            };
+
+            const onUp = (ev) => {
+                if (rafId) {
+                    cancelAnimationFrame(rafId);
+                    rafId = null;
+                }
+                isDraggingRef.current = false;
+                setIsDragging(false);
+                window.removeEventListener('pointermove', onMove);
+                window.removeEventListener('pointerup', onUp);
+                const finalVal = calcValFromClientX(ev.clientX);
+                triggerChange(finalVal, true);
+            };
+
+            window.addEventListener('pointermove', onMove, { passive: true });
+            window.addEventListener('pointerup', onUp, { passive: true });
         };
 
         const contextValue = React.useMemo(() => ({
@@ -4129,13 +4176,17 @@
                 <//>
             </div>
         `;
-    };
+    });
 
     Slider.Output = ({ className = '', children }) => {
         const ctx = React.useContext(SliderContext);
+        const val = ctx ? ctx.value : 0;
+        const display = typeof children === 'function'
+            ? children(val)
+            : (children || `${Math.round(ctx ? (ctx.value <= 1 && ctx.maxValue <= 1 ? ctx.value * 100 : ctx.percentage) : 0)}%`);
         return html`
             <output className=${`slider__output ${className}`.trim()}>
-                ${children ? children : `${Math.round(ctx ? ctx.percentage : 0)}%`}
+                ${display}
             </output>
         `;
     };
@@ -4178,30 +4229,37 @@
     };
 
     // --- ServiceTile Component (HeroUI v3 Switch) ---
-    const ServiceTile = ({ serviceKey, service, isChecked, onToggle }) => html`
-        <div 
-            className="service-tile"
-            data-service=${serviceKey}
-            data-checked=${isChecked ? 'true' : 'false'}
-            title=${service.hosts.join(', ')}
-            onClick=${onToggle}
-        >
-            <span className="service-tile__label">${service.label}</span>
-            <${Switch} 
-                isSelected=${isChecked} 
-                onChange=${onToggle}
-                size="sm"
-                className="service-tile__switch"
+    const ServiceTile = React.memo(({ serviceKey, service, isChecked, onToggle }) => {
+        const handleToggle = React.useCallback((e) => {
+            if (e && e.stopPropagation) e.stopPropagation();
+            if (onToggle) onToggle(serviceKey);
+        }, [onToggle, serviceKey]);
+
+        return html`
+            <div 
+                className="service-tile"
+                data-service=${serviceKey}
+                data-checked=${isChecked ? 'true' : 'false'}
+                title=${service.hosts.join(', ')}
+                onClick=${handleToggle}
             >
-                <${Switch.Control}>
-                    <${Switch.Thumb} />
+                <span className="service-tile__label">${service.label}</span>
+                <${Switch} 
+                    isSelected=${isChecked} 
+                    onChange=${handleToggle}
+                    size="sm"
+                    className="service-tile__switch"
+                >
+                    <${Switch.Control}>
+                        <${Switch.Thumb} />
+                    <//>
                 <//>
-            <//>
-        </div>
-    `;
+            </div>
+        `;
+    });
 
     // --- StatusPill Component (Floating UI) ---
-    const StatusPill = ({ currentSettings, currentStats, accumulatedBonus, onToggleBoost, onOpenSettings }) => {
+    const StatusPill = React.memo(({ currentSettings, currentStats, accumulatedBonus, onToggleBoost, onOpenSettings }) => {
         if (!currentSettings.pillVisible) return null;
         const mode = currentSettings.pillMode || 'minimal';
         const isMinimal = mode === 'minimal';
@@ -4283,39 +4341,17 @@
                 </button>
             </div>
         `;
-    };
+    });
 
     // --- SettingsModal Component (HeroUI v3 Dialog) ---
-    const SettingsModal = ({
-        isOpen,
-        isClosing,
-        onClose,
+    // --- SettingsModal Component & Isolated Memoized Tabs ---
+    const TelemetryTab = React.memo(({
         currentSettings,
-        currentStats,
-        accumulatedBonus,
-        isCapturingKeybind,
-        onStartCaptureKeybind,
-        onClearKeybind,
         onUpdateSetting,
-        onResetAllSettings,
-        onResetStats,
     }) => {
-        const { useState, useMemo } = React;
-        const [activeTab, setActiveTab] = useState('telemetry');
-        const [tabDirection, setTabDirection] = useState('forward');
+        const { useState, useMemo, useCallback } = React;
         const [servicesFilter, setServicesFilter] = useState('');
 
-        const TAB_KEYS = ['telemetry', 'timeboost', 'preferences', 'stats'];
-
-        const handleTabClick = (targetTab) => {
-            if (targetTab === activeTab) return;
-            const curIdx = TAB_KEYS.indexOf(activeTab);
-            const targetIdx = TAB_KEYS.indexOf(targetTab);
-            setTabDirection(targetIdx > curIdx ? 'forward' : 'backward');
-            setActiveTab(targetTab);
-        };
-
-        // Filter services
         const { filteredServicesList, activeServicesCount, totalServicesCount } = useMemo(() => {
             const q = servicesFilter.toLowerCase().trim();
             let active = 0, total = 0;
@@ -4333,17 +4369,17 @@
             return { filteredServicesList: list, activeServicesCount: active, totalServicesCount: total };
         }, [servicesFilter, currentSettings.telemetryServices]);
 
-        const handleToggleService = (key) => {
-            const next = !currentSettings.telemetryServices[key];
-            const updated = Object.assign({}, currentSettings.telemetryServices, { [key]: next });
-            currentSettings.telemetryServices[key] = next;
-            if (!applyingPreset) currentSettings.telemetryPreset = 'custom';
+        const handleToggleService = useCallback((key) => {
+            const next = !settings.telemetryServices[key];
+            const updated = Object.assign({}, settings.telemetryServices, { [key]: next });
+            settings.telemetryServices = updated;
+            settings.telemetryPreset = 'custom';
             saveSettings();
-            onUpdateSetting('telemetryServices', updated);
             LOG(`service "${TELEMETRY_SERVICES[key].label}" ${next ? 'ENABLED' : 'DISABLED'}`);
-        };
+            onUpdateSetting('telemetryServices', updated);
+        }, [onUpdateSetting]);
 
-        const handleEnableAllServices = () => {
+        const handleEnableAllServices = useCallback(() => {
             const updated = {};
             for (const k in TELEMETRY_SERVICES) {
                 if (k !== 'jitsu') {
@@ -4351,13 +4387,13 @@
                     updated[k] = true;
                 }
             }
+            settings.telemetryServices = updated;
             settings.telemetryPreset = 'custom';
             saveSettings();
             onUpdateSetting('telemetryServices', updated);
-            onUpdateSetting('telemetryPreset', 'custom');
-        };
+        }, [onUpdateSetting]);
 
-        const handleDisableAllServices = () => {
+        const handleDisableAllServices = useCallback(() => {
             const updated = {};
             for (const k in TELEMETRY_SERVICES) {
                 if (k !== 'jitsu') {
@@ -4365,15 +4401,852 @@
                     updated[k] = false;
                 }
             }
+            settings.telemetryServices = updated;
             settings.telemetryPreset = 'custom';
             saveSettings();
             onUpdateSetting('telemetryServices', updated);
-            onUpdateSetting('telemetryPreset', 'custom');
-        };
+        }, [onUpdateSetting]);
+
+        // Memoized switch handlers
+        const updatePreset = useCallback((val) => onUpdateSetting('telemetryPreset', val), [onUpdateSetting]);
+        const updateLogImproper = useCallback((v) => onUpdateSetting('blockLogImproperUse', v), [onUpdateSetting]);
+        const updateBlockDom = useCallback((v) => onUpdateSetting('blockDomElements', v), [onUpdateSetting]);
+        const updateBlockWs = useCallback((v) => onUpdateSetting('blockWebSockets', v), [onUpdateSetting]);
+        const updateBlockBeacon = useCallback((v) => onUpdateSetting('blockSendBeacon', v), [onUpdateSetting]);
+        const updateSpoofVis = useCallback((v) => onUpdateSetting('spoofVisibility', v), [onUpdateSetting]);
+        const updateSuppressNoise = useCallback((v) => onUpdateSetting('suppressConsoleNoise', v), [onUpdateSetting]);
+        const updateSuppressJitsu = useCallback((v) => onUpdateSetting('suppressJitsu', v), [onUpdateSetting]);
+
+        return html`
+            <div className="grid-2col">
+                <div className="col-stack">
+                    <${Card} className="card--compact">
+                        <${Card.Header}>
+                            <${Card.Title}>
+                                <span>Blocking Preset</span>
+                                <${Badge} variant="soft" color="accent">Smart Filters<//>
+                            <//>
+                            <${Card.Description}>Pick a ready-made preset or customize your active blockers.<//>
+                        <//>
+                        <${Card.Content}>
+                            <div className="field-row">
+                                <label>Active Preset
+                                    <small>Off · Simple (LogImproperUse only) · Harsh (Block all) · Custom</small>
+                                </label>
+                                <${Dropdown} 
+                                    selectedKey=${currentSettings.telemetryPreset}
+                                    onSelectionChange=${updatePreset}
+                                >
+                                    <${Dropdown.Trigger}>
+                                        <${Button} variant="secondary" className="dropdown__trigger-btn">
+                                            <span>${PRESET_OPTIONS.find(o => o.id === currentSettings.telemetryPreset)?.label || 'Custom'}</span>
+                                            <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                                        <//>
+                                    <//>
+                                    <${Dropdown.Popover}>
+                                        <${Dropdown.Menu}>
+                                            ${PRESET_OPTIONS.map(opt => html`
+                                                <${Dropdown.Item} id=${opt.id} key=${opt.id}>
+                                                    <${Dropdown.Item.Label}>${opt.label}<//>
+                                                    <${Dropdown.Item.Description}>${opt.desc}<//>
+                                                <//>
+                                            `)}
+                                        <//>
+                                    <//>
+                                <//>
+                            </div>
+                        <//>
+                    <//>
+
+                    <${Card} className="card--compact">
+                        <${Card.Header}>
+                            <${Card.Title}>Core Protection Toggles<//>
+                            <${Card.Description}>Fine-grained control over network intercepts and client spoofing.<//>
+                        <//>
+                        <${Card.Content} className="core-toggles-list">
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.blockLogImproperUse}
+                                onChange=${updateLogImproper}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Block LogImproperUse requests<//>
+                                    <${Switch.Description}>Silently drops UpLearn improper-use telemetry sent to API<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.blockDomElements}
+                                onChange=${updateBlockDom}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Block DOM telemetry injection<//>
+                                    <${Switch.Description}>Hooks script/iframe src and purges blocked tracker nodes<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.blockWebSockets}
+                                onChange=${updateBlockWs}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Block telemetry WebSockets<//>
+                                    <${Switch.Description}>Terminates analytics & Intercom WebSocket connections<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.blockSendBeacon}
+                                onChange=${updateBlockBeacon}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Block telemetry sendBeacon<//>
+                                    <${Switch.Description}>Drops background beacon-style telemetry packets<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.spoofVisibility}
+                                onChange=${updateSpoofVis}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Spoof visibility & focus<//>
+                                    <${Switch.Description}>Ensures page always believes it is focused & visible<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.suppressConsoleNoise}
+                                onChange=${updateSuppressNoise}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Suppress site's console noise<//>
+                                    <${Switch.Description}>Mutes [J-ERROR], Jitsu send errors, and blocked-host spam<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.suppressJitsu}
+                                onChange=${updateSuppressJitsu}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Suppress Jitsu telemetry<//>
+                                    <${Switch.Description}>Checked: blocks jitsu.uplearn.co.uk. Unchecked: logs inspected packets.<//>
+                                <//>
+                            <//>
+                        <//>
+                    <//>
+                </div>
+
+                <div className="col-stack">
+                    <${Card} className="card--compact">
+                        <${Card.Header}>
+                            <${Card.Title}>
+                                <span>Third-Party Telemetry Services</span>
+                                <${Badge} variant="soft" color="accent">${activeServicesCount}/${totalServicesCount} Active<//>
+                            <//>
+                            <${Card.Description}>Toggle individual analytics trackers. Changes auto-switch preset to Custom.<//>
+                        <//>
+                        <${Card.Content}>
+                            <div className="services-search-bar">
+                                <input 
+                                    type="text" 
+                                    className="services-search-input" 
+                                    placeholder="Search service name or hostname…"
+                                    value=${servicesFilter}
+                                    onInput=${(e) => setServicesFilter(e.target.value)}
+                                />
+                                <${Button} variant="secondary" size="sm" onPress=${handleEnableAllServices}>
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                        <polyline points="20 6 9 17 4 12"></polyline>
+                                    </svg>
+                                    <span>Enable All</span>
+                                <//>
+                                <${Button} variant="outline" size="sm" onPress=${handleDisableAllServices}>
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                                    </svg>
+                                    <span>Disable All</span>
+                                <//>
+                            </div>
+                            <div className="services-grid">
+                                ${filteredServicesList.map(({ key, svc, checked }) => html`
+                                    <${ServiceTile} 
+                                        key=${key}
+                                        serviceKey=${key} 
+                                        service=${svc} 
+                                        isChecked=${checked} 
+                                        onToggle=${handleToggleService}
+                                    />
+                                `)}
+                            </div>
+                        <//>
+                    <//>
+                </div>
+            </div>
+        `;
+    });
+
+    const TimeBoostTab = React.memo(({
+        currentSettings,
+        accumulatedBonus,
+        onUpdateSetting,
+    }) => {
+        const { useState, useEffect, useCallback } = React;
+        const [minStr, setMinStr] = useState(() => String(currentSettings.extraSecondsMin));
+        const [maxStr, setMaxStr] = useState(() => String(currentSettings.extraSecondsMax));
+
+        useEffect(() => {
+            setMinStr(String(currentSettings.extraSecondsMin));
+        }, [currentSettings.extraSecondsMin]);
+
+        useEffect(() => {
+            setMaxStr(String(currentSettings.extraSecondsMax));
+        }, [currentSettings.extraSecondsMax]);
+
+        const commitMin = useCallback(() => {
+            const val = parseInt(minStr, 10);
+            if (!isNaN(val) && val >= 1) onUpdateSetting('extraSecondsMin', val);
+            else setMinStr(String(currentSettings.extraSecondsMin));
+        }, [minStr, currentSettings.extraSecondsMin, onUpdateSetting]);
+
+        const commitMax = useCallback(() => {
+            const val = parseInt(maxStr, 10);
+            if (!isNaN(val) && val >= 1) onUpdateSetting('extraSecondsMax', val);
+            else setMaxStr(String(currentSettings.extraSecondsMax));
+        }, [maxStr, currentSettings.extraSecondsMax, onUpdateSetting]);
+
+        const updateTimeBoost = useCallback((v) => onUpdateSetting('timeBoostEnabled', v), [onUpdateSetting]);
+        const updateManualBtn = useCallback((v) => onUpdateSetting('manualTimeButtonEnabled', v), [onUpdateSetting]);
+        const updateManualStack = useCallback((v) => onUpdateSetting('manualTimeStacksWithAuto', v), [onUpdateSetting]);
 
         const rangeHint = (currentSettings.extraSecondsMin === currentSettings.extraSecondsMax)
             ? `Every question receives +${currentSettings.extraSecondsMin}s.`
             : `Each question rolls random +${currentSettings.extraSecondsMin}–${currentSettings.extraSecondsMax}s.`;
+
+        return html`
+            <div className="grid-2col">
+                <div className="col-stack">
+                    <${Card}>
+                        <${Card.Header}>
+                            <${Card.Title}>
+                                <span>Master Booster Switch</span>
+                                <${Badge} variant="soft" color="success">TimeSpent<//>
+                            <//>
+                            <${Card.Description}>Automatically adds extra time spent to quiz submissions and group summaries.<//>
+                        <//>
+                        <${Card.Content}>
+                            <${Switch} 
+                                isSelected=${currentSettings.timeBoostEnabled}
+                                onChange=${updateTimeBoost}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Enable time boost<//>
+                                    <${Switch.Description}>Injects calculated time bonuses into AnswerProgressQuizQuestion API calls<//>
+                                <//>
+                            <//>
+                        <//>
+                    <//>
+
+                    <${Card}>
+                        <${Card.Header}>
+                            <${Card.Title}>Random Duration Range<//>
+                            <${Card.Description}>${rangeHint}<//>
+                        <//>
+                        <${Card.Content}>
+                            <div className="field-row">
+                                <label>Extra Seconds Range
+                                    <small>Minimum and maximum extra seconds added per question</small>
+                                </label>
+                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                    <input 
+                                        type="number" 
+                                        className="input" 
+                                        style=${{ width: '78px', textAlign: 'center' }} 
+                                        min="1" 
+                                        max="3600"
+                                        value=${minStr}
+                                        onInput=${(e) => setMinStr(e.target.value)}
+                                        onBlur=${commitMin}
+                                        onKeyDown=${(e) => { if (e.key === 'Enter') commitMin(); }}
+                                    />
+                                    <span style=${{ color: 'var(--muted)', fontWeight: 600 }}>to</span>
+                                    <input 
+                                        type="number" 
+                                        className="input" 
+                                        style=${{ width: '78px', textAlign: 'center' }} 
+                                        min="1" 
+                                        max="3600"
+                                        value=${maxStr}
+                                        onInput=${(e) => setMaxStr(e.target.value)}
+                                        onBlur=${commitMax}
+                                        onKeyDown=${(e) => { if (e.key === 'Enter') commitMax(); }}
+                                    />
+                                    <span style=${{ color: 'var(--muted)', fontWeight: 600 }}>s</span>
+                                </div>
+                            </div>
+
+                            <div style=${{ marginTop: '8px' }}>
+                                <${TagGroup} 
+                                    ariaLabel="Quick Range Presets" 
+                                    selectedKeys=${[
+                                        QUICK_RANGE_PRESETS.find(p => p.min === currentSettings.extraSecondsMin && p.max === currentSettings.extraSecondsMax)?.label
+                                    ].filter(Boolean)}
+                                    onSelectionChange=${(label) => {
+                                        const p = QUICK_RANGE_PRESETS.find(item => item.label === label);
+                                        if (p) {
+                                            onUpdateSetting('extraSecondsMin', p.min);
+                                            onUpdateSetting('extraSecondsMax', p.max);
+                                        }
+                                    }}
+                                >
+                                    <${TagGroup.Label}>Quick Range Presets<//>
+                                    <${TagGroup.List}>
+                                        ${QUICK_RANGE_PRESETS.map((p, idx) => html`
+                                            <${Tag} id=${p.label} key=${idx}>
+                                                <span>${p.label}</span>
+                                            <//>
+                                        `)}
+                                    <//>
+                                <//>
+                            </div>
+                        <//>
+                    <//>
+                </div>
+
+                <div className="col-stack">
+                    <${Card}>
+                        <${Card.Header}>
+                            <${Card.Title}>
+                                <span>Inline "Add Time" Button</span>
+                                <${Badge} variant="soft" color=${currentSettings.manualTimeButtonEnabled ? 'success' : 'default'}>Interactive<//>
+                            <//>
+                            <${Card.Description}>Adds an interactive button beside the question Submit button.<//>
+                        <//>
+                        <${Card.Content} className="core-toggles-list">
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.manualTimeButtonEnabled}
+                                onChange=${updateManualBtn}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Show "Add time" button<//>
+                                    <${Switch.Description}>Adds a button left of "Submit". Click to enter seconds; Enter or blur commits.<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.manualTimeStacksWithAuto}
+                                onChange=${updateManualStack}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Stack with automatic boost<//>
+                                    <${Switch.Description}>If enabled, adds manual time on top of random range boost (instead of setting the exact bonus)<//>
+                                <//>
+                            <//>
+
+                            <div style=${{ padding: '10px 12px', background: 'var(--surface)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', fontSize: '12px', color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                <span>Accepted formats:</span>
+                                <span style=${{ fontWeight: 600, color: 'var(--foreground)' }}>120 · 1:30 · 2m 30s · PT45S</span>
+                            </div>
+                        <//>
+                    <//>
+
+                    <${Card}>
+                        <${Card.Header}>
+                            <${Card.Title}>
+                                <span>Boost Automation Insights</span>
+                                <${Badge} variant="soft" color="accent">Active Session<//>
+                            <//>
+                            <${Card.Description}>How UpLearn measures engagement and how the booster works.<//>
+                        <//>
+                        <${Card.Content}>
+                            <div style=${{ fontSize: '12.5px', color: 'var(--muted)', lineHeight: '1.6' }}>
+                                UpLearn logs seconds spent on each quiz question and sums them upon finishing a lesson or group. When active, every answered question receives a bonus (randomized or manually entered), maintaining realistic, organic engagement scores without tripping detection heuristics.
+                            </div>
+                            <div style=${{ marginTop: '8px', padding: '12px 14px', background: 'var(--surface)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                <span style=${{ fontSize: '12.5px', fontWeight: 500, color: 'var(--foreground)' }}>Cumulative Session Bonus</span>
+                                <span style=${{ fontSize: '14px', fontWeight: 700, color: 'var(--accent)' }}>+${accumulatedBonus}s</span>
+                            </div>
+                        <//>
+                    <//>
+                </div>
+            </div>
+        `;
+    });
+
+    const ColorSwatch = React.memo(({ color, isSelected, onSelect }) => {
+        return html`
+            <div 
+                className="color-swatch"
+                style=${{ backgroundColor: color.hex }}
+                title=${color.name}
+                data-active=${isSelected ? 'true' : 'false'}
+                onClick=${() => onSelect(color.hex)}
+            ></div>
+        `;
+    });
+
+    const PreferencesTab = React.memo(({
+        currentSettings,
+        isCapturingKeybind,
+        onStartCaptureKeybind,
+        onClearKeybind,
+        onUpdateSetting,
+        onResetAllSettings,
+    }) => {
+        const { useCallback } = React;
+        const updatePillMode = useCallback((val) => onUpdateSetting('pillMode', val), [onUpdateSetting]);
+        const updatePillPosition = useCallback((val) => onUpdateSetting('pillPosition', val), [onUpdateSetting]);
+        const updatePillOpacity = useCallback((val) => onUpdateSetting('pillOpacity', val), [onUpdateSetting]);
+        const updateDisableAutoFullscreen = useCallback((val) => onUpdateSetting('disableAutoFullscreen', val), [onUpdateSetting]);
+        const updateDarkMode = useCallback((val) => onUpdateSetting('darkMode', val), [onUpdateSetting]);
+        const updateTheme = useCallback((val) => onUpdateSetting('theme', val), [onUpdateSetting]);
+        const updateAccentColor = useCallback((val) => onUpdateSetting('accentColor', val), [onUpdateSetting]);
+        const updateLogLevel = useCallback((val) => onUpdateSetting('logLevel', val), [onUpdateSetting]);
+
+        return html`
+            <div className="grid-2col">
+                <div className="col-stack">
+                    <${Card}>
+                        <${Card.Header}>
+                            <${Card.Title}>Status Pill Appearance & Detail<//>
+                            <${Card.Description}>Control how much information shows on the floating pill and how it shapes itself.<//>
+                        <//>
+                        <${Card.Content}>
+                            <div className="field-row">
+                                <label>Pill Information Display
+                                    <small>Select how much info is displayed. The pill dynamically adapts its shape.</small>
+                                </label>
+                                <${Dropdown} 
+                                    selectedKey=${currentSettings.pillMode}
+                                    onSelectionChange=${updatePillMode}
+                                >
+                                    <${Dropdown.Trigger}>
+                                        <${Button} variant="secondary" className="dropdown__trigger-btn">
+                                            <span>${PILL_MODE_OPTIONS.find(o => o.id === currentSettings.pillMode)?.label || currentSettings.pillMode}</span>
+                                            <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                                        <//>
+                                    <//>
+                                    <${Dropdown.Popover}>
+                                        <${Dropdown.Menu}>
+                                            ${PILL_MODE_OPTIONS.map(opt => html`
+                                                <${Dropdown.Item} id=${opt.id} key=${opt.id}>
+                                                    <${Dropdown.Item.Label}>${opt.label}<//>
+                                                    <${Dropdown.Item.Description}>${opt.desc}<//>
+                                                <//>
+                                            `)}
+                                        <//>
+                                    <//>
+                                <//>
+                            </div>
+
+                            <div className="field-row">
+                                <label>Pill Dock Position
+                                    <small>Corner of the screen where the status pill floats</small>
+                                </label>
+                                <${Dropdown} 
+                                    selectedKey=${currentSettings.pillPosition}
+                                    onSelectionChange=${updatePillPosition}
+                                >
+                                    <${Dropdown.Trigger}>
+                                        <${Button} variant="secondary" className="dropdown__trigger-btn">
+                                            <span>${PILL_POS_OPTIONS.find(o => o.id === currentSettings.pillPosition)?.label || currentSettings.pillPosition}</span>
+                                            <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                                        <//>
+                                    <//>
+                                    <${Dropdown.Popover}>
+                                        <${Dropdown.Menu}>
+                                            ${PILL_POS_OPTIONS.map(opt => html`
+                                                <${Dropdown.Item} id=${opt.id} key=${opt.id}>
+                                                    <${Dropdown.Item.Label}>${opt.label}<//>
+                                                    <${Dropdown.Item.Description}>${opt.desc}<//>
+                                                <//>
+                                            `)}
+                                        <//>
+                                    <//>
+                                <//>
+                            </div>
+
+                            <div className="field-row">
+                                <label>Pill Opacity
+                                    <small>Adjust background transparency</small>
+                                </label>
+                                <${Slider} 
+                                    value=${currentSettings.pillOpacity}
+                                    minValue=${0.2}
+                                    maxValue=${1}
+                                    step=${0.05}
+                                    onChange=${updatePillOpacity}
+                                    className="slider--inline"
+                                >
+                                    <${Slider.Track}>
+                                        <${Slider.Fill} />
+                                        <${Slider.Thumb} />
+                                    <//>
+                                    <${Slider.Output}>
+                                        ${Math.round(currentSettings.pillOpacity * 100)}%
+                                    <//>
+                                <//>
+                            </div>
+                        <//>
+                    <//>
+
+                    <${Card}>
+                        <${Card.Header}>
+                            <${Card.Title}>Page Experience<//>
+                            <${Card.Description}>Quality of life tweaks for the UpLearn learning environment.<//>
+                        <//>
+                        <${Card.Content}>
+                            <${Switch} 
+                                isSelected=${currentSettings.disableAutoFullscreen}
+                                onChange=${updateDisableAutoFullscreen}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Disable auto fullscreen<//>
+                                    <${Switch.Description}>Blocks the website from silently forcing fullscreen mode<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                isSelected=${currentSettings.darkMode}
+                                onChange=${updateDarkMode}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>UpLearn Dark Mode<//>
+                                    <${Switch.Description}>Soft high-contrast dark theme across all lesson and quiz pages<//>
+                                <//>
+                            <//>
+                        <//>
+                    <//>
+                </div>
+
+                <div className="col-stack">
+                    <${Card}>
+                        <${Card.Header}>
+                            <${Card.Title}>Theme & Accent Color<//>
+                            <${Card.Description}>Customize color palette and visual styling.<//>
+                        <//>
+                        <${Card.Content}>
+                            <div className="field-row">
+                                <label>Control Panel Theme</label>
+                                <${Dropdown} 
+                                    selectedKey=${currentSettings.theme}
+                                    onSelectionChange=${updateTheme}
+                                >
+                                    <${Dropdown.Trigger}>
+                                        <${Button} variant="secondary" className="dropdown__trigger-btn">
+                                            <span>${THEME_OPTIONS.find(o => o.id === currentSettings.theme)?.label || currentSettings.theme}</span>
+                                            <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                                        <//>
+                                    <//>
+                                    <${Dropdown.Popover}>
+                                        <${Dropdown.Menu}>
+                                            ${THEME_OPTIONS.map(opt => html`
+                                                <${Dropdown.Item} id=${opt.id} key=${opt.id}>
+                                                    <${Dropdown.Item.Label}>${opt.label}<//>
+                                                    <${Dropdown.Item.Description}>${opt.desc}<//>
+                                                <//>
+                                            `)}
+                                        <//>
+                                    <//>
+                                <//>
+                            </div>
+
+                            <div className="field-row">
+                                <label>Theme Accent Color
+                                    <small>Primary color for switches, active badges, and highlights</small>
+                                </label>
+                                <div style=${{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                                    <div className="color-swatches">
+                                        ${QUICK_COLOR_SWATCHES.map((c) => html`
+                                            <${ColorSwatch}
+                                                key=${c.hex}
+                                                color=${c}
+                                                isSelected=${c.hex.toLowerCase() === currentSettings.accentColor.toLowerCase()}
+                                                onSelect=${updateAccentColor}
+                                            />
+                                        `)}
+                                    </div>
+                                    <input 
+                                        type="color" 
+                                        style=${{ width: '36px', height: '28px', border: '1px solid var(--border)', borderRadius: '6px', background: 'transparent', cursor: 'pointer', padding: '1px' }}
+                                        value=${currentSettings.accentColor}
+                                        onChange=${(e) => updateAccentColor(e.target.value)}
+                                    />
+                                </div>
+                            </div>
+                        <//>
+                    <//>
+
+                    <${Card}>
+                        <${Card.Header}>
+                            <${Card.Title}>Shortcuts & Logging<//>
+                            <${Card.Description}>Configure hotkeys and developer diagnostics.<//>
+                        <//>
+                        <${Card.Content}>
+                            <div className="field-row">
+                                <label>Toggle-Pill Keybind
+                                    <small>Global keyboard shortcut to show or hide the pill</small>
+                                </label>
+                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                    <${Button} 
+                                        variant="secondary" 
+                                        size="sm"
+                                        className=${isCapturingKeybind ? 'button--capturing' : ''}
+                                        onPress=${onStartCaptureKeybind}
+                                    >
+                                        ${isCapturingKeybind ? 'Press any key…' : formatKeybind(currentSettings.uiToggleKeybind)}
+                                    <//>
+                                    <${Button} 
+                                        variant="outline" 
+                                        size="sm"
+                                        isIconOnly
+                                        title="Clear keybind"
+                                        aria-label="Clear keybind"
+                                        onPress=${onClearKeybind}
+                                    >
+                                        ✕
+                                    <//>
+                                </div>
+                            </div>
+
+                            <div className="field-row">
+                                <label>Console Logging Level
+                                    <small>Verbose inspects bodies and prints grouped block reports</small>
+                                </label>
+                                <${Dropdown} 
+                                    selectedKey=${currentSettings.logLevel}
+                                    onSelectionChange=${updateLogLevel}
+                                >
+                                    <${Dropdown.Trigger}>
+                                        <${Button} variant="secondary" className="dropdown__trigger-btn">
+                                            <span>${LOG_LEVEL_OPTIONS.find(o => o.id === currentSettings.logLevel)?.label || currentSettings.logLevel}</span>
+                                            <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                                        <//>
+                                    <//>
+                                    <${Dropdown.Popover}>
+                                        <${Dropdown.Menu}>
+                                            ${LOG_LEVEL_OPTIONS.map(opt => html`
+                                                <${Dropdown.Item} id=${opt.id} key=${opt.id}>
+                                                    <${Dropdown.Item.Label}>${opt.label}<//>
+                                                    <${Dropdown.Item.Description}>${opt.desc}<//>
+                                                <//>
+                                            `)}
+                                        <//>
+                                    <//>
+                                <//>
+                            </div>
+
+                            <div style=${{ marginTop: '6px', paddingTop: '12px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                <div>
+                                    <div style=${{ fontSize: '12.5px', fontWeight: 600, color: 'var(--foreground)' }}>Reset All Preferences</div>
+                                    <div style=${{ fontSize: '11px', color: 'var(--muted)' }}>Restore all settings & services to factory defaults</div>
+                                </div>
+                                <${Button} variant="danger-soft" size="sm" onPress=${onResetAllSettings}>
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                        <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
+                                        <path d="M21 3v5h-5"></path>
+                                        <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
+                                        <path d="M8 16H3v5"></path>
+                                    </svg>
+                                    <span>Reset All Settings</span>
+                                <//>
+                            </div>
+                        <//>
+                    <//>
+                </div>
+            </div>
+        `;
+    });
+
+    const StatsTab = React.memo(({
+        accumulatedBonus,
+        onResetStats,
+        isActive,
+    }) => {
+        const { useState, useEffect, useCallback } = React;
+        const [tabStats, setTabStats] = useState(Object.assign({}, stats));
+
+        useEffect(() => {
+            if (!isActive) return;
+            const update = () => {
+                setTabStats((prev) => {
+                    if (
+                        prev.apiPosts === stats.apiPosts &&
+                        prev.seen === stats.seen &&
+                        prev.boosted === stats.boosted &&
+                        prev.blocked === stats.blocked &&
+                        prev.groupExtra === stats.groupExtra &&
+                        prev.fullscreenBlocked === stats.fullscreenBlocked &&
+                        prev.consoleSuppressed === stats.consoleSuppressed &&
+                        prev.logImproperUseBlocked === stats.logImproperUseBlocked &&
+                        prev.jitsuPackets === stats.jitsuPackets &&
+                        prev.manualBoosted === (stats.manualBoosted || 0)
+                    ) {
+                        return prev;
+                    }
+                    return Object.assign({}, stats);
+                });
+            };
+            update();
+            const timer = setInterval(update, 800);
+            return () => clearInterval(timer);
+        }, [isActive]);
+
+        const handleReset = useCallback(() => {
+            onResetStats();
+            setTabStats(Object.assign({}, stats));
+        }, [onResetStats]);
+
+        return html`
+            <${Card}>
+                <${Card.Header}>
+                    <${Card.Title}>
+                        <span>Session Telemetry & Boost Activity</span>
+                        <${Badge} variant="soft" color="accent">Real-Time<//>
+                    <//>
+                    <${Card.Description}>Live metric counters accumulated in this browser session.<//>
+                <//>
+                <${Card.Content}>
+                    <div className="stats-grid">
+                        <div className="stat-card">
+                            <span className="stat-card__label">Blocked</span>
+                            <span className="stat-card__value">${tabStats.blocked}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Boosted Qs</span>
+                            <span className="stat-card__value">${tabStats.boosted}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Manual Boosts</span>
+                            <span className="stat-card__value">${tabStats.manualBoosted || 0}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Improper Use</span>
+                            <span className="stat-card__value">${tabStats.logImproperUseBlocked}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Jitsu Packets</span>
+                            <span className="stat-card__value">${tabStats.jitsuPackets}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Pending Bonus</span>
+                            <span className="stat-card__value">${accumulatedBonus}s</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Group Bonus</span>
+                            <span className="stat-card__value">${tabStats.groupExtra}s</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">FS Blocked</span>
+                            <span className="stat-card__value">${tabStats.fullscreenBlocked}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Console Muted</span>
+                            <span className="stat-card__value">${tabStats.consoleSuppressed}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">API Posts</span>
+                            <span className="stat-card__value">${tabStats.apiPosts}</span>
+                        </div>
+                    </div>
+
+                    <div style=${{ marginTop: '16px', display: 'flex', justifyContent: 'flex-end' }}>
+                        <${Button} variant="secondary" size="sm" onPress=${handleReset}>
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
+                                <path d="M21 3v5h-5"></path>
+                                <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
+                                <path d="M8 16H3v5"></path>
+                            </svg>
+                            <span>Reset Session Statistics</span>
+                        <//>
+                    </div>
+                <//>
+            <//>
+        `;
+    });
+
+    const SettingsModal = React.memo(({
+        isOpen,
+        isClosing,
+        onClose,
+        currentSettings,
+        accumulatedBonus,
+        isCapturingKeybind,
+        onStartCaptureKeybind,
+        onClearKeybind,
+        onUpdateSetting,
+        onResetAllSettings,
+        onResetStats,
+    }) => {
+        if (!isOpen && !isClosing) return null;
+
+        const { useState } = React;
+        const [activeTab, setActiveTab] = useState('telemetry');
+        const [tabDirection, setTabDirection] = useState('forward');
+        const [visitedTabs, setVisitedTabs] = useState(() => new Set(['telemetry']));
+
+        const TAB_KEYS = ['telemetry', 'timeboost', 'preferences', 'stats'];
+
+        const handleTabClick = (targetTab) => {
+            if (targetTab === activeTab) return;
+            const curIdx = TAB_KEYS.indexOf(activeTab);
+            const targetIdx = TAB_KEYS.indexOf(targetTab);
+            setTabDirection(targetIdx > curIdx ? 'forward' : 'backward');
+            setActiveTab(targetTab);
+            setVisitedTabs(prev => {
+                if (prev.has(targetTab)) return prev;
+                const next = new Set(prev);
+                next.add(targetTab);
+                return next;
+            });
+        };
 
         return html`
             <${Modal} isOpen=${isOpen} isClosing=${isClosing} onClose=${onClose}>
@@ -4423,701 +5296,44 @@
 
                             <!-- Body -->
                             <${Modal.Body}>
-
-                                <!-- Tab 1: Telemetry -->
-                                <${Tabs.Panel} id="telemetry" activeTab=${activeTab} direction=${tabDirection}>
-                                    <div className="grid-2col">
-                                        <div className="col-stack">
-                                            <${Card} className="card--compact">
-                                                <${Card.Header}>
-                                                    <${Card.Title}>
-                                                        <span>Blocking Preset</span>
-                                                        <${Badge} variant="soft" color="accent">Smart Filters<//>
-                                                    <//>
-                                                    <${Card.Description}>Pick a ready-made preset or customize your active blockers.<//>
-                                                <//>
-                                                <${Card.Content}>
-                                                    <div className="field-row">
-                                                        <label>Active Preset
-                                                            <small>Off · Simple (LogImproperUse only) · Harsh (Block all) · Custom</small>
-                                                        </label>
-                                                        <${Dropdown} 
-                                                            selectedKey=${currentSettings.telemetryPreset}
-                                                            onSelectionChange=${(val) => onUpdateSetting('telemetryPreset', val)}
-                                                        >
-                                                            <${Dropdown.Trigger}>
-                                                                <${Button} variant="secondary" className="dropdown__trigger-btn">
-                                                                    <span>${PRESET_OPTIONS.find(o => o.id === currentSettings.telemetryPreset)?.label || 'Custom'}</span>
-                                                                    <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                                                                <//>
-                                                            <//>
-                                                            <${Dropdown.Popover}>
-                                                                <${Dropdown.Menu}>
-                                                                    ${PRESET_OPTIONS.map(opt => html`
-                                                                        <${Dropdown.Item} id=${opt.id} key=${opt.id}>
-                                                                            <${Dropdown.Item.Label}>${opt.label}<//>
-                                                                            <${Dropdown.Item.Description}>${opt.desc}<//>
-                                                                        <//>
-                                                                    `)}
-                                                                <//>
-                                                            <//>
-                                                        <//>
-                                                    </div>
-                                                <//>
-                                            <//>
-
-                                            <${Card} className="card--compact">
-                                                <${Card.Header}>
-                                                    <${Card.Title}>Core Protection Toggles<//>
-                                                    <${Card.Description}>Fine-grained control over network intercepts and client spoofing.<//>
-                                                <//>
-                                                <${Card.Content} className="core-toggles-list">
-                                                    <${Switch} 
-                                                        size="sm"
-                                                        isSelected=${currentSettings.blockLogImproperUse}
-                                                        onChange=${(v) => onUpdateSetting('blockLogImproperUse', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>Block LogImproperUse requests<//>
-                                                            <${Switch.Description}>Silently drops UpLearn improper-use telemetry sent to API<//>
-                                                        <//>
-                                                    <//>
-
-                                                    <${Switch} 
-                                                        size="sm"
-                                                        isSelected=${currentSettings.blockDomElements}
-                                                        onChange=${(v) => onUpdateSetting('blockDomElements', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>Block DOM telemetry injection<//>
-                                                            <${Switch.Description}>Hooks script/iframe src and purges blocked tracker nodes<//>
-                                                        <//>
-                                                    <//>
-
-                                                    <${Switch} 
-                                                        size="sm"
-                                                        isSelected=${currentSettings.blockWebSockets}
-                                                        onChange=${(v) => onUpdateSetting('blockWebSockets', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>Block telemetry WebSockets<//>
-                                                            <${Switch.Description}>Terminates analytics & Intercom WebSocket connections<//>
-                                                        <//>
-                                                    <//>
-
-                                                    <${Switch} 
-                                                        size="sm"
-                                                        isSelected=${currentSettings.blockSendBeacon}
-                                                        onChange=${(v) => onUpdateSetting('blockSendBeacon', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>Block telemetry sendBeacon<//>
-                                                            <${Switch.Description}>Drops background beacon-style telemetry packets<//>
-                                                        <//>
-                                                    <//>
-
-                                                    <${Switch} 
-                                                        size="sm"
-                                                        isSelected=${currentSettings.spoofVisibility}
-                                                        onChange=${(v) => onUpdateSetting('spoofVisibility', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>Spoof visibility & focus<//>
-                                                            <${Switch.Description}>Ensures page always believes it is focused & visible<//>
-                                                        <//>
-                                                    <//>
-
-                                                    <${Switch} 
-                                                        size="sm"
-                                                        isSelected=${currentSettings.suppressConsoleNoise}
-                                                        onChange=${(v) => onUpdateSetting('suppressConsoleNoise', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>Suppress site's console noise<//>
-                                                            <${Switch.Description}>Mutes [J-ERROR], Jitsu send errors, and blocked-host spam<//>
-                                                        <//>
-                                                    <//>
-
-                                                    <${Switch} 
-                                                        size="sm"
-                                                        isSelected=${currentSettings.suppressJitsu}
-                                                        onChange=${(v) => onUpdateSetting('suppressJitsu', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>Suppress Jitsu telemetry<//>
-                                                            <${Switch.Description}>Checked: blocks jitsu.uplearn.co.uk. Unchecked: logs inspected packets.<//>
-                                                        <//>
-                                                    <//>
-                                                <//>
-                                            <//>
-                                        </div>
-
-                                        <div className="col-stack">
-                                            <${Card} className="card--compact">
-                                                <${Card.Header}>
-                                                    <${Card.Title}>
-                                                        <span>Third-Party Telemetry Services</span>
-                                                        <${Badge} variant="soft" color="accent">${activeServicesCount}/${totalServicesCount} Active<//>
-                                                    <//>
-                                                    <${Card.Description}>Toggle individual analytics trackers. Changes auto-switch preset to Custom.<//>
-                                                <//>
-                                                <${Card.Content}>
-                                                    <div className="services-search-bar">
-                                                        <input 
-                                                            type="text" 
-                                                            className="services-search-input" 
-                                                            placeholder="Search service name or hostname…"
-                                                            value=${servicesFilter}
-                                                            onInput=${(e) => setServicesFilter(e.target.value)}
-                                                        />
-                                                        <${Button} variant="secondary" size="sm" onPress=${handleEnableAllServices}>
-                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                                                                <polyline points="20 6 9 17 4 12"></polyline>
-                                                            </svg>
-                                                            <span>Enable All</span>
-                                                        <//>
-                                                        <${Button} variant="outline" size="sm" onPress=${handleDisableAllServices}>
-                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                                                                <line x1="18" y1="6" x2="6" y2="18"></line>
-                                                                <line x1="6" y1="6" x2="18" y2="18"></line>
-                                                            </svg>
-                                                            <span>Disable All</span>
-                                                        <//>
-                                                    </div>
-                                                    <div className="services-grid">
-                                                        ${filteredServicesList.map(({ key, svc, checked }) => html`
-                                                            <${ServiceTile} 
-                                                                key=${key}
-                                                                serviceKey=${key} 
-                                                                service=${svc} 
-                                                                isChecked=${checked} 
-                                                                onToggle=${() => handleToggleService(key)}
-                                                            />
-                                                        `)}
-                                                    </div>
-                                                <//>
-                                            <//>
-                                        </div>
-                                    </div>
-                                <//>
-
-                                <!-- Tab 2: Time Boost -->
-                                <${Tabs.Panel} id="timeboost" activeTab=${activeTab} direction=${tabDirection}>
-                                    <div className="grid-2col">
-                                        <div className="col-stack">
-                                            <${Card}>
-                                                <${Card.Header}>
-                                                    <${Card.Title}>
-                                                        <span>Master Booster Switch</span>
-                                                        <${Badge} variant="soft" color="success">TimeSpent<//>
-                                                    <//>
-                                                    <${Card.Description}>Automatically adds extra time spent to quiz submissions and group summaries.<//>
-                                                <//>
-                                                <${Card.Content}>
-                                                    <${Switch} 
-                                                        isSelected=${currentSettings.timeBoostEnabled}
-                                                        onChange=${(v) => onUpdateSetting('timeBoostEnabled', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>Enable time boost<//>
-                                                            <${Switch.Description}>Injects calculated time bonuses into AnswerProgressQuizQuestion API calls<//>
-                                                        <//>
-                                                    <//>
-                                                <//>
-                                            <//>
-
-                                            <${Card}>
-                                                <${Card.Header}>
-                                                    <${Card.Title}>Random Duration Range<//>
-                                                    <${Card.Description}>${rangeHint}<//>
-                                                <//>
-                                                <${Card.Content}>
-                                                    <div className="field-row">
-                                                        <label>Extra Seconds Range
-                                                            <small>Minimum and maximum extra seconds added per question</small>
-                                                        </label>
-                                                        <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                                            <input 
-                                                                type="number" 
-                                                                className="input" 
-                                                                style=${{ width: '78px', textAlign: 'center' }} 
-                                                                min="1" 
-                                                                max="3600"
-                                                                value=${currentSettings.extraSecondsMin}
-                                                                onChange=${(e) => {
-                                                                    const val = parseInt(e.target.value, 10);
-                                                                    if (!isNaN(val)) onUpdateSetting('extraSecondsMin', val);
-                                                                }}
-                                                            />
-                                                            <span style=${{ color: 'var(--muted)', fontWeight: 600 }}>to</span>
-                                                            <input 
-                                                                type="number" 
-                                                                className="input" 
-                                                                style=${{ width: '78px', textAlign: 'center' }} 
-                                                                min="1" 
-                                                                max="3600"
-                                                                value=${currentSettings.extraSecondsMax}
-                                                                onChange=${(e) => {
-                                                                    const val = parseInt(e.target.value, 10);
-                                                                    if (!isNaN(val)) onUpdateSetting('extraSecondsMax', val);
-                                                                }}
-                                                            />
-                                                            <span style=${{ color: 'var(--muted)', fontWeight: 600 }}>s</span>
-                                                        </div>
-                                                    </div>
-
-
-                                                    <div style=${{ marginTop: '8px' }}>
-                                                        <${TagGroup} 
-                                                            ariaLabel="Quick Range Presets" 
-                                                            selectedKeys=${[
-                                                                QUICK_RANGE_PRESETS.find(p => p.min === currentSettings.extraSecondsMin && p.max === currentSettings.extraSecondsMax)?.label
-                                                            ].filter(Boolean)}
-                                                            onSelectionChange=${(label) => {
-                                                                const p = QUICK_RANGE_PRESETS.find(item => item.label === label);
-                                                                if (p) {
-                                                                    onUpdateSetting('extraSecondsMin', p.min);
-                                                                    onUpdateSetting('extraSecondsMax', p.max);
-                                                                }
-                                                            }}
-                                                        >
-                                                            <${TagGroup.Label}>Quick Range Presets<//>
-                                                            <${TagGroup.List}>
-                                                                ${QUICK_RANGE_PRESETS.map((p, idx) => html`
-                                                                    <${Tag} id=${p.label} key=${idx}>
-                                                                        <span>${p.label}</span>
-                                                                    <//>
-                                                                `)}
-                                                            <//>
-                                                        <//>
-                                                    </div>
-                                                <//>
-                                            <//>
-                                        </div>
-
-                                        <div className="col-stack">
-                                            <${Card}>
-                                                <${Card.Header}>
-                                                    <${Card.Title}>
-                                                        <span>Inline "Add Time" Button</span>
-                                                        <${Badge} variant="soft" color=${currentSettings.manualTimeButtonEnabled ? 'success' : 'default'}>Interactive<//>
-                                                    <//>
-                                                    <${Card.Description}>Adds an interactive button beside the question Submit button.<//>
-                                                <//>
-                                                <${Card.Content} className="core-toggles-list">
-                                                    <${Switch} 
-                                                        size="sm"
-                                                        isSelected=${currentSettings.manualTimeButtonEnabled}
-                                                        onChange=${(v) => onUpdateSetting('manualTimeButtonEnabled', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>Show "Add time" button<//>
-                                                            <${Switch.Description}>Adds a button left of "Submit". Click to enter seconds; Enter or blur commits.<//>
-                                                        <//>
-                                                    <//>
-
-                                                    <${Switch} 
-                                                        size="sm"
-                                                        isSelected=${currentSettings.manualTimeStacksWithAuto}
-                                                        onChange=${(v) => onUpdateSetting('manualTimeStacksWithAuto', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>Stack with automatic boost<//>
-                                                            <${Switch.Description}>If enabled, adds manual time on top of random range boost (instead of setting the exact bonus)<//>
-                                                        <//>
-                                                    <//>
-
-                                                    <div style=${{ padding: '10px 12px', background: 'var(--surface)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', fontSize: '12px', color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                                        <span>Accepted formats:</span>
-                                                        <span style=${{ fontWeight: 600, color: 'var(--foreground)' }}>120 · 1:30 · 2m 30s · PT45S</span>
-                                                    </div>
-                                                <//>
-                                            <//>
-
-                                            <${Card}>
-                                                <${Card.Header}>
-                                                    <${Card.Title}>
-                                                        <span>Boost Automation Insights</span>
-                                                        <${Badge} variant="soft" color="accent">Active Session<//>
-                                                    <//>
-                                                    <${Card.Description}>How UpLearn measures engagement and how the booster works.<//>
-                                                <//>
-                                                <${Card.Content}>
-                                                    <div style=${{ fontSize: '12.5px', color: 'var(--muted)', lineHeight: '1.6' }}>
-                                                        UpLearn logs seconds spent on each quiz question and sums them upon finishing a lesson or group. When active, every answered question receives a bonus (randomized or manually entered), maintaining realistic, organic engagement scores without tripping detection heuristics.
-                                                    </div>
-                                                    <div style=${{ marginTop: '8px', padding: '12px 14px', background: 'var(--surface)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                                        <span style=${{ fontSize: '12.5px', fontWeight: 500, color: 'var(--foreground)' }}>Cumulative Session Bonus</span>
-                                                        <${Badge} variant="primary" color="accent">${accumulatedBonus}s<//>
-                                                    </div>
-                                                <//>
-                                            <//>
-                                        </div>
-                                    </div>
-                                <//>
-
-                                <!-- Tab 3: Preferences -->
-                                <${Tabs.Panel} id="preferences" activeTab=${activeTab} direction=${tabDirection}>
-                                    <div className="grid-2col">
-                                        <div className="col-stack">
-                                            <${Card}>
-                                                <${Card.Header}>
-                                                    <${Card.Title}>Status Pill Appearance & Detail<//>
-                                                    <${Card.Description}>Control how much information shows on the floating pill and how it shapes itself.<//>
-                                                <//>
-                                                <${Card.Content}>
-                                                    <div className="field-row">
-                                                        <label>Pill Information Display
-                                                            <small>Select how much info is displayed. The pill dynamically adapts its shape.</small>
-                                                        </label>
-                                                        <${Dropdown} 
-                                                            selectedKey=${currentSettings.pillMode}
-                                                            onSelectionChange=${(val) => onUpdateSetting('pillMode', val)}
-                                                        >
-                                                            <${Dropdown.Trigger}>
-                                                                <${Button} variant="secondary" className="dropdown__trigger-btn">
-                                                                    <span>${PILL_MODE_OPTIONS.find(o => o.id === currentSettings.pillMode)?.label || currentSettings.pillMode}</span>
-                                                                    <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                                                                <//>
-                                                            <//>
-                                                            <${Dropdown.Popover}>
-                                                                <${Dropdown.Menu}>
-                                                                    ${PILL_MODE_OPTIONS.map(opt => html`
-                                                                        <${Dropdown.Item} id=${opt.id} key=${opt.id}>
-                                                                            <${Dropdown.Item.Label}>${opt.label}<//>
-                                                                            <${Dropdown.Item.Description}>${opt.desc}<//>
-                                                                        <//>
-                                                                    `)}
-                                                                <//>
-                                                            <//>
-                                                        <//>
-                                                    </div>
-
-                                                    <div className="field-row">
-                                                        <label>Pill Dock Position
-                                                            <small>Corner of the screen where the status pill floats</small>
-                                                        </label>
-                                                        <${Dropdown} 
-                                                            selectedKey=${currentSettings.pillPosition}
-                                                            onSelectionChange=${(val) => onUpdateSetting('pillPosition', val)}
-                                                        >
-                                                            <${Dropdown.Trigger}>
-                                                                <${Button} variant="secondary" className="dropdown__trigger-btn">
-                                                                    <span>${PILL_POS_OPTIONS.find(o => o.id === currentSettings.pillPosition)?.label || currentSettings.pillPosition}</span>
-                                                                    <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                                                                <//>
-                                                            <//>
-                                                            <${Dropdown.Popover}>
-                                                                <${Dropdown.Menu}>
-                                                                    ${PILL_POS_OPTIONS.map(opt => html`
-                                                                        <${Dropdown.Item} id=${opt.id} key=${opt.id}>
-                                                                            <${Dropdown.Item.Label}>${opt.label}<//>
-                                                                            <${Dropdown.Item.Description}>${opt.desc}<//>
-                                                                        <//>
-                                                                    `)}
-                                                                <//>
-                                                            <//>
-                                                        <//>
-                                                    </div>
-
-                                                    <div className="field-row">
-                                                        <label>Pill Opacity
-                                                            <small>Adjust background transparency</small>
-                                                        </label>
-                                                        <${Slider} 
-                                                            value=${currentSettings.pillOpacity}
-                                                            minValue=${0.2}
-                                                            maxValue=${1}
-                                                            step=${0.05}
-                                                            onChange=${(val) => onUpdateSetting('pillOpacity', val)}
-                                                            className="slider--inline"
-                                                        >
-                                                            <${Slider.Track}>
-                                                                <${Slider.Fill} />
-                                                                <${Slider.Thumb} />
-                                                            <//>
-                                                            <${Slider.Output}>
-                                                                ${Math.round(currentSettings.pillOpacity * 100)}%
-                                                            <//>
-                                                        <//>
-                                                    </div>
-                                                <//>
-                                            <//>
-
-                                            <${Card}>
-                                                <${Card.Header}>
-                                                    <${Card.Title}>Page Experience<//>
-                                                    <${Card.Description}>Quality of life tweaks for the UpLearn learning environment.<//>
-                                                <//>
-                                                <${Card.Content}>
-                                                    <${Switch} 
-                                                        isSelected=${currentSettings.disableAutoFullscreen}
-                                                        onChange=${(v) => onUpdateSetting('disableAutoFullscreen', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>Disable auto fullscreen<//>
-                                                            <${Switch.Description}>Blocks the website from silently forcing fullscreen mode<//>
-                                                        <//>
-                                                    <//>
-
-                                                    <${Switch} 
-                                                        isSelected=${currentSettings.darkMode}
-                                                        onChange=${(v) => onUpdateSetting('darkMode', v)}
-                                                    >
-                                                        <${Switch.Control}>
-                                                            <${Switch.Thumb} />
-                                                        <//>
-                                                        <${Switch.Content}>
-                                                            <${Switch.Label}>UpLearn Dark Mode<//>
-                                                            <${Switch.Description}>Soft high-contrast dark theme across all lesson and quiz pages<//>
-                                                        <//>
-                                                    <//>
-                                                <//>
-                                            <//>
-                                        </div>
-
-                                        <div className="col-stack">
-                                            <${Card}>
-                                                <${Card.Header}>
-                                                    <${Card.Title}>Theme & Accent Color<//>
-                                                    <${Card.Description}>Customize color palette and visual styling.<//>
-                                                <//>
-                                                <${Card.Content}>
-                                                    <div className="field-row">
-                                                        <label>Control Panel Theme</label>
-                                                        <${Dropdown} 
-                                                            selectedKey=${currentSettings.theme}
-                                                            onSelectionChange=${(val) => onUpdateSetting('theme', val)}
-                                                        >
-                                                            <${Dropdown.Trigger}>
-                                                                <${Button} variant="secondary" className="dropdown__trigger-btn">
-                                                                    <span>${THEME_OPTIONS.find(o => o.id === currentSettings.theme)?.label || currentSettings.theme}</span>
-                                                                    <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                                                                <//>
-                                                            <//>
-                                                            <${Dropdown.Popover}>
-                                                                <${Dropdown.Menu}>
-                                                                    ${THEME_OPTIONS.map(opt => html`
-                                                                        <${Dropdown.Item} id=${opt.id} key=${opt.id}>
-                                                                            <${Dropdown.Item.Label}>${opt.label}<//>
-                                                                            <${Dropdown.Item.Description}>${opt.desc}<//>
-                                                                        <//>
-                                                                    `)}
-                                                                <//>
-                                                            <//>
-                                                        <//>
-                                                    </div>
-
-                                                    <div className="field-row">
-                                                        <label>Theme Accent Color
-                                                            <small>Primary color for switches, active badges, and highlights</small>
-                                                        </label>
-                                                        <div style=${{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                                                            <div className="color-swatches">
-                                                                ${QUICK_COLOR_SWATCHES.map((c, idx) => html`
-                                                                    <div 
-                                                                        key=${idx}
-                                                                        className="color-swatch"
-                                                                        style=${{ backgroundColor: c.hex }}
-                                                                        title=${c.name}
-                                                                        data-active=${c.hex.toLowerCase() === currentSettings.accentColor.toLowerCase() ? 'true' : 'false'}
-                                                                        onClick=${() => onUpdateSetting('accentColor', c.hex)}
-                                                                    ></div>
-                                                                `)}
-                                                            </div>
-                                                            <input 
-                                                                type="color" 
-                                                                style=${{ width: '36px', height: '28px', border: '1px solid var(--border)', borderRadius: '6px', background: 'transparent', cursor: 'pointer', padding: '1px' }}
-                                                                value=${currentSettings.accentColor}
-                                                                onChange=${(e) => onUpdateSetting('accentColor', e.target.value)}
-                                                            />
-                                                        </div>
-                                                    </div>
-                                                <//>
-                                            <//>
-
-                                            <${Card}>
-                                                <${Card.Header}>
-                                                    <${Card.Title}>Shortcuts & Logging<//>
-                                                    <${Card.Description}>Configure hotkeys and developer diagnostics.<//>
-                                                <//>
-                                                <${Card.Content}>
-                                                    <div className="field-row">
-                                                        <label>Toggle-Pill Keybind
-                                                            <small>Global keyboard shortcut to show or hide the pill</small>
-                                                        </label>
-                                                        <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                                            <${Button} 
-                                                                variant="secondary" 
-                                                                size="sm"
-                                                                className=${isCapturingKeybind ? 'button--capturing' : ''}
-                                                                onPress=${onStartCaptureKeybind}
-                                                            >
-                                                                ${isCapturingKeybind ? 'Press any key…' : formatKeybind(currentSettings.uiToggleKeybind)}
-                                                            <//>
-                                                            <${Button} 
-                                                                variant="outline" 
-                                                                size="sm"
-                                                                isIconOnly
-                                                                title="Clear keybind"
-                                                                aria-label="Clear keybind"
-                                                                onPress=${onClearKeybind}
-                                                            >
-                                                                ✕
-                                                            <//>
-                                                        </div>
-                                                    </div>
-
-                                                    <div className="field-row">
-                                                        <label>Console Logging Level
-                                                            <small>Verbose inspects bodies and prints grouped block reports</small>
-                                                        </label>
-                                                        <${Dropdown} 
-                                                            selectedKey=${currentSettings.logLevel}
-                                                            onSelectionChange=${(val) => onUpdateSetting('logLevel', val)}
-                                                        >
-                                                            <${Dropdown.Trigger}>
-                                                                <${Button} variant="secondary" className="dropdown__trigger-btn">
-                                                                    <span>${LOG_LEVEL_OPTIONS.find(o => o.id === currentSettings.logLevel)?.label || currentSettings.logLevel}</span>
-                                                                    <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                                                                <//>
-                                                            <//>
-                                                            <${Dropdown.Popover}>
-                                                                <${Dropdown.Menu}>
-                                                                    ${LOG_LEVEL_OPTIONS.map(opt => html`
-                                                                        <${Dropdown.Item} id=${opt.id} key=${opt.id}>
-                                                                            <${Dropdown.Item.Label}>${opt.label}<//>
-                                                                            <${Dropdown.Item.Description}>${opt.desc}<//>
-                                                                        <//>
-                                                                    `)}
-                                                                <//>
-                                                            <//>
-                                                        <//>
-                                                    </div>
-
-                                                    <div style=${{ marginTop: '6px', paddingTop: '12px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                                        <div>
-                                                            <div style=${{ fontSize: '12.5px', fontWeight: 600, color: 'var(--foreground)' }}>Reset All Preferences</div>
-                                                            <div style=${{ fontSize: '11px', color: 'var(--muted)' }}>Restore all settings & services to factory defaults</div>
-                                                        </div>
-                                                        <${Button} variant="danger-soft" size="sm" onPress=${onResetAllSettings}>
-                                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                                                                <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
-                                                                <path d="M21 3v5h-5"></path>
-                                                                <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
-                                                                <path d="M8 16H3v5"></path>
-                                                            </svg>
-                                                            <span>Reset All Settings</span>
-                                                        <//>
-                                                    </div>
-                                                <//>
-                                            <//>
-                                        </div>
-                                    </div>
-                                <//>
-
-                                <!-- Tab 4: Statistics -->
-                                <${Tabs.Panel} id="stats" activeTab=${activeTab} direction=${tabDirection}>
-                                    <${Card}>
-                                        <${Card.Header}>
-                                            <${Card.Title}>
-                                                <span>Session Telemetry & Boost Activity</span>
-                                                <${Badge} variant="soft" color="accent">Real-Time<//>
-                                            <//>
-                                            <${Card.Description}>Live metric counters accumulated in this browser session.<//>
-                                        <//>
-                                        <${Card.Content}>
-                                            <div className="stats-grid">
-                                                <div className="stat-card">
-                                                    <span className="stat-card__label">Blocked</span>
-                                                    <span className="stat-card__value">${currentStats.blocked}</span>
-                                                </div>
-                                                <div className="stat-card">
-                                                    <span className="stat-card__label">Boosted Qs</span>
-                                                    <span className="stat-card__value">${currentStats.boosted}</span>
-                                                </div>
-                                                <div className="stat-card">
-                                                    <span className="stat-card__label">Manual Boosts</span>
-                                                    <span className="stat-card__value">${currentStats.manualBoosted || 0}</span>
-                                                </div>
-                                                <div className="stat-card">
-                                                    <span className="stat-card__label">Improper Use</span>
-                                                    <span className="stat-card__value">${currentStats.logImproperUseBlocked}</span>
-                                                </div>
-                                                <div className="stat-card">
-                                                    <span className="stat-card__label">Jitsu Packets</span>
-                                                    <span className="stat-card__value">${currentStats.jitsuPackets}</span>
-                                                </div>
-                                                <div className="stat-card">
-                                                    <span className="stat-card__label">Pending Bonus</span>
-                                                    <span className="stat-card__value">${accumulatedBonus}s</span>
-                                                </div>
-                                                <div className="stat-card">
-                                                    <span className="stat-card__label">Group Bonus</span>
-                                                    <span className="stat-card__value">${currentStats.groupExtra}s</span>
-                                                </div>
-                                                <div className="stat-card">
-                                                    <span className="stat-card__label">FS Blocked</span>
-                                                    <span className="stat-card__value">${currentStats.fullscreenBlocked}</span>
-                                                </div>
-                                                <div className="stat-card">
-                                                    <span className="stat-card__label">Console Muted</span>
-                                                    <span className="stat-card__value">${currentStats.consoleSuppressed}</span>
-                                                </div>
-                                                <div className="stat-card">
-                                                    <span className="stat-card__label">API Posts</span>
-                                                    <span className="stat-card__value">${currentStats.apiPosts}</span>
-                                                </div>
-                                            </div>
-
-                                            <div style=${{ marginTop: '16px', display: 'flex', justifyContent: 'flex-end' }}>
-                                                <${Button} variant="secondary" size="sm" onPress=${onResetStats}>
-                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                                                        <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
-                                                        <path d="M21 3v5h-5"></path>
-                                                        <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
-                                                        <path d="M8 16H3v5"></path>
-                                                    </svg>
-                                                    <span>Reset Session Statistics</span>
-                                                <//>
-                                            </div>
-                                        <//>
+                                ${visitedTabs.has('telemetry') && html`
+                                    <${Tabs.Panel} id="telemetry" activeTab=${activeTab} direction=${tabDirection}>
+                                        <${TelemetryTab} 
+                                            currentSettings=${currentSettings}
+                                            onUpdateSetting=${onUpdateSetting}
+                                        />
                                     <//>
-                                <//>
-
+                                `}
+                                ${visitedTabs.has('timeboost') && html`
+                                    <${Tabs.Panel} id="timeboost" activeTab=${activeTab} direction=${tabDirection}>
+                                        <${TimeBoostTab} 
+                                            currentSettings=${currentSettings}
+                                            accumulatedBonus=${accumulatedBonus}
+                                            onUpdateSetting=${onUpdateSetting}
+                                        />
+                                    <//>
+                                `}
+                                ${visitedTabs.has('preferences') && html`
+                                    <${Tabs.Panel} id="preferences" activeTab=${activeTab} direction=${tabDirection}>
+                                        <${PreferencesTab} 
+                                            currentSettings=${currentSettings}
+                                            isCapturingKeybind=${isCapturingKeybind}
+                                            onStartCaptureKeybind=${onStartCaptureKeybind}
+                                            onClearKeybind=${onClearKeybind}
+                                            onUpdateSetting=${onUpdateSetting}
+                                            onResetAllSettings=${onResetAllSettings}
+                                        />
+                                    <//>
+                                `}
+                                ${visitedTabs.has('stats') && html`
+                                    <${Tabs.Panel} id="stats" activeTab=${activeTab} direction=${tabDirection}>
+                                        <${StatsTab} 
+                                            accumulatedBonus=${accumulatedBonus}
+                                            onResetStats=${onResetStats}
+                                            isActive=${activeTab === 'stats'}
+                                        />
+                                    <//>
+                                `}
                             <//>
 
                             <!-- Modal Footer with HeroUI v3 Actions -->
@@ -5131,7 +5347,7 @@
                 <//>
             <//>
         `;
-    };
+    });
 
     // --- Root App Component ---
     const App = () => {
@@ -5161,7 +5377,7 @@
                         setIsModalOpen(false);
                         setIsClosing(false);
                         isModalOpenGlobal = false;
-                    }, 240);
+                    }, 190);
                 }
             };
             reactSetCapturingKeybind = setIsCapturing;
@@ -5174,12 +5390,28 @@
             };
         }, []);
 
-        // Real-time live stats update interval
+        // Real-time live stats update interval with equality bail-out
         useEffect(() => {
             const interval = setInterval(() => {
-                setAppStats(Object.assign({}, stats));
-                setAccumulatedBonus(accumulatedExtraSeconds);
-            }, 400);
+                setAppStats((prev) => {
+                    if (
+                        prev.apiPosts === stats.apiPosts &&
+                        prev.seen === stats.seen &&
+                        prev.boosted === stats.boosted &&
+                        prev.blocked === stats.blocked &&
+                        prev.groupExtra === stats.groupExtra &&
+                        prev.fullscreenBlocked === stats.fullscreenBlocked &&
+                        prev.consoleSuppressed === stats.consoleSuppressed &&
+                        prev.logImproperUseBlocked === stats.logImproperUseBlocked &&
+                        prev.jitsuPackets === stats.jitsuPackets &&
+                        prev.manualBoosted === (stats.manualBoosted || 0)
+                    ) {
+                        return prev; // exact same reference => React bails out of re-rendering!
+                    }
+                    return Object.assign({}, stats);
+                });
+                setAccumulatedBonus((prev) => (prev === accumulatedExtraSeconds ? prev : accumulatedExtraSeconds));
+            }, 800);
             return () => clearInterval(interval);
         }, []);
 
@@ -5190,8 +5422,12 @@
                 setIsModalOpen(false);
                 setIsClosing(false);
                 isModalOpenGlobal = false;
-            }, 240);
+            }, 190);
         }, [isClosing]);
+
+        const handleOpenSettings = useCallback(() => {
+            if (reactSetModalOpen) reactSetModalOpen(true);
+        }, []);
 
         const handleToggleBoost = useCallback(() => {
             const next = !settings.timeBoostEnabled;
@@ -5221,7 +5457,7 @@
                 settings.telemetryServices = buildDefaultTelemetryServices();
                 settings.uiToggleKeybind = Object.assign({}, DEFAULT_KEYBIND);
                 normalizeRange(settings);
-                saveSettings();
+                saveSettings(true);
                 applyDarkMode();
                 setAppSettings(Object.assign({}, settings));
                 LOG('settings reset to defaults');
@@ -5255,22 +5491,23 @@
                     currentStats=${appStats}
                     accumulatedBonus=${accumulatedBonus}
                     onToggleBoost=${handleToggleBoost}
-                    onOpenSettings=${() => reactSetModalOpen(true)}
+                    onOpenSettings=${handleOpenSettings}
                 />
-                <${SettingsModal} 
-                    isOpen=${isModalOpen}
-                    isClosing=${isClosing}
-                    onClose=${handleCloseModal}
-                    currentSettings=${appSettings}
-                    currentStats=${appStats}
-                    accumulatedBonus=${accumulatedBonus}
-                    isCapturingKeybind=${isCapturing}
-                    onStartCaptureKeybind=${handleStartCaptureKeybind}
-                    onClearKeybind=${handleClearKeybind}
-                    onUpdateSetting=${applySettingChange}
-                    onResetAllSettings=${handleResetAllSettings}
-                    onResetStats=${handleResetStats}
-                />
+                ${(isModalOpen || isClosing) ? html`
+                    <${SettingsModal} 
+                        isOpen=${isModalOpen}
+                        isClosing=${isClosing}
+                        onClose=${handleCloseModal}
+                        currentSettings=${appSettings}
+                        accumulatedBonus=${accumulatedBonus}
+                        isCapturingKeybind=${isCapturing}
+                        onStartCaptureKeybind=${handleStartCaptureKeybind}
+                        onClearKeybind=${handleClearKeybind}
+                        onUpdateSetting=${applySettingChange}
+                        onResetAllSettings=${handleResetAllSettings}
+                        onResetStats=${handleResetStats}
+                    />
+                ` : null}
             </div>
         `;
     };
