@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UpLearn Telemetry Blocker & TimeSpent Booster
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
-// @version      3.5.0
-// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; dark mode; full control panel UI
+// @version      3.6.0
+// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; inline manual "Add time" question button; dark mode; full control panel UI
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
@@ -89,6 +89,8 @@
         timeBoostEnabled:          true,
         extraSecondsMin:           30,
         extraSecondsMax:           90,
+        manualTimeButtonEnabled:   true,
+        manualTimeStacksWithAuto:  false,
         disableAutoFullscreen:     true,
         darkMode:                  false,
         pillVisible:               true,
@@ -148,6 +150,13 @@
                     }
                 }
                 delete parsed.allowJitsu;
+
+                if (typeof parsed.manualTimeButtonEnabled !== 'boolean') {
+                    parsed.manualTimeButtonEnabled = DEFAULT_SETTINGS.manualTimeButtonEnabled;
+                }
+                if (typeof parsed.manualTimeStacksWithAuto !== 'boolean') {
+                    parsed.manualTimeStacksWithAuto = DEFAULT_SETTINGS.manualTimeStacksWithAuto;
+                }
 
                 Object.assign(s, parsed);
             } else {
@@ -329,7 +338,7 @@
     const stats = {
         apiPosts: 0, seen: 0, boosted: 0, blocked: 0,
         groupExtra: 0, fullscreenBlocked: 0, consoleSuppressed: 0,
-        logImproperUseBlocked: 0, jitsuPackets: 0,
+        logImproperUseBlocked: 0, jitsuPackets: 0, manualBoosted: 0,
     };
 
     // ============================================================
@@ -571,6 +580,7 @@
         nativeConsole.log('%cConsole noise:   ', CSS.muted, settings.suppressConsoleNoise);
         nativeConsole.log('%cTime boost:      ', CSS.muted, settings.timeBoostEnabled,
             `(+${settings.extraSecondsMin}–${settings.extraSecondsMax}s)`);
+        nativeConsole.log('%cManual time btn: ', CSS.muted, settings.manualTimeButtonEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cFullscreen:      ', CSS.muted, settings.disableAutoFullscreen ? 'blocked' : 'allowed');
         nativeConsole.log('%cDark mode:       ', CSS.muted, settings.darkMode);
         nativeConsole.groupEnd();
@@ -782,22 +792,92 @@
     }
 
     // ============================================================
-    // TIME BOOST
+    // TIME BOOST & MANUAL "ADD TIME" QUESTION BUTTON
     // ============================================================
-    const QUIZ_OP  = 'AnswerProgressQuizQuestion';
-    const GROUP_OP = 'CompleteProgressQuizGroup';
+    const QUIZ_OP              = 'AnswerProgressQuizQuestion';
+    const GROUP_OP             = 'CompleteProgressQuizGroup';
+    const MANUAL_BUTTON_ID     = 'us-timespent-btn';
+    const MANUAL_TRIGGER_LABEL = 'submit';
 
     let accumulatedExtraSeconds  = 0;
     let accumulatedQuestionCount = 0;
 
-    function parseISODuration(str) {
-        const m = /^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/.exec(str);
-        if (!m) return null;
-        return parseFloat(m[1] || 0) * 3600 + parseFloat(m[2] || 0) * 60 + parseFloat(m[3] || 0);
+    /**
+     * Extra seconds queued to ADD on top of UpLearn's own timeSpent.
+     *   null  → user hasn't set anything (button shows "Add time")
+     *   0     → user explicitly set 0 (button shows "+0s")
+     *   N > 0 → user set N seconds (button shows "+Xm Ys")
+     * This is SET, not accumulated — each entry replaces the previous one.
+     */
+    let queuedSeconds  = null;
+    let editing        = false;
+    let resetScheduled = false;
+
+    /* ------------------------------------------------------------
+     * Helpers
+     * ------------------------------------------------------------ */
+    const round3 = (n) => Math.round(n * 1000) / 1000;
+
+    function toIso(seconds) {
+        return 'PT' + round3(seconds) + 'S';
     }
-    function toISODuration(totalSeconds) {
-        return 'PT' + String(Math.round(totalSeconds * 1000) / 1000) + 'S';
+    const toISODuration = toIso;
+
+    function formatSeconds(seconds) {
+        seconds = round3(seconds);
+        if (seconds < 60) return seconds + 's';
+        const mm = Math.floor(seconds / 60);
+        const ss = round3(seconds % 60);
+        if (mm < 60) return `${mm}m ${ss}s`;
+        const hh = Math.floor(mm / 60);
+        return `${hh}h ${mm % 60}m ${ss}s`;
     }
+
+    function parseDurationToSeconds(raw) {
+        if (raw == null) return null;
+        const s = String(raw).trim();
+        if (!s) return null;
+
+        // ISO-8601
+        if (/^P/i.test(s)) {
+            const m = /^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/i.exec(s);
+            if (!m) return null;
+            const h  = parseFloat(m[1] || 0);
+            const mi = parseFloat(m[2] || 0);
+            const se = parseFloat(m[3] || 0);
+            return h * 3600 + mi * 60 + se;
+        }
+
+        // mm:ss or hh:mm:ss
+        if (/^\d+(:[0-5]?\d){1,2}$/.test(s)) {
+            const parts = s.split(':').map(Number);
+            let secs = 0;
+            for (const p of parts) secs = secs * 60 + p;
+            return secs;
+        }
+
+        // "1h 30m 20s", "90s", "1.5m", "2 min"
+        const unitRe = /(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/gi;
+        let total = 0;
+        let matched = false;
+        let m;
+        while ((m = unitRe.exec(s)) !== null) {
+            matched = true;
+            const value = parseFloat(m[1]);
+            const unit  = m[2].toLowerCase();
+            if (unit[0] === 'h')      total += value * 3600;
+            else if (unit[0] === 'm') total += value * 60;
+            else                      total += value;
+        }
+        if (matched) return total;
+
+        // Bare number => seconds
+        if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+
+        return null;
+    }
+    const parseISODuration = parseDurationToSeconds;
+
     function pickExtraSeconds() {
         const min = Math.min(settings.extraSecondsMin, settings.extraSecondsMax);
         const max = Math.max(settings.extraSecondsMin, settings.extraSecondsMax);
@@ -805,8 +885,315 @@
         return Math.floor(min + Math.random() * (max - min + 1));
     }
 
+    /* ------------------------------------------------------------
+     * Manual "Add Time" Button UI & Styles
+     * ------------------------------------------------------------ */
+    const MANUAL_BUTTON_CSS = `
+#${MANUAL_BUTTON_ID} {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin: 0 8px 0 0 !important;
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid #cbd5e1;
+    background: #f8fafc;
+    color: #0f172a;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    white-space: nowrap;
+    vertical-align: middle;
+    transition: background .15s, border-color .15s, color .15s;
+    box-sizing: border-box;
+    min-width: 110px;
+    user-select: none;
+    outline: none;
+}
+#${MANUAL_BUTTON_ID}:hover { background: #eef2f7; }
+#${MANUAL_BUTTON_ID}.us-active {
+    border-color: #2563eb;
+    background: #eff6ff;
+    color: #1d4ed8;
+}
+#${MANUAL_BUTTON_ID}.us-editing {
+    padding: 0;
+    background: #ffffff;
+    border-color: #2563eb;
+    box-shadow: 0 0 0 3px rgba(37,99,235,0.15);
+    cursor: text;
+}
+#${MANUAL_BUTTON_ID}.us-editing:hover { background: #ffffff; }
+#${MANUAL_BUTTON_ID} input.us-input {
+    border: none;
+    outline: none;
+    background: transparent;
+    font: inherit;
+    color: inherit;
+    padding: 10px 14px;
+    width: 110px;
+    text-align: center;
+    box-sizing: border-box;
+    letter-spacing: 0.3px;
+}
+#${MANUAL_BUTTON_ID}.us-reset {
+    animation: us-pop .4s ease;
+}
+@keyframes us-pop {
+    0%   { transform: scale(1);    }
+    40%  { transform: scale(1.08); }
+    100% { transform: scale(1);    }
+}
+`;
+
+    function injectButtonStyles() {
+        if (document.getElementById(MANUAL_BUTTON_ID + '-style')) return;
+        const style = document.createElement('style');
+        style.id = MANUAL_BUTTON_ID + '-style';
+        style.textContent = MANUAL_BUTTON_CSS;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function findSubmitButton() {
+        const buttons = document.querySelectorAll('button[type="submit"]');
+        for (const b of buttons) {
+            const t = (b.textContent || '').trim().toLowerCase();
+            if (t === MANUAL_TRIGGER_LABEL) return b;
+        }
+        const allButtons = document.querySelectorAll('button');
+        for (const b of allButtons) {
+            const t = (b.textContent || '').trim().toLowerCase();
+            if (t === MANUAL_TRIGGER_LABEL) return b;
+        }
+        return null;
+    }
+
+    function updateLabel(btn, pulse) {
+        if (editing) return;          // never clobber the input
+        btn = btn || document.getElementById(MANUAL_BUTTON_ID);
+        if (!btn) return;
+
+        if (queuedSeconds !== null) {
+            btn.textContent = '\u23F1 +' + formatSeconds(queuedSeconds);
+            btn.classList.add('us-active');
+            btn.title = 'Extra: +' + toIso(queuedSeconds) +
+                        ' (added on top of UpLearn\'s own timeSpent). Click to edit.';
+        } else {
+            btn.textContent = '\u23F1 Add time';
+            btn.classList.remove('us-active');
+            btn.title = 'Set extra time added on top of UpLearn\'s own timeSpent';
+        }
+
+        if (pulse) {
+            btn.classList.remove('us-reset');
+            void btn.offsetWidth;
+            btn.classList.add('us-reset');
+            setTimeout(() => btn.classList.remove('us-reset'), 500);
+        }
+    }
+
+    function enterEditMode() {
+        const btn = document.getElementById(MANUAL_BUTTON_ID);
+        if (!btn || editing) return;
+
+        editing = true;
+        btn.classList.add('us-editing');
+        btn.textContent = '';
+
+        const input = document.createElement('input');
+        input.type         = 'text';
+        input.inputMode    = 'numeric';
+        input.autocomplete = 'off';
+        input.spellcheck   = false;
+        input.className    = 'us-input';
+        input.placeholder  = 'seconds';
+        input.value        = queuedSeconds !== null ? String(round3(queuedSeconds)) : '';
+
+        ['click', 'mousedown', 'mouseup'].forEach((ev) =>
+            input.addEventListener(ev, (e) => e.stopPropagation())
+        );
+        input.addEventListener('keydown', onInputKeyDown);
+        input.addEventListener('blur',    onInputBlur);
+
+        btn.appendChild(input);
+        input.focus();
+        input.select();
+    }
+
+    function onInputKeyDown(e) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            e.stopPropagation();
+            commitEdit(e.target.value);
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            e.stopPropagation();
+            cancelEdit();
+        }
+    }
+
+    function onInputBlur(e) {
+        if (!editing) return;
+        commitEdit(e.target.value);
+    }
+
+    function teardownInput() {
+        editing = false;
+        const btn = document.getElementById(MANUAL_BUTTON_ID);
+        if (!btn) return null;
+        btn.classList.remove('us-editing');
+        const input = btn.querySelector('input.us-input');
+        if (input && input.parentNode === btn) btn.removeChild(input);
+        return btn;
+    }
+
+    function commitEdit(rawValue) {
+        if (!editing) return;
+        teardownInput();
+
+        const raw = (rawValue || '').trim();
+
+        if (!raw) {
+            queuedSeconds = null;
+            updateLabel();
+            return;
+        }
+
+        const secs = parseDurationToSeconds(raw);
+        if (secs == null || secs < 0) {
+            window.alert(
+                'Could not understand "' + raw + '".\n\n' +
+                'Enter a number of seconds (e.g. 120), or 1:30, 2m30s, PT45S.'
+            );
+            updateLabel();
+            return;
+        }
+
+        queuedSeconds = secs;
+        updateLabel(null, true);
+        LOG(
+            '[timeSpent] manual extra set to +' + formatSeconds(secs) +
+            ' (' + toIso(secs) + ')'
+        );
+        nativeConsole.log(
+            '[UpLearn timeSpent] extra set to +' + formatSeconds(secs) +
+            ' (' + toIso(secs) + ')'
+        );
+    }
+
+    function cancelEdit() {
+        if (!editing) return;
+        teardownInput();
+        updateLabel();
+    }
+
+    function onButtonClick(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (editing) return;
+        enterEditMode();
+    }
+
+    function onButtonKeyDown(e) {
+        if (editing) return;
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            enterEditMode();
+        }
+    }
+
+    function createButton() {
+        const btn = document.createElement('div');
+        btn.id = MANUAL_BUTTON_ID;
+        btn.setAttribute('role', 'button');
+        btn.setAttribute('tabindex', '0');
+        btn.addEventListener('click',   onButtonClick,   true);
+        btn.addEventListener('keydown', onButtonKeyDown, false);
+        return btn;
+    }
+
+    function removeButton() {
+        const mine = document.getElementById(MANUAL_BUTTON_ID);
+        if (mine && mine.isConnected) mine.remove();
+        editing = false;
+    }
+
+    function ensureButton() {
+        if (!settings.manualTimeButtonEnabled) {
+            removeButton();
+            queuedSeconds = null;
+            editing = false;
+            return;
+        }
+
+        const submit = findSubmitButton();
+
+        if (!submit) {
+            removeButton();
+            queuedSeconds = null;
+            editing = false;
+            return;
+        }
+
+        injectButtonStyles();
+
+        let mine = document.getElementById(MANUAL_BUTTON_ID);
+
+        if (mine && mine.isConnected && mine.nextElementSibling === submit) {
+            updateLabel(mine);
+            return;
+        }
+
+        if (editing) return;
+
+        if (!mine) mine = createButton();
+
+        submit.parentNode.insertBefore(mine, submit);
+        updateLabel(mine);
+    }
+
+    function scheduleReset() {
+        if (resetScheduled) return;
+        resetScheduled = true;
+        setTimeout(() => {
+            queuedSeconds = null;
+            resetScheduled = false;
+            updateLabel();
+        }, 0);
+    }
+
+    let manualBtnScheduled = false;
+    function scheduleEnsureButton() {
+        if (manualBtnScheduled) return;
+        manualBtnScheduled = true;
+        setTimeout(() => {
+            manualBtnScheduled = false;
+            ensureButton();
+        }, 150);
+    }
+
+    function initManualButtonObserver() {
+        try {
+            const observer = new MutationObserver(scheduleEnsureButton);
+            observer.observe(document.documentElement || document, {
+                childList: true,
+                subtree: true,
+                characterData: true,
+            });
+            setInterval(ensureButton, 3000);
+        } catch (e) {
+            WARN('mutation observer for manual button failed', e);
+        }
+    }
+
+    /* ------------------------------------------------------------
+     * Body Rewriting & Network Injection
+     * ------------------------------------------------------------ */
     function maybeBumpTimeSpent(body, source) {
-        if (!settings.timeBoostEnabled) return { body, changed: false };
+        if (!settings.timeBoostEnabled && queuedSeconds === null) return { body, changed: false };
         if (typeof body !== 'string')    return { body, changed: false };
 
         const hasQuiz  = body.includes(QUIZ_OP);
@@ -823,31 +1210,62 @@
             if (!obj || !obj.operationName || !obj.variables) return;
 
             if (obj.operationName === QUIZ_OP && typeof obj.variables.timeSpent === 'string') {
-                const total = parseISODuration(obj.variables.timeSpent);
+                const total = parseDurationToSeconds(obj.variables.timeSpent);
                 if (total === null) return;
                 const before = obj.variables.timeSpent;
-                const extra  = pickExtraSeconds();
-                obj.variables.timeSpent = toISODuration(total + extra);
+
+                let extra = 0;
+                let isManual = false;
+
+                if (queuedSeconds !== null) {
+                    isManual = true;
+                    if (settings.manualTimeStacksWithAuto && settings.timeBoostEnabled) {
+                        const autoExtra = pickExtraSeconds();
+                        extra = queuedSeconds + autoExtra;
+                    } else {
+                        extra = queuedSeconds;
+                    }
+                } else if (settings.timeBoostEnabled) {
+                    extra = pickExtraSeconds();
+                } else {
+                    return;
+                }
+
+                obj.variables.timeSpent = toIso(total + extra);
                 accumulatedExtraSeconds  += extra;
                 accumulatedQuestionCount += 1;
-                stats.seen++; stats.boosted++;
+                stats.seen++;
+                stats.boosted++;
+                if (isManual) stats.manualBoosted = (stats.manualBoosted || 0) + 1;
                 changed = true;
-                LOG(`[${source}] ${QUIZ_OP}: ${before} → ${obj.variables.timeSpent} ` +
-                    `(+${extra}s, accumulated ${accumulatedExtraSeconds}s / ${accumulatedQuestionCount} q)`);
-                VLOG('boost roll', {
-                    rolled: extra,
-                    range: `[${settings.extraSecondsMin}–${settings.extraSecondsMax}]`,
-                    newAccumulated: accumulatedExtraSeconds,
-                    questionCount: accumulatedQuestionCount,
-                });
+
+                if (isManual) {
+                    LOG(`[${source}] ${QUIZ_OP} (manual time): ${before} (+${formatSeconds(queuedSeconds)}${settings.manualTimeStacksWithAuto && settings.timeBoostEnabled ? ' + auto' : ''}) → ${obj.variables.timeSpent} ` +
+                        `(accumulated ${accumulatedExtraSeconds}s / ${accumulatedQuestionCount} q)`);
+                    nativeConsole.log(
+                        '[UpLearn timeSpent] original=' + before +
+                        ' (+' + formatSeconds(extra) + ')' +
+                        ' → ' + obj.variables.timeSpent
+                    );
+                } else {
+                    LOG(`[${source}] ${QUIZ_OP}: ${before} → ${obj.variables.timeSpent} ` +
+                        `(+${extra}s, accumulated ${accumulatedExtraSeconds}s / ${accumulatedQuestionCount} q)`);
+                    VLOG('boost roll', {
+                        rolled: extra,
+                        range: `[${settings.extraSecondsMin}–${settings.extraSecondsMax}]`,
+                        newAccumulated: accumulatedExtraSeconds,
+                        questionCount: accumulatedQuestionCount,
+                    });
+                }
             }
             else if (obj.operationName === GROUP_OP && typeof obj.variables.timeSpent === 'string') {
-                const total = parseISODuration(obj.variables.timeSpent);
+                if (!settings.timeBoostEnabled && accumulatedExtraSeconds === 0) return;
+                const total = parseDurationToSeconds(obj.variables.timeSpent);
                 if (total === null) return;
                 const before = obj.variables.timeSpent;
                 const bonus  = accumulatedExtraSeconds;
                 const count  = accumulatedQuestionCount;
-                obj.variables.timeSpent = toISODuration(total + bonus);
+                obj.variables.timeSpent = toIso(total + bonus);
                 stats.groupExtra += bonus;
                 changed = true;
                 LOG(`[${source}] ${GROUP_OP}: ${before} → ${obj.variables.timeSpent} ` +
@@ -861,7 +1279,17 @@
         if (Array.isArray(json)) json.forEach(patch);
         else patch(json);
 
-        return changed ? { body: JSON.stringify(json), changed: true } : { body, changed: false };
+        if (changed) {
+            if (queuedSeconds !== null) {
+                scheduleReset();
+            }
+            return { body: JSON.stringify(json), changed: true };
+        }
+        return { body, changed: false };
+    }
+
+    function rewriteBodyText(text) {
+        return maybeBumpTimeSpent(text, 'rewriteBodyText').body;
     }
 
     // ============================================================
@@ -3134,6 +3562,14 @@
         LOG('setting changed:', key, '=', value);
 
         switch (key) {
+            case 'manualTimeButtonEnabled':
+                LOG('manual "Add time" button ' + (value ? 'ENABLED' : 'DISABLED'));
+                if (!value) removeButton();
+                else ensureButton();
+                break;
+            case 'manualTimeStacksWithAuto':
+                LOG('manual time stacking with auto-boost ' + (value ? 'ENABLED' : 'DISABLED'));
+                break;
             case 'suppressJitsu':
                 LOG('Jitsu telemetry ' + (value ? 'SUPPRESSED (blocked + logged)' : 'ALLOWED (passed through + logged)'));
                 break;
@@ -4287,6 +4723,50 @@
                                             <${Card}>
                                                 <${Card.Header}>
                                                     <${Card.Title}>
+                                                        <span>Inline "Add Time" Button</span>
+                                                        <${Badge} variant="soft" color=${currentSettings.manualTimeButtonEnabled ? 'success' : 'default'}>Interactive<//>
+                                                    <//>
+                                                    <${Card.Description}>Adds an interactive button beside the question Submit button.<//>
+                                                <//>
+                                                <${Card.Content} className="core-toggles-list">
+                                                    <${Switch} 
+                                                        size="sm"
+                                                        isSelected=${currentSettings.manualTimeButtonEnabled}
+                                                        onChange=${(v) => onUpdateSetting('manualTimeButtonEnabled', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>Show "Add time" button<//>
+                                                            <${Switch.Description}>Adds a button left of "Submit". Click to enter seconds; Enter or blur commits.<//>
+                                                        <//>
+                                                    <//>
+
+                                                    <${Switch} 
+                                                        size="sm"
+                                                        isSelected=${currentSettings.manualTimeStacksWithAuto}
+                                                        onChange=${(v) => onUpdateSetting('manualTimeStacksWithAuto', v)}
+                                                    >
+                                                        <${Switch.Control}>
+                                                            <${Switch.Thumb} />
+                                                        <//>
+                                                        <${Switch.Content}>
+                                                            <${Switch.Label}>Stack with automatic boost<//>
+                                                            <${Switch.Description}>If enabled, adds manual time on top of random range boost (instead of setting the exact bonus)<//>
+                                                        <//>
+                                                    <//>
+
+                                                    <div style=${{ padding: '10px 12px', background: 'var(--surface)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', fontSize: '12px', color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                                        <span>Accepted formats:</span>
+                                                        <span style=${{ fontWeight: 600, color: 'var(--foreground)' }}>120 · 1:30 · 2m 30s · PT45S</span>
+                                                    </div>
+                                                <//>
+                                            <//>
+
+                                            <${Card}>
+                                                <${Card.Header}>
+                                                    <${Card.Title}>
                                                         <span>Boost Automation Insights</span>
                                                         <${Badge} variant="soft" color="accent">Active Session<//>
                                                     <//>
@@ -4294,7 +4774,7 @@
                                                 <//>
                                                 <${Card.Content}>
                                                     <div style=${{ fontSize: '12.5px', color: 'var(--muted)', lineHeight: '1.6' }}>
-                                                        UpLearn logs seconds spent on each quiz question and sums them upon finishing a lesson or group. When active, every answered question receives a randomized bonus within your configured range, maintaining realistic, organic engagement scores without tripping detection heuristics.
+                                                        UpLearn logs seconds spent on each quiz question and sums them upon finishing a lesson or group. When active, every answered question receives a bonus (randomized or manually entered), maintaining realistic, organic engagement scores without tripping detection heuristics.
                                                     </div>
                                                     <div style=${{ marginTop: '8px', padding: '12px 14px', background: 'var(--surface)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                                                         <span style=${{ fontSize: '12.5px', fontWeight: 500, color: 'var(--foreground)' }}>Cumulative Session Bonus</span>
@@ -4590,6 +5070,10 @@
                                                     <span className="stat-card__value">${currentStats.boosted}</span>
                                                 </div>
                                                 <div className="stat-card">
+                                                    <span className="stat-card__label">Manual Boosts</span>
+                                                    <span className="stat-card__value">${currentStats.manualBoosted || 0}</span>
+                                                </div>
+                                                <div className="stat-card">
                                                     <span className="stat-card__label">Improper Use</span>
                                                     <span className="stat-card__value">${currentStats.logImproperUseBlocked}</span>
                                                 </div>
@@ -4748,7 +5232,7 @@
             stats.apiPosts = 0; stats.seen = 0; stats.boosted = 0;
             stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
             stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
-            stats.jitsuPackets = 0;
+            stats.jitsuPackets = 0; stats.manualBoosted = 0;
             accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
             setAppStats(Object.assign({}, stats));
             setAccumulatedBonus(0);
@@ -4847,7 +5331,11 @@
     // ============================================================
     // BOOTSTRAP
     // ============================================================
-    function bootstrap() { ensureUIHost(); }
+    function bootstrap() {
+        ensureUIHost();
+        ensureButton();
+        initManualButtonObserver();
+    }
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', bootstrap, { once: true });
     } else {
@@ -4865,12 +5353,22 @@
         setTelemetryPreset: (p) => { applySettingChange('telemetryPreset', p); },
         setLogLevel: (lvl) => { applySettingChange('logLevel', lvl); },
         setSuppressJitsu: (v) => { applySettingChange('suppressJitsu', !!v); },
+        setManualTimeButtonEnabled: (v) => { applySettingChange('manualTimeButtonEnabled', !!v); },
+        setManualTimeStacksWithAuto: (v) => { applySettingChange('manualTimeStacksWithAuto', !!v); },
+        getQueuedSeconds: () => queuedSeconds,
+        setQueuedSeconds: (secs) => {
+            queuedSeconds = secs;
+            updateLabel();
+        },
+        ensureManualTimeButton: ensureButton,
+        removeManualTimeButton: removeButton,
+        rewriteBodyText,
         telemetryServices: TELEMETRY_SERVICES,
         resetStats: () => {
             stats.apiPosts = 0; stats.seen = 0; stats.boosted = 0;
             stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
             stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
-            stats.jitsuPackets = 0;
+            stats.jitsuPackets = 0; stats.manualBoosted = 0;
             accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
         },
         getAccumulated: () => accumulatedExtraSeconds,
@@ -4881,6 +5379,7 @@
 
     LOG('=== READY | timeBoost:', settings.timeBoostEnabled,
         '| range:', settings.extraSecondsMin + '–' + settings.extraSecondsMax + 's',
+        '| manualTimeBtn:', settings.manualTimeButtonEnabled ? 'ON' : 'OFF',
         '| keybind:', formatKeybind(settings.uiToggleKeybind),
         '| auto-fullscreen blocked:', settings.disableAutoFullscreen ? 'ON' : 'OFF',
         '| dark mode:', settings.darkMode ? 'ON' : 'OFF',
@@ -4895,6 +5394,7 @@
         nativeConsole.log('%cThird-party services:   ', CSS.muted, anyServiceOn ? 'ON' : 'OFF');
         nativeConsole.log('%cSuppress Jitsu:         ', CSS.muted, settings.suppressJitsu ? 'YES (blocked + logged)' : 'no (allowed + logged)');
         nativeConsole.log('%cLogImproperUse:         ', CSS.muted, settings.blockLogImproperUse ? 'ON' : 'OFF');
+        nativeConsole.log('%cManual time button:     ', CSS.muted, settings.manualTimeButtonEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cDOM injection:          ', CSS.muted, settings.blockDomElements ? 'ON' : 'OFF');
         nativeConsole.log('%cWebSockets:             ', CSS.muted, settings.blockWebSockets ? 'ON' : 'OFF');
         nativeConsole.log('%csendBeacon:             ', CSS.muted, settings.blockSendBeacon ? 'ON' : 'OFF');
