@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UpLearn Telemetry + Fullscreen + Tab-Switch Blocker
 // @namespace    https://github.com/local/uplearn-blocker
-// @version      1.1.2
+// @version      1.1.4
 // @description  Blocks telemetry, third-party trackers, auto-fullscreen, and tab-switch/blur detection across all userscript managers.
 // @author       you
 // @match        https://web.uplearn.co.uk/*
@@ -10,6 +10,8 @@
 // @inject-into  page
 // @noframes
 //
+// @webRequest   [{"selector":{"include":"://jitsu.uplearn.co.uk/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://jitsu.com/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://openreplay.uplearn.co.uk/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://.ingest.us.sentry.io/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://static.cloudflareinsights.com/"},"action":"cancel"}]
@@ -65,14 +67,15 @@
     const API_PATH_RE = /\/api\/?$/;
 
     // Compiled regex matching all blocked telemetry hostnames & domains in a single pass.
-    // 'jitsu.uplearn.co.uk' and 'web.uplearn.co.uk' are intentionally excluded / unblocked.
-    const TELEMETRY_HOST_RE = /(?:^|\.)(?:openreplay\.uplearn\.co\.uk|sentry\.io|cloudflareinsights\.com|intercom\.io|intercomcdn\.com|googletagmanager\.com|google-analytics\.com|analytics\.google\.com|facebook\.net|sc-static\.net|bat\.bing\.com|bzrcdn\.openai\.com|fullstory\.com|hotjar\.com|mixpanel\.com|segment\.io|amplitude\.com|posthog\.com)$/i;
+    // 'web.uplearn.co.uk' is intentionally excluded / unblocked.
+    const TELEMETRY_HOST_RE = /(?:^|\.)(?:jitsu\.uplearn\.co\.uk|jitsu\.com|openreplay\.uplearn\.co\.uk|sentry\.io|cloudflareinsights\.com|intercom\.io|intercomcdn\.com|googletagmanager\.com|google-analytics\.com|analytics\.google\.com|facebook\.net|sc-static\.net|bat\.bing\.com|bzrcdn\.openai\.com|fullstory\.com|hotjar\.com|mixpanel\.com|segment\.io|amplitude\.com|posthog\.com)\.?$/i;
 
     // Fast hostname extractor avoiding expensive `new URL()` allocations
     function getHostname(url) {
         if (!url || typeof url !== 'string') return '';
         const len = url.length;
         let start = 0;
+        // Skip leading whitespace
         while (start < len && url.charCodeAt(start) <= 32) start++;
         if (start >= len) return '';
 
@@ -109,13 +112,22 @@
             end = colonIdx;
         }
 
+        // Strip trailing dots from FQDN hostname if present
+        while (end > start && url.charCodeAt(end - 1) === 46) {
+            end--;
+        }
+
         return url.slice(start, end).toLowerCase();
     }
 
     function isTelemetryUrl(url) {
         if (!url) return false;
         if (typeof url !== 'string') {
-            if (typeof url.hostname === 'string') return TELEMETRY_HOST_RE.test(url.hostname);
+            if (typeof url.hostname === 'string') {
+                let hn = url.hostname.toLowerCase();
+                while (hn.charCodeAt(hn.length - 1) === 46) hn = hn.slice(0, -1);
+                return TELEMETRY_HOST_RE.test(hn);
+            }
             url = url.url || url.href || String(url);
         }
         const host = getHostname(url);
@@ -129,7 +141,7 @@
         }
         if (!url.includes('api')) return false;
 
-        // Fast path for relative paths: /api, /api/, /api?..., /api/?...
+        // Fast path for relative URLs: /api, /api/, /api?..., /api/?...
         if (url.charCodeAt(0) === 47) {
             if (url === '/api' || url === '/api/') return true;
             if (url.startsWith('/api?') || url.startsWith('/api/?') || url.startsWith('/api#')) return true;
@@ -143,7 +155,8 @@
 
         try {
             const u = new URL(url, location.href);
-            return u.host === API_HOST && API_PATH_RE.test(u.pathname);
+            const host = u.hostname.endsWith('.') ? u.hostname.slice(0, -1) : u.hostname;
+            return host === API_HOST && API_PATH_RE.test(u.pathname);
         } catch {
             return false;
         }
