@@ -922,7 +922,7 @@
     align-items: center;
     justify-content: center;
     gap: 6px;
-    margin: 0 8px 0 0 !important;
+    margin: 0 0 0 8px !important;
     padding: 10px 14px;
     border-radius: 8px;
     border: 1px solid #cbd5e1;
@@ -1176,7 +1176,7 @@
 
         let mine = document.getElementById(MANUAL_BUTTON_ID);
 
-        if (mine && mine.isConnected && mine.nextElementSibling === submit) {
+        if (mine && mine.isConnected && submit.nextElementSibling === mine) {
             updateLabel(mine);
             return;
         }
@@ -1185,7 +1185,9 @@
 
         if (!mine) mine = createButton();
 
-        submit.parentNode.insertBefore(mine, submit);
+        if (submit.parentNode) {
+            submit.parentNode.insertBefore(mine, submit.nextSibling);
+        }
         updateLabel(mine);
     }
 
@@ -4765,7 +4767,7 @@
                                 <//>
                                 <${Switch.Content}>
                                     <${Switch.Label}>Show "Add time" button<//>
-                                    <${Switch.Description}>Adds a button left of "Submit". Click to enter seconds; Enter or blur commits.<//>
+                                    <${Switch.Description}>Adds a button right of "Submit". Click to enter seconds; Enter or blur commits.<//>
                                 <//>
                             <//>
 
