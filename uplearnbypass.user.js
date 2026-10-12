@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UpLearn Telemetry Blocker & TimeSpent Booster
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
-// @version      3.7.0
-// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; inline manual "Add time" question button; full video watch completion toggle; dark mode; full control panel UI
+// @version      3.8.4
+// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; inline manual "Add time" question button; full video watch completion toggle; auto-skip video to questions / completion; add full video duration to timeSpent; dark mode; full control panel UI
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
@@ -92,6 +92,8 @@
         manualTimeButtonEnabled:   true,
         manualTimeStacksWithAuto:  false,
         fullVideoWatchedEnabled:   true,
+        autoSkipVideoEnabled:      true,
+        addVideoDurationToTimeSpent: true,
         disableAutoFullscreen:     true,
         darkMode:                  false,
         pillVisible:               true,
@@ -107,6 +109,7 @@
 
     const INDIVIDUAL_TELEMETRY_SETTINGS = new Set([
         'telemetryServices',
+        'suppressJitsu',
         'blockLogImproperUse', 'spoofVisibility', 'blockWebSockets',
         'blockSendBeacon', 'blockDomElements', 'suppressConsoleNoise',
     ]);
@@ -162,6 +165,12 @@
                 if (typeof parsed.fullVideoWatchedEnabled !== 'boolean') {
                     parsed.fullVideoWatchedEnabled = DEFAULT_SETTINGS.fullVideoWatchedEnabled;
                 }
+                if (typeof parsed.autoSkipVideoEnabled !== 'boolean') {
+                    parsed.autoSkipVideoEnabled = DEFAULT_SETTINGS.autoSkipVideoEnabled;
+                }
+                if (typeof parsed.addVideoDurationToTimeSpent !== 'boolean') {
+                    parsed.addVideoDurationToTimeSpent = DEFAULT_SETTINGS.addVideoDurationToTimeSpent;
+                }
 
                 Object.assign(s, parsed);
             } else {
@@ -171,6 +180,16 @@
                 if (u !== null) s.pillVisible = u === 'true';
             }
         } catch (e) { nativeConsole.warn('[UL] load settings failed', e); }
+
+        if (s.telemetryPreset === 'harsh') {
+            s.suppressJitsu = true;
+            s.telemetryServices.jitsu = true;
+        } else if (s.telemetryPreset === 'off' || s.telemetryPreset === 'simple') {
+            s.suppressJitsu = false;
+            s.telemetryServices.jitsu = false;
+        } else {
+            s.telemetryServices.jitsu = !!s.suppressJitsu;
+        }
 
         s.telemetryServices = Object.assign({}, s.telemetryServices);
         normalizeRange(s);
@@ -215,11 +234,21 @@
     } catch {}
 
     // ============================================================
-    // PRESETS
+    // CLONING & PRESETS
     // ============================================================
+    function cloneSettings(s) {
+        if (!s) return s;
+        return Object.assign({}, s, {
+            telemetryServices: Object.assign({}, s.telemetryServices),
+            uiToggleKeybind: Object.assign({}, s.uiToggleKeybind),
+        });
+    }
+
     function applyTelemetryPreset(preset) {
+        const nextServices = Object.assign({}, settings.telemetryServices);
         if (preset === 'off') {
-            for (const k in settings.telemetryServices) settings.telemetryServices[k] = false;
+            for (const k in nextServices) nextServices[k] = false;
+            settings.suppressJitsu        = false;
             settings.blockLogImproperUse  = false;
             settings.spoofVisibility      = false;
             settings.blockWebSockets      = false;
@@ -227,7 +256,8 @@
             settings.blockDomElements     = false;
             settings.suppressConsoleNoise = false;
         } else if (preset === 'simple') {
-            for (const k in settings.telemetryServices) settings.telemetryServices[k] = false;
+            for (const k in nextServices) nextServices[k] = false;
+            settings.suppressJitsu        = false;
             settings.blockLogImproperUse  = true;
             settings.spoofVisibility      = false;
             settings.blockWebSockets      = false;
@@ -235,7 +265,8 @@
             settings.blockDomElements     = false;
             settings.suppressConsoleNoise = true;
         } else if (preset === 'harsh') {
-            for (const k in settings.telemetryServices) settings.telemetryServices[k] = true;
+            for (const k in nextServices) nextServices[k] = true;
+            settings.suppressJitsu        = true;
             settings.blockLogImproperUse  = true;
             settings.spoofVisibility      = true;
             settings.blockWebSockets      = true;
@@ -243,6 +274,7 @@
             settings.blockDomElements     = true;
             settings.suppressConsoleNoise = true;
         }
+        settings.telemetryServices = nextServices;
         settings.telemetryPreset = preset;
     }
 
@@ -298,9 +330,10 @@
 
     function isJitsuHost(h) {
         if (!h) return false;
+        if (h === 'web.uplearn.co.uk' || (typeof location !== 'undefined' && h === location.hostname)) return false;
         for (let i = 0; i < JITSU_HOSTS.length; i++) {
             const t = JITSU_HOSTS[i];
-            if (h === t || h.endsWith('.' + t) || h.includes(t)) return true;
+            if (h === t || h.endsWith('.' + t)) return true;
         }
         return false;
     }
@@ -314,11 +347,11 @@
         if (!url) return null;
         const h = hostOf(url);
         if (!h) return null;
+        if (h === 'web.uplearn.co.uk' || (typeof location !== 'undefined' && h === location.hostname)) return null;
 
-        // Jitsu is controlled by its own dedicated toggle (settings.suppressJitsu),
-        // independent of presets and the per-service checkbox.
+        // Jitsu is controlled by settings.suppressJitsu (synced with telemetryServices.jitsu and presets)
         if (isJitsuHost(h)) {
-            if (!settings.suppressJitsu) return null;
+            if (!settings.suppressJitsu && !(settings.telemetryServices && settings.telemetryServices.jitsu)) return null;
             return { key: 'jitsu', label: 'Jitsu', host: h, pattern: JITSU_HOSTS[0] };
         }
 
@@ -329,7 +362,7 @@
             const hosts = TELEMETRY_SERVICES[key].hosts;
             for (let i = 0; i < hosts.length; i++) {
                 const t = hosts[i];
-                if (h === t || h.endsWith('.' + t) || h.includes(t)) {
+                if (h === t || h.endsWith('.' + t)) {
                     return { key, label: TELEMETRY_SERVICES[key].label, host: h, pattern: t };
                 }
             }
@@ -341,11 +374,12 @@
         if (!url) return null;
         const h = hostOf(url);
         if (!h) return null;
+        if (h === 'web.uplearn.co.uk' || (typeof location !== 'undefined' && h === location.hostname)) return null;
         for (const key in TELEMETRY_SERVICES) {
             const hosts = TELEMETRY_SERVICES[key].hosts;
             for (let i = 0; i < hosts.length; i++) {
                 const t = hosts[i];
-                if (h === t || h.endsWith('.' + t) || h.includes(t)) {
+                if (h === t || h.endsWith('.' + t)) {
                     return { key, label: TELEMETRY_SERVICES[key].label, host: h, pattern: t };
                 }
             }
@@ -371,7 +405,7 @@
         apiPosts: 0, seen: 0, boosted: 0, blocked: 0,
         groupExtra: 0, fullscreenBlocked: 0, consoleSuppressed: 0,
         logImproperUseBlocked: 0, jitsuPackets: 0, manualBoosted: 0,
-        videosMaxed: 0,
+        videosMaxed: 0, videosSkipped: 0, videoTimeAdded: 0,
     };
 
     // ============================================================
@@ -383,7 +417,6 @@
         /Failed to send data to/i,
         /Dropping queued event after/i,
         /max send attempts/i,
-        /go\.apollo\.dev\/c\/err/i,
         /\[Sentry\]/i,
     ];
 
@@ -424,7 +457,6 @@
                 if (textMatchesNoise(a)) return true;
             } else if (a instanceof Error) {
                 if (a.message && textMatchesNoise(a.message)) return true;
-                if (a.stack   && textMatchesNoise(a.stack))   return true;
             } else if (a && typeof a === 'object') {
                 try {
                     if (typeof a.url     === 'string' && textMatchesNoise(a.url))     return true;
@@ -870,22 +902,26 @@
 
     function parseDurationToSeconds(raw) {
         if (raw == null) return null;
+        if (typeof raw === 'number') {
+            return isFinite(raw) ? raw : null;
+        }
         const s = String(raw).trim();
         if (!s) return null;
 
-        // ISO-8601
+        // ISO-8601 (e.g. PT1M15S, PT45.5S, P0DT1M15S)
         if (/^P/i.test(s)) {
-            const m = /^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/i.exec(s);
+            const m = /^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i.exec(s);
             if (!m) return null;
-            const h  = parseFloat(m[1] || 0);
-            const mi = parseFloat(m[2] || 0);
-            const se = parseFloat(m[3] || 0);
-            return h * 3600 + mi * 60 + se;
+            const d  = parseFloat(m[1] || 0);
+            const h  = parseFloat(m[2] || 0);
+            const mi = parseFloat(m[3] || 0);
+            const se = parseFloat(m[4] || 0);
+            return d * 86400 + h * 3600 + mi * 60 + se;
         }
 
-        // mm:ss or hh:mm:ss
-        if (/^\d+(:[0-5]?\d){1,2}$/.test(s)) {
-            const parts = s.split(':').map(Number);
+        // mm:ss or hh:mm:ss (including optional fractional seconds like 00:01:15.5)
+        if (/^\d+(?::[0-5]?\d){1,2}(?:\.\d+)?$/.test(s)) {
+            const parts = s.split(':').map(parseFloat);
             let secs = 0;
             for (const p of parts) secs = secs * 60 + p;
             return secs;
@@ -918,6 +954,555 @@
         const max = Math.max(settings.extraSecondsMin, settings.extraSecondsMax);
         if (min === max) return min;
         return Math.floor(min + Math.random() * (max - min + 1));
+    }
+
+    /* ------------------------------------------------------------
+     * Video Lesson State & Auto-Skip Progression
+     * ------------------------------------------------------------ */
+    const knownLessonDurations = new Map();
+    let currentVideoLesson                 = null;
+    let lastSkippedTarget                  = null;
+    let autoSkipThrottled                  = false;
+    let lastSubmittedInVideoQuestionId     = null;
+    let lastSubmittedPreVideoQuestionId    = null;
+    let lastActiveVideoElement             = null;
+    let videoDetectedTimestamp             = 0;
+    let lastQuestionAnsweredAt             = 0;
+    let waitingForPostAnswerResume         = false;
+
+    function isQuestionAnswered(q) {
+        if (!q || !currentVideoLesson || !currentVideoLesson.answeredQuestionIds) return false;
+        const answered = currentVideoLesson.answeredQuestionIds;
+        if (q.id && answered.has(String(q.id))) return true;
+        if (q.quizContentId && answered.has(String(q.quizContentId))) return true;
+        return false;
+    }
+
+    function hasUnansweredPreQuestions() {
+        if (!currentVideoLesson || !Array.isArray(currentVideoLesson.preQuestions) || currentVideoLesson.preQuestions.length === 0) {
+            return false;
+        }
+        const answered = currentVideoLesson.answeredPreQuestionIds || new Set();
+        return currentVideoLesson.preQuestions.some((id) => !answered.has(id));
+    }
+
+    function inspectOutgoingGraphQL(body) {
+        if (!body || typeof body !== 'string') return;
+        if (!body.includes('AnswerInVideoQuestion') && !body.includes('answerInVideoQuestion') &&
+            !body.includes('AnswerPreVideoQuestion') && !body.includes('answerPreVideoQuestion')) {
+            return;
+        }
+        try {
+            const json = JSON.parse(body);
+            const checkOp = (obj) => {
+                if (!obj || !obj.variables) return;
+                const opName = obj.operationName || '';
+                const qStr = typeof obj.query === 'string'
+                    ? obj.query
+                    : (typeof obj.mutation === 'string' ? obj.mutation : '');
+
+                if (opName === 'AnswerInVideoQuestion' || qStr.includes('answerInVideoQuestion')) {
+                    if (obj.variables.questionId != null) {
+                        lastSubmittedInVideoQuestionId = String(obj.variables.questionId);
+                        VLOG('captured outgoing AnswerInVideoQuestion questionId', lastSubmittedInVideoQuestionId);
+                    }
+                }
+                if (opName === 'AnswerPreVideoQuestion' || qStr.includes('answerPreVideoQuestion')) {
+                    if (obj.variables.questionId != null) {
+                        lastSubmittedPreVideoQuestionId = String(obj.variables.questionId);
+                        VLOG('captured outgoing AnswerPreVideoQuestion questionId', lastSubmittedPreVideoQuestionId);
+                    }
+                }
+            };
+            if (Array.isArray(json)) json.forEach(checkOp);
+            else checkOp(json);
+        } catch {}
+    }
+
+    function handleApiResponse(data) {
+        if (!data || typeof data !== 'object') return;
+        if (Array.isArray(data)) {
+            data.forEach(handleApiResponse);
+            return;
+        }
+        const d = data.data || data;
+        if (!d || typeof d !== 'object') return;
+
+        // 0. Subsection overview videoLessons durations
+        if (d.subsection && Array.isArray(d.subsection.videoLessons)) {
+            for (const item of d.subsection.videoLessons) {
+                if (!item || !item.id) continue;
+                const itemDur = parseDurationToSeconds(item.length) || parseDurationToSeconds(item.duration) || 0;
+                if (itemDur > 0) {
+                    knownLessonDurations.set(String(item.id), itemDur);
+                }
+            }
+        }
+
+        // 1. GetVideoLesson response
+        if (d.videoLesson) {
+            const vl = d.videoLesson;
+            if (vl && vl.id) {
+                const lessonId = String(vl.id);
+                let dur = 0;
+                if (vl.length != null) {
+                    dur = parseDurationToSeconds(vl.length) || 0;
+                }
+                if (dur <= 0 && vl.duration != null) {
+                    dur = parseDurationToSeconds(vl.duration) || 0;
+                }
+                if (dur > 0) {
+                    knownLessonDurations.set(lessonId, dur);
+                }
+
+                const rawQuestions = Array.isArray(vl.inVideoQuizQuestions)
+                    ? vl.inVideoQuizQuestions.filter(Boolean)
+                    : [];
+                const questions = [];
+                for (let idx = 0; idx < rawQuestions.length; idx++) {
+                    const q = rawQuestions[idx];
+                    const parsedTrig = parseDurationToSeconds(q.triggerTime);
+                    const trig = (parsedTrig != null && isFinite(parsedTrig) && parsedTrig >= 0)
+                        ? parsedTrig
+                        : (isFinite(Number(q.triggerTime)) && Number(q.triggerTime) >= 0 ? Number(q.triggerTime) : null);
+                    const parsedResume = parseDurationToSeconds(q.postQuestionResumeTime);
+                    const resume = (parsedResume != null && isFinite(parsedResume) && parsedResume >= 0)
+                        ? parsedResume
+                        : (trig != null ? trig + 1 : null);
+
+                    questions.push({
+                        id: String(q.id || `q-idx-${idx}`),
+                        quizContentId: (q.quizContent && q.quizContent.id) ? String(q.quizContent.id) : null,
+                        triggerTime: trig,
+                        resumeTime: resume,
+                    });
+                }
+                questions.sort((a, b) => {
+                    if (a.triggerTime == null && b.triggerTime == null) return 0;
+                    if (a.triggerTime == null) return 1;
+                    if (b.triggerTime == null) return -1;
+                    return a.triggerTime - b.triggerTime;
+                });
+
+                const preQuestions = [];
+                if (Array.isArray(vl.preVideoQuestions)) {
+                    for (const pq of vl.preVideoQuestions) {
+                        if (pq && pq.id) {
+                            preQuestions.push(String(pq.id));
+                        }
+                    }
+                }
+
+                lastSkippedTarget = null;
+                lastQuestionAnsweredAt = 0;
+                waitingForPostAnswerResume = false;
+                currentVideoLesson = {
+                    id: lessonId,
+                    uniqueCode: vl.uniqueCode ? String(vl.uniqueCode) : '',
+                    title: vl.title || '',
+                    duration: dur,
+                    questions: questions,
+                    totalExpectedQuestions: rawQuestions.length,
+                    preQuestions: preQuestions,
+                    answeredQuestionIds: new Set(),
+                    answeredPreQuestionIds: new Set(),
+                    completed: false,
+                    receivedAt: Date.now(),
+                };
+
+                LOG(`[videoLesson] Intercepted "${vl.title || lessonId}" (duration: ${formatSeconds(dur)}, ${questions.length} in-video question(s))`);
+                VLOG('videoLesson intercepted', { lessonId, dur, questions, preQuestions });
+            }
+        }
+
+        // 2. In-video question response
+        if (d.answerInVideoQuestion) {
+            const ai = d.answerInVideoQuestion;
+            const q = ai.question;
+            const responses = Array.isArray(ai.responses) ? ai.responses : [];
+            // A question is completed when:
+            // - All response items are marked correct, OR
+            // - MarkedQuestion solution/explanation is returned (final attempt completed), OR
+            // - Direct mock/test response without responses array has question.id / question.quizContent
+            const allCorrect = responses.length > 0 && responses.every((r) => r && r.correct);
+            const hasMarkedSolution = Boolean(
+                q && q.quizContent && (q.quizContent.quizDefinition || q.quizContent.explanation)
+            );
+            const isDirectMock = Boolean(
+                (!ai.responses || responses.length === 0) && q && (q.id || q.quizContent)
+            );
+            const isCompleted = allCorrect || hasMarkedSolution || isDirectMock;
+
+            if (currentVideoLesson && isCompleted) {
+                let targetId = null;
+                if (q && q.id) {
+                    targetId = String(q.id);
+                } else if (q && q.quizContent && q.quizContent.id) {
+                    targetId = String(q.quizContent.id);
+                } else if (lastSubmittedInVideoQuestionId) {
+                    targetId = lastSubmittedInVideoQuestionId;
+                }
+
+                if (targetId) {
+                    currentVideoLesson.answeredQuestionIds.add(targetId);
+                    const matchedQ = currentVideoLesson.questions.find(
+                        (item) => item.id === targetId || item.quizContentId === targetId
+                    );
+                    if (matchedQ) {
+                        if (matchedQ.id) currentVideoLesson.answeredQuestionIds.add(matchedQ.id);
+                        if (matchedQ.quizContentId) currentVideoLesson.answeredQuestionIds.add(matchedQ.quizContentId);
+                    }
+                    VLOG('in-video question marked answered', targetId);
+                } else {
+                    // Fallback: mark the earliest unanswered question near current playback time
+                    const video = findActiveVideoElement();
+                    const curT = video ? (video.currentTime || 0) : 0;
+                    const candidate = currentVideoLesson.questions.find(
+                        (item) => !isQuestionAnswered(item) && item.triggerTime != null && item.triggerTime <= curT + 2.5
+                    ) || currentVideoLesson.questions.find((item) => !isQuestionAnswered(item));
+                    if (candidate) {
+                        if (candidate.id) currentVideoLesson.answeredQuestionIds.add(candidate.id);
+                        if (candidate.quizContentId) currentVideoLesson.answeredQuestionIds.add(candidate.quizContentId);
+                        VLOG('in-video question marked answered via timeline fallback', candidate.id);
+                    }
+                }
+                lastQuestionAnsweredAt = Date.now();
+                waitingForPostAnswerResume = true;
+                lastSubmittedInVideoQuestionId = null;
+            }
+        }
+
+        // 3. Pre-video question response
+        if (d.answerPreVideoQuestion) {
+            const ap = d.answerPreVideoQuestion;
+            const pq = ap.question;
+            let preId = (pq && pq.id) ? String(pq.id) : lastSubmittedPreVideoQuestionId;
+            if (currentVideoLesson) {
+                if (preId) {
+                    currentVideoLesson.answeredPreQuestionIds.add(preId);
+                } else if (Array.isArray(currentVideoLesson.preQuestions)) {
+                    const nextPre = currentVideoLesson.preQuestions.find((id) => !currentVideoLesson.answeredPreQuestionIds.has(id));
+                    if (nextPre) currentVideoLesson.answeredPreQuestionIds.add(nextPre);
+                }
+            }
+            lastSubmittedPreVideoQuestionId = null;
+        }
+    }
+
+    function findActiveVideoElement() {
+        try {
+            // 1. Standard HTML5 video elements in main document
+            const videos = document.querySelectorAll('video');
+            for (let i = 0; i < videos.length; i++) {
+                const v = videos[i];
+                if (v && v.isConnected && (v.offsetWidth > 0 || v.offsetHeight > 0 || (isFinite(v.duration) && v.duration > 0))) {
+                    return v;
+                }
+            }
+            if (videos.length > 0 && videos[0].isConnected) return videos[0];
+
+            // 2. Mux player custom elements
+            const muxPlayers = document.querySelectorAll('mux-player');
+            for (let i = 0; i < muxPlayers.length; i++) {
+                const mp = muxPlayers[i];
+                if (mp.shadowRoot) {
+                    const sv = mp.shadowRoot.querySelector('video');
+                    if (sv && sv.isConnected) return sv;
+                }
+                if (typeof mp.currentTime === 'number') return mp;
+            }
+
+            // 3. Wistia player custom elements or embed containers
+            const wistiaPlayers = document.querySelectorAll('wistia-player, .wistia_embed');
+            for (let i = 0; i < wistiaPlayers.length; i++) {
+                const wp = wistiaPlayers[i];
+                if (wp.shadowRoot) {
+                    const sv = wp.shadowRoot.querySelector('video');
+                    if (sv && sv.isConnected) return sv;
+                }
+                const inner = wp.querySelector('video');
+                if (inner && inner.isConnected) return inner;
+            }
+        } catch (e) {
+            WARN('findActiveVideoElement error', e);
+        }
+        return null;
+    }
+
+    function isElementVisible(el) {
+        if (!el || !el.isConnected) return false;
+        if (el.offsetParent !== null && el.offsetParent !== undefined) return true;
+        if ((el.offsetWidth > 0) || (el.offsetHeight > 0)) return true;
+        if (typeof el.getClientRects === 'function') {
+            try {
+                const rects = el.getClientRects();
+                if (rects && rects.length > 0) return true;
+            } catch {}
+        }
+        return false;
+    }
+
+    function isQuestionActiveOnPage() {
+        try {
+            const host = typeof document.getElementById === 'function'
+                ? document.getElementById('__ul-heroui-host')
+                : null;
+
+            const submitBtn = findSubmitButton();
+            if (submitBtn && isElementVisible(submitBtn)) {
+                if (!host || !host.contains || !host.contains(submitBtn)) {
+                    return true;
+                }
+            }
+
+            if (typeof document.querySelectorAll === 'function') {
+                // Check visible quiz action buttons (Submit, Check, Continue, Resume, Try Again)
+                const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+                for (let i = 0; i < buttons.length; i++) {
+                    const btn = buttons[i];
+                    if (!isElementVisible(btn)) continue;
+                    if (host && typeof host.contains === 'function' && host.contains(btn)) continue;
+                    const txt = (btn.innerText || btn.textContent || btn.value || '').trim().toLowerCase();
+                    if (
+                        txt === 'submit' ||
+                        txt === 'submit answer' ||
+                        txt === 'check' ||
+                        txt === 'check answer' ||
+                        txt === 'continue' ||
+                        txt === 'continue video' ||
+                        txt === 'resume' ||
+                        txt === 'resume video' ||
+                        txt === 'try again' ||
+                        txt === 'next' ||
+                        txt === 'next question'
+                    ) {
+                        return true;
+                    }
+                }
+
+                // Check visible quiz option inputs
+                const inputs = document.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+                for (let i = 0; i < inputs.length; i++) {
+                    const inp = inputs[i];
+                    if (!isElementVisible(inp)) continue;
+                    if (host && typeof host.contains === 'function' && host.contains(inp)) continue;
+                    return true;
+                }
+
+                // Check question modals / overlays
+                const modals = document.querySelectorAll('[role="dialog"], .quiz-content, [data-testid*="question"]');
+                for (let i = 0; i < modals.length; i++) {
+                    const m = modals[i];
+                    if (!isElementVisible(m)) continue;
+                    if (host && typeof host.contains === 'function' && host.contains(m)) continue;
+                    return true;
+                }
+            } else if (typeof document.querySelector === 'function') {
+                const activeModal = document.querySelector('[role="dialog"], .quiz-content, [data-testid*="question"]');
+                if (activeModal && isElementVisible(activeModal)) {
+                    return true;
+                }
+            }
+        } catch {}
+        return false;
+    }
+
+    function checkAndAutoSkipVideo(force = false) {
+        if (!settings.autoSkipVideoEnabled && !force) return;
+        if (autoSkipThrottled && !force) return;
+
+        const video = findActiveVideoElement();
+        if (!video || !video.isConnected || video.ended) return;
+
+        if (video !== lastActiveVideoElement) {
+            lastActiveVideoElement = video;
+            videoDetectedTimestamp = Date.now();
+            lastSkippedTarget = null;
+        }
+
+        // In real browser playback, wait if video is mid-seek or hasn't loaded metadata yet
+        if (!force && (video.seeking || (typeof video.readyState === 'number' && video.readyState < 1))) {
+            return;
+        }
+
+        const duration = (isFinite(video.duration) && video.duration > 0)
+            ? video.duration
+            : (currentVideoLesson?.duration || 0);
+
+        if (duration > 0 && currentVideoLesson && currentVideoLesson.duration <= 0) {
+            currentVideoLesson.duration = duration;
+            if (currentVideoLesson.id) {
+                knownLessonDurations.set(currentVideoLesson.id, duration);
+            }
+        }
+
+        // If an in-video question or feedback overlay is active on screen, wait for user to answer & click Continue
+        if (isQuestionActiveOnPage()) {
+            return;
+        }
+
+        // If a question was just answered, wait until the user clicks Continue and the video resumes playing
+        if (!force && waitingForPostAnswerResume) {
+            if (video.paused || (Date.now() - lastQuestionAnsweredAt < 1500)) {
+                return;
+            }
+            waitingForPostAnswerResume = false;
+        }
+
+        // In automatic mode, verify that GetVideoLesson metadata has arrived and matches the current lesson URL
+        if (!force) {
+            if (!currentVideoLesson) {
+                return;
+            }
+            if (
+                currentVideoLesson.uniqueCode &&
+                typeof location !== 'undefined' &&
+                location.pathname &&
+                location.pathname.length > 1 &&
+                !location.pathname.includes(currentVideoLesson.uniqueCode)
+            ) {
+                return;
+            }
+        }
+
+        const currentTime = video.currentTime || 0;
+
+        // 1. Check for unanswered in-video questions (NEVER auto-mark questions answered by playback time!)
+        if (currentVideoLesson && Array.isArray(currentVideoLesson.questions) && currentVideoLesson.questions.length > 0) {
+            const unansweredQuestions = currentVideoLesson.questions.filter((q) => !isQuestionAnswered(q));
+
+            if (unansweredQuestions.length > 0) {
+                const nextQ = unansweredQuestions[0];
+                if (nextQ.triggerTime == null || !isFinite(nextQ.triggerTime)) {
+                    // Question exists with unknown triggerTime -> never skip to end while unanswered
+                    return;
+                }
+
+                const dist = nextQ.triggerTime - currentTime;
+                const leadOffset = force ? 0.1 : 1.5;
+                const approachWindow = force ? 0.4 : 2.5;
+
+                if (dist > approachWindow) {
+                    // Video is before the question's approach window -> seek forward to just before triggerTime
+                    const target = Math.max(0, nextQ.triggerTime - leadOffset);
+                    if (Math.abs(currentTime - target) > 0.3 && (lastSkippedTarget !== nextQ.triggerTime || dist > 4.0)) {
+                        lastSkippedTarget = nextQ.triggerTime;
+                        autoSkipThrottled = true;
+                        setTimeout(() => { autoSkipThrottled = false; }, 1500);
+
+                        LOG(`[autoSkip] Skipping video to question at ${formatSeconds(nextQ.triggerTime)}`);
+                        nativeConsole.log(`[UpLearn Video] Auto-skipping video from ${formatSeconds(currentTime)} to question at ${formatSeconds(nextQ.triggerTime)}`);
+                        try {
+                            video.currentTime = target;
+                            video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
+                            stats.videosSkipped = (stats.videosSkipped || 0) + 1;
+                            if (video.paused && typeof video.play === 'function') {
+                                video.play().catch(() => {});
+                            }
+                        } catch (e) {
+                            WARN('autoSkip seek failed', e);
+                        }
+                    }
+                    // NEVER fall through to video completion while unanswered questions remain!
+                    return;
+                } else if (dist > 0) {
+                    // Video is in the approach window [triggerTime - approachWindow, triggerTime):
+                    // Let it play naturally across triggerTime so UpLearn's player triggers the question modal!
+                    if (video.paused && typeof video.play === 'function') {
+                        try { video.play().catch(() => {}); } catch {}
+                    }
+                    // NEVER fall through to video completion while unanswered questions remain!
+                    return;
+                } else if (dist >= -1.5) {
+                    // Video has reached or just crossed triggerTime -> ensure timeupdate fires and pause/wait
+                    if (!video.paused && typeof video.pause === 'function') {
+                        try {
+                            video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
+                            video.pause();
+                        } catch {}
+                    }
+                    // NEVER fall through to video completion while unanswered questions remain!
+                    return;
+                } else {
+                    // Video somehow drifted past an unanswered question -> rewind back so UpLearn triggers it
+                    const target = Math.max(0, nextQ.triggerTime - leadOffset);
+                    if (lastSkippedTarget !== `rewind-${nextQ.triggerTime}`) {
+                        lastSkippedTarget = `rewind-${nextQ.triggerTime}`;
+                        autoSkipThrottled = true;
+                        setTimeout(() => { autoSkipThrottled = false; }, 1500);
+
+                        LOG(`[autoSkip] Rewinding video to unanswered question at ${formatSeconds(nextQ.triggerTime)}`);
+                        try {
+                            video.currentTime = target;
+                            video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
+                            if (force && !video.paused && typeof video.pause === 'function') {
+                                video.pause();
+                            } else if (!force && video.paused && typeof video.play === 'function') {
+                                video.play().catch(() => {});
+                            }
+                        } catch (e) {}
+                    }
+                    // NEVER fall through to video completion while unanswered questions remain!
+                    return;
+                }
+            }
+        }
+
+        // Extra guard: if GetVideoLesson reported questions, never skip to completion until all are answered
+        if (
+            currentVideoLesson &&
+            currentVideoLesson.totalExpectedQuestions > 0 &&
+            currentVideoLesson.answeredQuestionIds.size < currentVideoLesson.totalExpectedQuestions
+        ) {
+            return;
+        }
+
+        // 2. If pre-video questions exist and are unanswered before video start, wait
+        if (hasUnansweredPreQuestions() && currentTime < 1.0) {
+            return;
+        }
+
+        // 3. All questions are answered (or video has 0 questions) -> auto skip to video completion
+        if (duration > 1 && currentTime < duration - 0.8) {
+            const target = Math.max(0, duration - 0.3);
+            if (lastSkippedTarget !== 'end' && Math.abs(currentTime - target) > 0.5) {
+                lastSkippedTarget = 'end';
+                autoSkipThrottled = true;
+                setTimeout(() => { autoSkipThrottled = false; }, 1500);
+
+                LOG(`[autoSkip] No remaining questions; skipping to video completion (${formatSeconds(duration)})`);
+                nativeConsole.log(`[UpLearn Video] Auto-skipping video from ${formatSeconds(currentTime)} to completion (${formatSeconds(duration)})`);
+                try {
+                    video.currentTime = target;
+                    video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
+                    stats.videosSkipped = (stats.videosSkipped || 0) + 1;
+                    if (video.paused && typeof video.play === 'function') {
+                        video.play().catch(() => {});
+                    }
+                    setTimeout(() => {
+                        try {
+                            if (video.currentTime >= duration - 0.5 && !isQuestionActiveOnPage()) {
+                                video.dispatchEvent(new Event('ended', { bubbles: true }));
+                            }
+                        } catch {}
+                    }, 800);
+                } catch (e) {
+                    WARN('autoSkip completion seek failed', e);
+                }
+            }
+        }
+    }
+
+    function initVideoAutoSkipController() {
+        try {
+            setInterval(() => {
+                if (settings.autoSkipVideoEnabled) {
+                    checkAndAutoSkipVideo();
+                }
+            }, 600);
+        } catch (e) {
+            WARN('initVideoAutoSkipController failed', e);
+        }
     }
 
     /* ------------------------------------------------------------
@@ -1247,14 +1832,16 @@
      * Body Rewriting & Network Injection
      * ------------------------------------------------------------ */
     function maybeBumpTimeSpent(body, source) {
-        const boostActive = settings.timeBoostEnabled || queuedSeconds !== null;
-        const videoActive = settings.fullVideoWatchedEnabled;
-        if (!boostActive && !videoActive) return { body, changed: false };
-        if (typeof body !== 'string')    return { body, changed: false };
+        if (typeof body !== 'string') return { body, changed: false };
+        inspectOutgoingGraphQL(body);
 
-        const hasQuiz  = boostActive && body.includes(QUIZ_OP);
+        const boostActive = settings.timeBoostEnabled || queuedSeconds !== null;
+        const videoActive = settings.fullVideoWatchedEnabled || settings.addVideoDurationToTimeSpent;
+        if (!boostActive && !videoActive) return { body, changed: false };
+
+        const hasQuiz  = boostActive && (body.includes(QUIZ_OP) || body.includes('AnswerInVideoQuestion') || body.includes('AnswerPreVideoQuestion'));
         const hasGroup = boostActive && body.includes(GROUP_OP);
-        const hasVideo = videoActive && body.includes(VIDEO_OP);
+        const hasVideo = (videoActive || boostActive) && body.includes(VIDEO_OP);
         if (!hasQuiz && !hasGroup && !hasVideo) return { body, changed: false };
 
         let json;
@@ -1272,21 +1859,84 @@
                 (typeof obj.query === 'string' && obj.query.includes(VIDEO_OP)) ||
                 (typeof obj.mutation === 'string' && obj.mutation.includes(VIDEO_OP));
 
-            if (videoActive && isVideo) {
-                const beforePercent = obj.variables.percentWatched;
-                const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
-                obj.variables.percentWatched = targetPercent;
-                stats.seen++;
-                stats.videosMaxed = (stats.videosMaxed || 0) + 1;
-                changed = true;
+            if (isVideo) {
+                let videoTouched = false;
+                const lessonId = String(obj.variables.lessonId || '');
 
-                LOG(`[${source}] ${VIDEO_OP}: percentWatched ${beforePercent} → ${targetPercent} (lessonId: ${obj.variables.lessonId || 'unknown'})`);
-                nativeConsole.log(
-                    `[UpLearn Video] ${VIDEO_OP} lessonId=${obj.variables.lessonId || 'unknown'} original percentWatched=${beforePercent} → ${targetPercent}`
-                );
+                // 1. Force 100% full watched
+                if (settings.fullVideoWatchedEnabled) {
+                    const beforePercent = obj.variables.percentWatched;
+                    const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
+                    if (beforePercent !== targetPercent) {
+                        obj.variables.percentWatched = targetPercent;
+                        stats.videosMaxed = (stats.videosMaxed || 0) + 1;
+                        videoTouched = true;
+                        changed = true;
+
+                        LOG(`[${source}] ${VIDEO_OP}: percentWatched ${beforePercent} → ${targetPercent} (lessonId: ${lessonId || 'unknown'})`);
+                        nativeConsole.log(
+                            `[UpLearn Video] ${VIDEO_OP} lessonId=${lessonId || 'unknown'} original percentWatched=${beforePercent} → ${targetPercent}`
+                        );
+                    }
+                }
+
+                // 2. Add video duration to timeSpent
+                let vidDuration = 0;
+                if (lessonId && knownLessonDurations.has(lessonId)) {
+                    vidDuration = knownLessonDurations.get(lessonId);
+                }
+                if (vidDuration <= 0 && currentVideoLesson && (currentVideoLesson.id === lessonId || !lessonId)) {
+                    vidDuration = currentVideoLesson.duration || 0;
+                }
+                if (vidDuration <= 0) {
+                    const activeVid = findActiveVideoElement();
+                    if (activeVid && isFinite(activeVid.duration) && activeVid.duration > 0) {
+                        vidDuration = Math.round(activeVid.duration);
+                    }
+                }
+                if (vidDuration <= 0 && currentVideoLesson && currentVideoLesson.duration > 0) {
+                    vidDuration = currentVideoLesson.duration;
+                }
+
+                const rawTimeSpent = obj.variables.timeSpent;
+                const origTimeSpent = Number(rawTimeSpent) || 0;
+                let extraTime = 0;
+
+                if (settings.addVideoDurationToTimeSpent && vidDuration > 0) {
+                    extraTime += vidDuration;
+                }
+
+                if (queuedSeconds !== null) {
+                    if (settings.manualTimeStacksWithAuto && settings.timeBoostEnabled) {
+                        extraTime += queuedSeconds + pickExtraSeconds();
+                    } else {
+                        extraTime += queuedSeconds;
+                    }
+                    manualResetNeeded = true;
+                }
+
+                if (extraTime > 0) {
+                    const newTimeSpent = round3(origTimeSpent + extraTime);
+                    obj.variables.timeSpent = (typeof rawTimeSpent === 'string') ? String(newTimeSpent) : newTimeSpent;
+                    if (settings.addVideoDurationToTimeSpent && vidDuration > 0) {
+                        stats.videoTimeAdded = (stats.videoTimeAdded || 0) + vidDuration;
+                    }
+                    videoTouched = true;
+                    changed = true;
+
+                    LOG(`[${source}] ${VIDEO_OP}: timeSpent ${rawTimeSpent} (+${formatSeconds(extraTime)}) → ${obj.variables.timeSpent} (lessonId: ${lessonId || 'unknown'})`);
+                    nativeConsole.log(
+                        `[UpLearn Video] ${VIDEO_OP} lessonId=${lessonId || 'unknown'} original timeSpent=${rawTimeSpent} (+${formatSeconds(extraTime)}) → ${obj.variables.timeSpent}`
+                    );
+                }
+
+                if (videoTouched) {
+                    stats.seen++;
+                }
             }
 
-            if (boostActive && opName === QUIZ_OP && typeof obj.variables.timeSpent === 'string') {
+            const isQuizOp = opName === QUIZ_OP || opName === 'AnswerInVideoQuestion' || opName === 'AnswerPreVideoQuestion';
+            if (boostActive && isQuizOp && typeof obj.variables.timeSpent === 'string') {
                 const total = parseDurationToSeconds(obj.variables.timeSpent);
                 if (total === null) return;
                 const before = obj.variables.timeSpent;
@@ -1379,11 +2029,13 @@
     if (origFetch) {
         window.fetch = function (input, init) {
             const self = this;
+            let url = '';
+            let method = 'GET';
             try {
-                const url = typeof input === 'string' ? input
+                url = typeof input === 'string' ? input
                           : (input && input.url) ? input.url
-                          : String(input);
-                const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+                          : String(input || '');
+                method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
 
                 // ---- Telemetry block ----
                 if (isTelemetryUrl(url)) {
@@ -1398,14 +2050,14 @@
                         } else {
                             reportBlock('fetch', url, { method, body: capturedBody });
                         }
-                        return new Response('', {
+                        return new Response('{}', {
                             status: 200, statusText: 'OK',
                             headers: { 'Content-Type': 'application/json' },
                         });
                     };
 
                     let bodyStr = init && typeof init.body === 'string' ? init.body : null;
-                    if (bodyStr == null && input instanceof Request) {
+                    if (bodyStr == null && typeof Request !== 'undefined' && input instanceof Request) {
                         try {
                             const ct = (input.headers.get('content-type') || '').toLowerCase();
                             if (ct.includes('application/json') || ct.includes('text/')) {
@@ -1424,7 +2076,7 @@
                         return origFetch.call(self, input, init);
                     };
                     let bodyStr = init && typeof init.body === 'string' ? init.body : null;
-                    if (bodyStr == null && input instanceof Request) {
+                    if (bodyStr == null && typeof Request !== 'undefined' && input instanceof Request) {
                         try {
                             const ct = (input.headers.get('content-type') || '').toLowerCase();
                             if (ct.includes('application/json') || ct.includes('text/')) {
@@ -1446,7 +2098,7 @@
                     stats.apiPosts++;
                     let body = init && typeof init.body === 'string' ? init.body : null;
 
-                    if (body == null && input instanceof Request) {
+                    if (body == null && typeof Request !== 'undefined' && input instanceof Request) {
                         const ct = (input.headers.get('content-type') || '').toLowerCase();
                         if (ct.includes('application/json')) {
                             const passInit = init;
@@ -1461,7 +2113,17 @@
                                     body: changed ? newBody : text,
                                     method: input.method
                                 });
-                                return origFetch.call(self, newReq, passInit);
+                                const fetchPromise = origFetch.call(self, newReq, passInit);
+                                if (isTargetApi(url)) {
+                                    fetchPromise.then((res) => {
+                                        try {
+                                            if (res && res.ok && typeof res.clone === 'function') {
+                                                res.clone().json().then(handleApiResponse).catch(() => {});
+                                            }
+                                        } catch {}
+                                    }).catch(() => {});
+                                }
+                                return fetchPromise;
                             });
                         }
                     }
@@ -1483,7 +2145,17 @@
                 WARN('fetch interceptor error:', e);
             }
 
-            return origFetch.call(self, input, init);
+            const fetchPromise = origFetch.call(self, input, init);
+            if (isTargetApi(url)) {
+                fetchPromise.then((res) => {
+                    try {
+                        if (res && res.ok && typeof res.clone === 'function') {
+                            res.clone().json().then(handleApiResponse).catch(() => {});
+                        }
+                    } catch {}
+                }).catch(() => {});
+            }
+            return fetchPromise;
         };
         VLOG('fetch hook installed');
     }
@@ -1597,6 +2269,14 @@
                         const { body: newBody, changed } = maybeBumpTimeSpent(body, 'xhr');
                         if (changed) body = newBody;
                     }
+
+                    this.addEventListener('load', function () {
+                        try {
+                            if (this.responseText) {
+                                handleApiResponse(JSON.parse(this.responseText));
+                            }
+                        } catch {}
+                    });
                 }
             } catch (e) {
                 WARN('xhr interceptor error:', e);
@@ -1659,19 +2339,19 @@
     }
 
     // ============================================================
-    // VISIBILITY / FOCUS SPOOFING
+    // VISIBILITY / FOCUS / ANTI-BLUR SPOOFING
     // ============================================================
     const ORIG_VIS = (() => {
         try {
-            const d = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState')
-                   || Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'visibilityState');
+            const d = (typeof Document !== 'undefined' && Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState'))
+                   || (typeof HTMLDocument !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'visibilityState'));
             return d && d.get ? d.get : null;
         } catch { return null; }
     })();
     const ORIG_HIDDEN = (() => {
         try {
-            const d = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden')
-                   || Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'hidden');
+            const d = (typeof Document !== 'undefined' && Object.getOwnPropertyDescriptor(Document.prototype, 'hidden'))
+                   || (typeof HTMLDocument !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'hidden'));
             return d && d.get ? d.get : null;
         } catch { return null; }
     })();
@@ -1679,25 +2359,31 @@
 
     function patchVisibilityProps() {
         try {
-            Object.defineProperty(document, 'visibilityState', {
+            const visDesc = {
                 get: () => settings.spoofVisibility ? 'visible'
                                                     : (ORIG_VIS ? ORIG_VIS.call(document) : 'visible'),
                 configurable: true
-            });
-            Object.defineProperty(document, 'webkitVisibilityState', {
-                get: () => settings.spoofVisibility ? 'visible'
-                                                    : (ORIG_VIS ? ORIG_VIS.call(document) : 'visible'),
-                configurable: true
-            });
-            Object.defineProperty(document, 'hidden', {
+            };
+            const hiddenDesc = {
                 get: () => settings.spoofVisibility ? false
                                                     : (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : false),
                 configurable: true
+            };
+            ['visibilityState', 'webkitVisibilityState', 'mozVisibilityState', 'msVisibilityState'].forEach((prop) => {
+                try { Object.defineProperty(document, prop, visDesc); } catch {}
+                try {
+                    if (typeof Document !== 'undefined' && Document.prototype) {
+                        Object.defineProperty(Document.prototype, prop, visDesc);
+                    }
+                } catch {}
             });
-            Object.defineProperty(document, 'webkitHidden', {
-                get: () => settings.spoofVisibility ? false
-                                                    : (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : false),
-                configurable: true
+            ['hidden', 'webkitHidden', 'mozHidden', 'msHidden'].forEach((prop) => {
+                try { Object.defineProperty(document, prop, hiddenDesc); } catch {}
+                try {
+                    if (typeof Document !== 'undefined' && Document.prototype) {
+                        Object.defineProperty(Document.prototype, prop, hiddenDesc);
+                    }
+                } catch {}
             });
         } catch (e) { WARN('visibility patch failed', e); }
     }
@@ -1705,21 +2391,68 @@
 
     function installHasFocusPatch() {
         try {
-            document.hasFocus = function () {
+            const focusFn = function () {
                 return settings.spoofVisibility ? true : ORIG_HAS_FOCUS();
             };
+            document.hasFocus = focusFn;
+            if (typeof Document !== 'undefined' && Document.prototype) {
+                Document.prototype.hasFocus = focusFn;
+            }
         } catch {}
     }
     installHasFocusPatch();
     VLOG('visibility/focus spoofing installed (live-toggleable)');
 
     const SUPPRESSED_EVENTS = new Set([
-        'visibilitychange', 'webkitvisibilitychange', 'blur', 'focusout', 'pagehide'
+        'visibilitychange', 'webkitvisibilitychange', 'mozvisibilitychange', 'msvisibilitychange',
+        'blur', 'pagehide', 'freeze', 'resume'
     ]);
+
+    const origWinAdd = window.addEventListener ? window.addEventListener.bind(window) : null;
+    const origDocAdd = document.addEventListener ? document.addEventListener.bind(document) : null;
+    const origProtoAdd = (typeof EventTarget !== 'undefined' && EventTarget.prototype && EventTarget.prototype.addEventListener)
+        ? EventTarget.prototype.addEventListener
+        : null;
+
+    const __ul_seenKilled = new Set();
+    const KILL = (e) => {
+        if (!settings.spoofVisibility) return;
+        if (e.type === 'blur' || e.type === 'focusout') {
+            if (
+                e.target &&
+                e.target !== window &&
+                e.target !== document &&
+                e.target !== document.documentElement &&
+                e.target !== document.body &&
+                ORIG_HAS_FOCUS()
+            ) {
+                return;
+            }
+        }
+        if (settings.logLevel === 'verbose' && !__ul_seenKilled.has(e.type)) {
+            __ul_seenKilled.add(e.type);
+            VLOG(`intercepted "${e.type}" event (further ${e.type}s will be silenced from logs)`);
+        }
+        if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+        if (typeof e.stopPropagation === 'function') e.stopPropagation();
+    };
+
+    // Register capture-phase KILL listeners BEFORE wrapping addEventListener so they are never blocked by our own wrapper
+    ['visibilitychange', 'webkitvisibilitychange', 'mozvisibilitychange', 'msvisibilitychange', 'blur', 'focusout', 'pagehide', 'freeze'].forEach((evt) => {
+        try {
+            if (origWinAdd) origWinAdd(evt, KILL, true);
+            else if (origProtoAdd) origProtoAdd.call(window, evt, KILL, true);
+        } catch {}
+        try {
+            if (origDocAdd) origDocAdd(evt, KILL, true);
+            else if (origProtoAdd) origProtoAdd.call(document, evt, KILL, true);
+        } catch {}
+    });
 
     function wrapAddEventListener(target) {
         const targetName = target === window ? 'window' : 'document';
         const origAdd = target.addEventListener;
+        if (!origAdd) return;
         target.addEventListener = function (type, listener, options) {
             if (settings.spoofVisibility && SUPPRESSED_EVENTS.has(type)) {
                 VLOG(`suppressed "${type}" listener registration on ${targetName}`);
@@ -1732,56 +2465,54 @@
     wrapAddEventListener(document);
 
     try {
-        const origProtoAdd = EventTarget.prototype.addEventListener;
-        EventTarget.prototype.addEventListener = function (type, listener, options) {
-            if (settings.spoofVisibility &&
-                (this === window || this === document) &&
-                SUPPRESSED_EVENTS.has(type)) {
-                VLOG(`suppressed "${type}" listener via EventTarget prototype`);
-                return;
-            }
-            return origProtoAdd.call(this, type, listener, options);
-        };
+        if (origProtoAdd) {
+            EventTarget.prototype.addEventListener = function (type, listener, options) {
+                if (settings.spoofVisibility &&
+                    (this === window || this === document) &&
+                    SUPPRESSED_EVENTS.has(type)) {
+                    VLOG(`suppressed "${type}" listener via EventTarget prototype`);
+                    return;
+                }
+                return origProtoAdd.call(this, type, listener, options);
+            };
+        }
     } catch {}
 
-    ['onblur', 'onfocusout', 'onpagehide', 'onvisibilitychange'].forEach((prop) => {
+    function findPropertyDescriptor(obj, prop) {
+        let cur = obj;
+        while (cur) {
+            try {
+                const d = Object.getOwnPropertyDescriptor(cur, prop);
+                if (d) return d;
+            } catch {}
+            try { cur = Object.getPrototypeOf(cur); } catch { break; }
+        }
+        return null;
+    }
+
+    ['onpagehide', 'onvisibilitychange', 'onblur', 'onfocusout'].forEach((prop) => {
         [window, document].forEach((target) => {
             try {
-                const desc = Object.getOwnPropertyDescriptor(target, prop);
-                if (!desc) return;
+                const desc = findPropertyDescriptor(target, prop);
+                let fallbackVal = null;
                 Object.defineProperty(target, prop, {
                     get() {
                         if (settings.spoofVisibility) return null;
-                        return desc.get ? desc.get.call(this) : null;
+                        if (desc && desc.get) return desc.get.call(this);
+                        return fallbackVal;
                     },
                     set(v) {
                         if (settings.spoofVisibility) {
                             VLOG(`suppressed assignment to "${prop}"`);
                             return;
                         }
-                        if (desc.set) desc.set.call(this, v);
+                        if (desc && desc.set) desc.set.call(this, v);
+                        else fallbackVal = v;
                     },
                     configurable: true,
                 });
             } catch {}
         });
-    });
-
-    const __ul_seenKilled = new Set();
-    const KILL = (e) => {
-        if (!settings.spoofVisibility) return;
-        if (settings.logLevel === 'verbose' && !__ul_seenKilled.has(e.type)) {
-            __ul_seenKilled.add(e.type);
-            VLOG(`intercepted "${e.type}" event (further ${e.type}s will be silenced from logs)`);
-        }
-        e.stopImmediatePropagation();
-        e.stopPropagation();
-    };
-    ['visibilitychange', 'webkitvisibilitychange', 'blur', 'focusout', 'pagehide'].forEach((evt) => {
-        try {
-            EventTarget.prototype.addEventListener.call(window,   evt, KILL, true);
-            EventTarget.prototype.addEventListener.call(document, evt, KILL, true);
-        } catch {}
     });
 
     setInterval(() => {
@@ -3603,13 +4334,28 @@
             }
             saveSettings();
             LOG('telemetry preset:', value);
-            if (reactSetSettings) reactSetSettings(Object.assign({}, settings));
+            if (reactSetSettings) reactSetSettings(cloneSettings(settings));
+            return;
+        }
+
+        if (key === 'telemetryServices') {
+            settings.telemetryServices = Object.assign({}, value);
+            if (typeof settings.telemetryServices.jitsu === 'boolean') {
+                settings.suppressJitsu = settings.telemetryServices.jitsu;
+            }
+            settings.telemetryPreset = 'custom';
+            saveSettings();
+            if (reactSetSettings) reactSetSettings(cloneSettings(settings));
             return;
         }
 
         if (settings[key] === value) return;
 
         settings[key] = value;
+
+        if (key === 'suppressJitsu' && settings.telemetryServices) {
+            settings.telemetryServices.jitsu = !!value;
+        }
 
         if (key === 'extraSecondsMin' || key === 'extraSecondsMax') {
             normalizeRange(settings);
@@ -3634,6 +4380,12 @@
             case 'fullVideoWatchedEnabled':
                 LOG('full video watch toggle (percentWatched=1) ' + (value ? 'ENABLED' : 'DISABLED'));
                 break;
+            case 'autoSkipVideoEnabled':
+                LOG('auto-skip video to questions / completion ' + (value ? 'ENABLED' : 'DISABLED'));
+                break;
+            case 'addVideoDurationToTimeSpent':
+                LOG('add full video duration to timeSpent ' + (value ? 'ENABLED' : 'DISABLED'));
+                break;
             case 'suppressJitsu':
                 LOG('Jitsu telemetry ' + (value ? 'SUPPRESSED (blocked + logged)' : 'ALLOWED (passed through + logged)'));
                 break;
@@ -3649,7 +4401,7 @@
                 break;
         }
 
-        if (reactSetSettings) reactSetSettings(Object.assign({}, settings));
+        if (reactSetSettings) reactSetSettings(cloneSettings(settings));
     }
 
     function openSettingsModal() {
@@ -3666,7 +4418,7 @@
     }
 
     function syncModalIfOpen() {
-        if (reactSetSettings) reactSetSettings(Object.assign({}, settings));
+        if (reactSetSettings) reactSetSettings(cloneSettings(settings));
     }
 
     // ============================================================
@@ -3758,7 +4510,7 @@
     });
 
     const ButtonGroup = ({ orientation = 'horizontal', fullWidth = false, size = 'md', className = '', children }) => html`
-        <div
+        <div 
             className=${`button-group button-group--${orientation} ${fullWidth ? 'button-group--full-width' : ''} ${className}`}
             role="group"
             data-slot="button-group"
@@ -3774,7 +4526,7 @@
         return children;
     };
     Modal.Backdrop = ({ isClosing, onClose, children }) => html`
-        <div
+        <div 
             id="__ul-settings-overlay"
             className=${`modal__backdrop modal__backdrop--blur ${isClosing ? 'modal__backdrop--closing' : ''}`}
             onClick=${(e) => {
@@ -3788,9 +4540,9 @@
         <div className="modal__container" data-placement="center">${children}</div>
     `;
     Modal.Dialog = ({ children }) => html`
-        <div
-            className="modal__dialog modal__dialog--lg modal__dialog--scroll-inside"
-            role="dialog"
+        <div 
+            className="modal__dialog modal__dialog--lg modal__dialog--scroll-inside" 
+            role="dialog" 
             aria-modal="true"
             onClick=${(e) => e.stopPropagation()}
         >
@@ -3802,13 +4554,13 @@
     Modal.Icon = ({ children }) => html`<div className="modal__icon">${children}</div>`;
     Modal.Heading = ({ children }) => html`<div className="modal__title-box"><h2 className="modal__heading">${children}</h2></div>`;
     Modal.CloseTrigger = ({ onPress }) => html`
-        <${Button}
-            type="button"
-            variant="ghost"
-            size="sm"
-            isIconOnly
-            className="modal__close-trigger"
-            onPress=${onPress}
+        <${Button} 
+            type="button" 
+            variant="ghost" 
+            size="sm" 
+            isIconOnly 
+            className="modal__close-trigger" 
+            onPress=${onPress} 
             title="Close (Esc)"
             aria-label="Close modal"
         >
@@ -3826,11 +4578,11 @@
     Tabs.ListContainer = ({ children }) => html`<div className="tabs__list-container">${children}</div>`;
     Tabs.List = ({ innerRef, children }) => html`<div className="tabs__list" role="tablist" ref=${innerRef}>${children}</div>`;
     Tabs.Tab = ({ id, isSelected, onPress, innerRef, children }) => html`
-        <button
-            type="button"
-            className="tabs__tab"
-            role="tab"
-            data-tab=${id}
+        <button 
+            type="button" 
+            className="tabs__tab" 
+            role="tab" 
+            data-tab=${id} 
             data-selected=${isSelected ? 'true' : 'false'}
             onClick=${onPress}
             ref=${innerRef}
@@ -3842,9 +4594,9 @@
     Tabs.Panel = React.memo(({ id, activeTab, direction, children }) => {
         const isActive = id === activeTab;
         return html`
-            <div
-                className="tabs__panel"
-                data-tab=${id}
+            <div 
+                className="tabs__panel" 
+                data-tab=${id} 
                 data-active=${isActive ? 'true' : undefined}
                 data-direction=${direction}
                 style=${isActive ? {} : { display: 'none' }}
@@ -3870,9 +4622,9 @@
             }
         };
         return html`
-            <div
-                className=${`switch switch--${size} ${className}`.trim()}
-                role="switch"
+            <div 
+                className=${`switch switch--${size} ${className}`.trim()} 
+                role="switch" 
                 tabIndex=${isDisabled ? '-1' : '0'}
                 data-selected=${isSelected ? 'true' : 'false'}
                 data-disabled=${isDisabled ? 'true' : undefined}
@@ -3948,7 +4700,7 @@
     Dropdown.Trigger = ({ children }) => {
         const ctx = React.useContext(DropdownContext);
         return html`
-            <div
+            <div 
                 className="dropdown__trigger-wrapper"
                 onClick=${(e) => {
                     e.stopPropagation();
@@ -3976,7 +4728,7 @@
         const ctx = React.useContext(DropdownContext);
         const isSelected = ctx && ctx.selectedKey === id;
         return html`
-            <div
+            <div 
                 className=${`dropdown__item ${variant === 'danger' ? 'dropdown__item--danger' : ''}`}
                 role="menuitem"
                 data-selected=${isSelected ? 'true' : 'false'}
@@ -4019,8 +4771,8 @@
         const ctx = React.useContext(TagGroupContext);
         const isSelected = ctx ? ctx.selectedKeys.includes(id) : false;
         return html`
-            <div
-                className=${`tag ${className}`.trim()}
+            <div 
+                className=${`tag ${className}`.trim()} 
                 role="button"
                 tabIndex="0"
                 data-id=${id}
@@ -4204,7 +4956,7 @@
         }), [curVal, minValue, maxValue, percentage, isDragging, isDisabled]);
 
         return html`
-            <div
+            <div 
                 className=${`slider ${className}`.trim()}
                 data-disabled=${isDisabled ? 'true' : undefined}
                 data-dragging=${isDragging ? 'true' : undefined}
@@ -4232,7 +4984,7 @@
     Slider.Track = ({ className = '', children }) => {
         const ctx = React.useContext(SliderContext);
         return html`
-            <div
+            <div 
                 ref=${ctx ? ctx.trackRef : null}
                 className=${`slider-track ${className}`.trim()}
                 onPointerDown=${ctx ? ctx.handlePointerDown : null}
@@ -4252,7 +5004,7 @@
         const ctx = React.useContext(SliderContext);
         const left = ctx ? `${ctx.percentage}%` : '0%';
         return html`
-            <div
+            <div 
                 className=${`slider-thumb ${className}`.trim()}
                 role="slider"
                 tabIndex="0"
@@ -4274,7 +5026,7 @@
         }, [onToggle, serviceKey]);
 
         return html`
-            <div
+            <div 
                 className="service-tile"
                 data-service=${serviceKey}
                 data-checked=${isChecked ? 'true' : 'false'}
@@ -4282,8 +5034,8 @@
                 onClick=${handleToggle}
             >
                 <span className="service-tile__label">${service.label}</span>
-                <${Switch}
-                    isSelected=${isChecked}
+                <${Switch} 
+                    isSelected=${isChecked} 
                     onChange=${handleToggle}
                     size="sm"
                     className="service-tile__switch"
@@ -4321,7 +5073,7 @@
             : `Click badge: toggle time boost | Click gear: Control Panel | ${kbText}: hide/show`;
 
         return html`
-            <div
+            <div 
                 id="__ul-pill"
                 className=${`heroui-pill ${isMinimal ? 'heroui-pill--minimal' : ''}`}
                 data-mode=${mode}
@@ -4334,7 +5086,7 @@
                     }
                 }}
             >
-                <div
+                <div 
                     className="heroui-pill__main"
                     onClick=${(e) => {
                         if (!isMinimal) {
@@ -4348,13 +5100,13 @@
                         <span className="heroui-pill__label">${rangeLabel} ${enabled ? 'Active' : 'Paused'}</span>
                     </span>
                     <span className="heroui-pill__stats">
-                        <span
-                            className="heroui-pill__stat-item"
+                        <span 
+                            className="heroui-pill__stat-item" 
                             style=${{ display: (isCompact || isFull) ? 'inline-flex' : 'none' }}
                         >
                             🛡 ${currentStats.blocked}
                         </span>
-                        <span
+                        <span 
                             className="heroui-pill__stat-item"
                             style=${{ display: isFull ? 'inline-flex' : 'none' }}
                         >
@@ -4362,9 +5114,9 @@
                         </span>
                     </span>
                 </div>
-                <button
-                    type="button"
-                    className="heroui-pill__gear"
+                <button 
+                    type="button" 
+                    className="heroui-pill__gear" 
                     title="Open UpLearn Settings (Ctrl+Shift+U)"
                     onClick=${(e) => {
                         e.preventDefault(); e.stopPropagation();
@@ -4395,37 +5147,43 @@
             let active = 0, total = 0;
             const list = [];
             for (const key in TELEMETRY_SERVICES) {
-                if (key === 'jitsu') continue;
                 total++;
                 const svc = TELEMETRY_SERVICES[key];
-                const checked = !!currentSettings.telemetryServices[key];
+                const checked = key === 'jitsu'
+                    ? (!!currentSettings.suppressJitsu || !!(currentSettings.telemetryServices && currentSettings.telemetryServices.jitsu))
+                    : !!(currentSettings.telemetryServices && currentSettings.telemetryServices[key]);
                 if (checked) active++;
                 if (!q || svc.label.toLowerCase().includes(q) || svc.hosts.some(h => h.toLowerCase().includes(q))) {
                     list.push({ key, svc, checked });
                 }
             }
             return { filteredServicesList: list, activeServicesCount: active, totalServicesCount: total };
-        }, [servicesFilter, currentSettings.telemetryServices]);
+        }, [servicesFilter, currentSettings.telemetryServices, currentSettings.suppressJitsu]);
 
         const handleToggleService = useCallback((key) => {
-            const next = !settings.telemetryServices[key];
-            const updated = Object.assign({}, settings.telemetryServices, { [key]: next });
+            const current = currentSettings.telemetryServices || {};
+            const curVal = key === 'jitsu'
+                ? (!!currentSettings.suppressJitsu || !!current[key])
+                : !!current[key];
+            const next = !curVal;
+            const updated = Object.assign({}, current, { [key]: next });
             settings.telemetryServices = updated;
+            if (key === 'jitsu') {
+                settings.suppressJitsu = next;
+            }
             settings.telemetryPreset = 'custom';
             saveSettings();
             LOG(`service "${TELEMETRY_SERVICES[key].label}" ${next ? 'ENABLED' : 'DISABLED'}`);
             onUpdateSetting('telemetryServices', updated);
-        }, [onUpdateSetting]);
+        }, [currentSettings.telemetryServices, currentSettings.suppressJitsu, onUpdateSetting]);
 
         const handleEnableAllServices = useCallback(() => {
             const updated = {};
             for (const k in TELEMETRY_SERVICES) {
-                if (k !== 'jitsu') {
-                    settings.telemetryServices[k] = true;
-                    updated[k] = true;
-                }
+                updated[k] = true;
             }
             settings.telemetryServices = updated;
+            settings.suppressJitsu = true;
             settings.telemetryPreset = 'custom';
             saveSettings();
             onUpdateSetting('telemetryServices', updated);
@@ -4434,12 +5192,10 @@
         const handleDisableAllServices = useCallback(() => {
             const updated = {};
             for (const k in TELEMETRY_SERVICES) {
-                if (k !== 'jitsu') {
-                    settings.telemetryServices[k] = false;
-                    updated[k] = false;
-                }
+                updated[k] = false;
             }
             settings.telemetryServices = updated;
+            settings.suppressJitsu = false;
             settings.telemetryPreset = 'custom';
             saveSettings();
             onUpdateSetting('telemetryServices', updated);
@@ -4471,7 +5227,7 @@
                                 <label>Active Preset
                                     <small>Off · Simple (LogImproperUse only) · Harsh (Block all) · Custom</small>
                                 </label>
-                                <${Dropdown}
+                                <${Dropdown} 
                                     selectedKey=${currentSettings.telemetryPreset}
                                     onSelectionChange=${updatePreset}
                                 >
@@ -4502,7 +5258,7 @@
                             <${Card.Description}>Fine-grained control over network intercepts and client spoofing.<//>
                         <//>
                         <${Card.Content} className="core-toggles-list">
-                            <${Switch}
+                            <${Switch} 
                                 size="sm"
                                 isSelected=${currentSettings.blockLogImproperUse}
                                 onChange=${updateLogImproper}
@@ -4516,7 +5272,7 @@
                                 <//>
                             <//>
 
-                            <${Switch}
+                            <${Switch} 
                                 size="sm"
                                 isSelected=${currentSettings.blockDomElements}
                                 onChange=${updateBlockDom}
@@ -4530,7 +5286,7 @@
                                 <//>
                             <//>
 
-                            <${Switch}
+                            <${Switch} 
                                 size="sm"
                                 isSelected=${currentSettings.blockWebSockets}
                                 onChange=${updateBlockWs}
@@ -4544,7 +5300,7 @@
                                 <//>
                             <//>
 
-                            <${Switch}
+                            <${Switch} 
                                 size="sm"
                                 isSelected=${currentSettings.blockSendBeacon}
                                 onChange=${updateBlockBeacon}
@@ -4558,7 +5314,7 @@
                                 <//>
                             <//>
 
-                            <${Switch}
+                            <${Switch} 
                                 size="sm"
                                 isSelected=${currentSettings.spoofVisibility}
                                 onChange=${updateSpoofVis}
@@ -4572,7 +5328,7 @@
                                 <//>
                             <//>
 
-                            <${Switch}
+                            <${Switch} 
                                 size="sm"
                                 isSelected=${currentSettings.suppressConsoleNoise}
                                 onChange=${updateSuppressNoise}
@@ -4586,7 +5342,7 @@
                                 <//>
                             <//>
 
-                            <${Switch}
+                            <${Switch} 
                                 size="sm"
                                 isSelected=${currentSettings.suppressJitsu}
                                 onChange=${updateSuppressJitsu}
@@ -4614,9 +5370,9 @@
                         <//>
                         <${Card.Content}>
                             <div className="services-search-bar">
-                                <input
-                                    type="text"
-                                    className="services-search-input"
+                                <input 
+                                    type="text" 
+                                    className="services-search-input" 
                                     placeholder="Search service name or hostname…"
                                     value=${servicesFilter}
                                     onInput=${(e) => setServicesFilter(e.target.value)}
@@ -4637,11 +5393,11 @@
                             </div>
                             <div className="services-grid">
                                 ${filteredServicesList.map(({ key, svc, checked }) => html`
-                                    <${ServiceTile}
+                                    <${ServiceTile} 
                                         key=${key}
-                                        serviceKey=${key}
-                                        service=${svc}
-                                        isChecked=${checked}
+                                        serviceKey=${key} 
+                                        service=${svc} 
+                                        isChecked=${checked} 
                                         onToggle=${handleToggleService}
                                     />
                                 `)}
@@ -4686,6 +5442,8 @@
         const updateManualBtn = useCallback((v) => onUpdateSetting('manualTimeButtonEnabled', v), [onUpdateSetting]);
         const updateManualStack = useCallback((v) => onUpdateSetting('manualTimeStacksWithAuto', v), [onUpdateSetting]);
         const updateFullVideo = useCallback((v) => onUpdateSetting('fullVideoWatchedEnabled', v), [onUpdateSetting]);
+        const updateAutoSkipVideo = useCallback((v) => onUpdateSetting('autoSkipVideoEnabled', v), [onUpdateSetting]);
+        const updateAddVideoDuration = useCallback((v) => onUpdateSetting('addVideoDurationToTimeSpent', v), [onUpdateSetting]);
 
         const rangeHint = (currentSettings.extraSecondsMin === currentSettings.extraSecondsMax)
             ? `Every question receives +${currentSettings.extraSecondsMin}s.`
@@ -4703,7 +5461,7 @@
                             <${Card.Description}>Automatically adds extra time spent to quiz submissions and group summaries.<//>
                         <//>
                         <${Card.Content}>
-                            <${Switch}
+                            <${Switch} 
                                 isSelected=${currentSettings.timeBoostEnabled}
                                 onChange=${updateTimeBoost}
                             >
@@ -4729,11 +5487,11 @@
                                     <small>Minimum and maximum extra seconds added per question</small>
                                 </label>
                                 <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    <input
-                                        type="number"
-                                        className="input"
-                                        style=${{ width: '78px', textAlign: 'center' }}
-                                        min="1"
+                                    <input 
+                                        type="number" 
+                                        className="input" 
+                                        style=${{ width: '78px', textAlign: 'center' }} 
+                                        min="1" 
                                         max="3600"
                                         value=${minStr}
                                         onInput=${(e) => setMinStr(e.target.value)}
@@ -4741,11 +5499,11 @@
                                         onKeyDown=${(e) => { if (e.key === 'Enter') commitMin(); }}
                                     />
                                     <span style=${{ color: 'var(--muted)', fontWeight: 600 }}>to</span>
-                                    <input
-                                        type="number"
-                                        className="input"
-                                        style=${{ width: '78px', textAlign: 'center' }}
-                                        min="1"
+                                    <input 
+                                        type="number" 
+                                        className="input" 
+                                        style=${{ width: '78px', textAlign: 'center' }} 
+                                        min="1" 
                                         max="3600"
                                         value=${maxStr}
                                         onInput=${(e) => setMaxStr(e.target.value)}
@@ -4757,8 +5515,8 @@
                             </div>
 
                             <div style=${{ marginTop: '8px' }}>
-                                <${TagGroup}
-                                    ariaLabel="Quick Range Presets"
+                                <${TagGroup} 
+                                    ariaLabel="Quick Range Presets" 
                                     selectedKeys=${[
                                         QUICK_RANGE_PRESETS.find(p => p.min === currentSettings.extraSecondsMin && p.max === currentSettings.extraSecondsMax)?.label
                                     ].filter(Boolean)}
@@ -4786,13 +5544,13 @@
                     <${Card}>
                         <${Card.Header}>
                             <${Card.Title}>
-                                <span>Video Completion</span>
-                                <${Badge} variant="soft" color=${currentSettings.fullVideoWatchedEnabled ? 'success' : 'default'}>Videos<//>
+                                <span>Video Automation & Completion</span>
+                                <${Badge} variant="soft" color=${(currentSettings.fullVideoWatchedEnabled || currentSettings.autoSkipVideoEnabled || currentSettings.addVideoDurationToTimeSpent) ? 'success' : 'default'}>Videos<//>
                             <//>
-                            <${Card.Description}>Always mark watched video lessons as 100% complete.<//>
+                            <${Card.Description}>Automate video lesson playback, skip to questions, and ensure full duration credits.<//>
                         <//>
                         <${Card.Content} className="core-toggles-list">
-                            <${Switch}
+                            <${Switch} 
                                 size="sm"
                                 isSelected=${currentSettings.fullVideoWatchedEnabled}
                                 onChange=${updateFullVideo}
@@ -4803,6 +5561,34 @@
                                 <${Switch.Content}>
                                     <${Switch.Label}>Always mark videos as fully watched (100%)<//>
                                     <${Switch.Description}>Sets percentWatched to 1 on CompleteVideoLesson mutations so every video registers as fully completed<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.autoSkipVideoEnabled}
+                                onChange=${updateAutoSkipVideo}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Auto-skip video to questions / completion<//>
+                                    <${Switch.Description}>Automatically seeks directly to in-video quiz questions, or fast-forwards to the end if there are no questions<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.addVideoDurationToTimeSpent}
+                                onChange=${updateAddVideoDuration}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Add video duration to study time<//>
+                                    <${Switch.Description}>Adds the video's full length to CompleteVideoLesson timeSpent so you get full study time credit<//>
                                 <//>
                             <//>
                         <//>
@@ -4819,7 +5605,7 @@
                             <${Card.Description}>Adds an interactive button beside the question Submit button.<//>
                         <//>
                         <${Card.Content} className="core-toggles-list">
-                            <${Switch}
+                            <${Switch} 
                                 size="sm"
                                 isSelected=${currentSettings.manualTimeButtonEnabled}
                                 onChange=${updateManualBtn}
@@ -4833,7 +5619,7 @@
                                 <//>
                             <//>
 
-                            <${Switch}
+                            <${Switch} 
                                 size="sm"
                                 isSelected=${currentSettings.manualTimeStacksWithAuto}
                                 onChange=${updateManualStack}
@@ -4879,7 +5665,7 @@
 
     const ColorSwatch = React.memo(({ color, isSelected, onSelect }) => {
         return html`
-            <div
+            <div 
                 className="color-swatch"
                 style=${{ backgroundColor: color.hex }}
                 title=${color.name}
@@ -4920,7 +5706,7 @@
                                 <label>Pill Information Display
                                     <small>Select how much info is displayed. The pill dynamically adapts its shape.</small>
                                 </label>
-                                <${Dropdown}
+                                <${Dropdown} 
                                     selectedKey=${currentSettings.pillMode}
                                     onSelectionChange=${updatePillMode}
                                 >
@@ -4947,7 +5733,7 @@
                                 <label>Pill Dock Position
                                     <small>Corner of the screen where the status pill floats</small>
                                 </label>
-                                <${Dropdown}
+                                <${Dropdown} 
                                     selectedKey=${currentSettings.pillPosition}
                                     onSelectionChange=${updatePillPosition}
                                 >
@@ -4974,7 +5760,7 @@
                                 <label>Pill Opacity
                                     <small>Adjust background transparency</small>
                                 </label>
-                                <${Slider}
+                                <${Slider} 
                                     value=${currentSettings.pillOpacity}
                                     minValue=${0.2}
                                     maxValue=${1}
@@ -5000,7 +5786,7 @@
                             <${Card.Description}>Quality of life tweaks for the UpLearn learning environment.<//>
                         <//>
                         <${Card.Content}>
-                            <${Switch}
+                            <${Switch} 
                                 isSelected=${currentSettings.disableAutoFullscreen}
                                 onChange=${updateDisableAutoFullscreen}
                             >
@@ -5013,7 +5799,7 @@
                                 <//>
                             <//>
 
-                            <${Switch}
+                            <${Switch} 
                                 isSelected=${currentSettings.darkMode}
                                 onChange=${updateDarkMode}
                             >
@@ -5038,7 +5824,7 @@
                         <${Card.Content}>
                             <div className="field-row">
                                 <label>Control Panel Theme</label>
-                                <${Dropdown}
+                                <${Dropdown} 
                                     selectedKey=${currentSettings.theme}
                                     onSelectionChange=${updateTheme}
                                 >
@@ -5076,8 +5862,8 @@
                                             />
                                         `)}
                                     </div>
-                                    <input
-                                        type="color"
+                                    <input 
+                                        type="color" 
                                         style=${{ width: '36px', height: '28px', border: '1px solid var(--border)', borderRadius: '6px', background: 'transparent', cursor: 'pointer', padding: '1px' }}
                                         value=${currentSettings.accentColor}
                                         onChange=${(e) => updateAccentColor(e.target.value)}
@@ -5098,16 +5884,16 @@
                                     <small>Global keyboard shortcut to show or hide the pill</small>
                                 </label>
                                 <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    <${Button}
-                                        variant="secondary"
+                                    <${Button} 
+                                        variant="secondary" 
                                         size="sm"
                                         className=${isCapturingKeybind ? 'button--capturing' : ''}
                                         onPress=${onStartCaptureKeybind}
                                     >
                                         ${isCapturingKeybind ? 'Press any key…' : formatKeybind(currentSettings.uiToggleKeybind)}
                                     <//>
-                                    <${Button}
-                                        variant="outline"
+                                    <${Button} 
+                                        variant="outline" 
                                         size="sm"
                                         isIconOnly
                                         title="Clear keybind"
@@ -5123,7 +5909,7 @@
                                 <label>Console Logging Level
                                     <small>Verbose inspects bodies and prints grouped block reports</small>
                                 </label>
-                                <${Dropdown}
+                                <${Dropdown} 
                                     selectedKey=${currentSettings.logLevel}
                                     onSelectionChange=${updateLogLevel}
                                 >
@@ -5191,7 +5977,9 @@
                         prev.logImproperUseBlocked === stats.logImproperUseBlocked &&
                         prev.jitsuPackets === stats.jitsuPackets &&
                         prev.manualBoosted === (stats.manualBoosted || 0) &&
-                        prev.videosMaxed === (stats.videosMaxed || 0)
+                        prev.videosMaxed === (stats.videosMaxed || 0) &&
+                        prev.videosSkipped === (stats.videosSkipped || 0) &&
+                        prev.videoTimeAdded === (stats.videoTimeAdded || 0)
                     ) {
                         return prev;
                     }
@@ -5230,6 +6018,14 @@
                         <div className="stat-card">
                             <span className="stat-card__label">Videos 100%</span>
                             <span className="stat-card__value">${tabStats.videosMaxed || 0}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Videos Skipped</span>
+                            <span className="stat-card__value">${tabStats.videosSkipped || 0}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Video Time Added</span>
+                            <span className="stat-card__value">+${formatSeconds(tabStats.videoTimeAdded || 0)}</span>
                         </div>
                         <div className="stat-card">
                             <span className="stat-card__label">Manual Boosts</span>
@@ -5322,7 +6118,7 @@
                 <${Modal.Backdrop} isClosing=${isClosing} onClose=${onClose}>
                     <${Modal.Container}>
                         <${Modal.Dialog}>
-
+                            
                             <!-- Header -->
                             <${Modal.Header}>
                                 <div className="modal__header-top">
@@ -5339,7 +6135,7 @@
                                 </div>
 
                                 <!-- Tabs Navigation via TagGroup -->
-                                <${TagGroup}
+                                <${TagGroup} 
                                     ariaLabel="Panel Navigation"
                                     selectionMode="single"
                                     selectedKeys=${[activeTab]}
@@ -5367,7 +6163,7 @@
                             <${Modal.Body}>
                                 ${visitedTabs.has('telemetry') && html`
                                     <${Tabs.Panel} id="telemetry" activeTab=${activeTab} direction=${tabDirection}>
-                                        <${TelemetryTab}
+                                        <${TelemetryTab} 
                                             currentSettings=${currentSettings}
                                             onUpdateSetting=${onUpdateSetting}
                                         />
@@ -5375,7 +6171,7 @@
                                 `}
                                 ${visitedTabs.has('timeboost') && html`
                                     <${Tabs.Panel} id="timeboost" activeTab=${activeTab} direction=${tabDirection}>
-                                        <${TimeBoostTab}
+                                        <${TimeBoostTab} 
                                             currentSettings=${currentSettings}
                                             accumulatedBonus=${accumulatedBonus}
                                             onUpdateSetting=${onUpdateSetting}
@@ -5384,7 +6180,7 @@
                                 `}
                                 ${visitedTabs.has('preferences') && html`
                                     <${Tabs.Panel} id="preferences" activeTab=${activeTab} direction=${tabDirection}>
-                                        <${PreferencesTab}
+                                        <${PreferencesTab} 
                                             currentSettings=${currentSettings}
                                             isCapturingKeybind=${isCapturingKeybind}
                                             onStartCaptureKeybind=${onStartCaptureKeybind}
@@ -5396,7 +6192,7 @@
                                 `}
                                 ${visitedTabs.has('stats') && html`
                                     <${Tabs.Panel} id="stats" activeTab=${activeTab} direction=${tabDirection}>
-                                        <${StatsTab}
+                                        <${StatsTab} 
                                             accumulatedBonus=${accumulatedBonus}
                                             onResetStats=${onResetStats}
                                             isActive=${activeTab === 'stats'}
@@ -5528,7 +6324,7 @@
                 normalizeRange(settings);
                 saveSettings(true);
                 applyDarkMode();
-                setAppSettings(Object.assign({}, settings));
+                setAppSettings(cloneSettings(settings));
                 LOG('settings reset to defaults');
             }
         }, []);
@@ -5555,7 +6351,7 @@
 
         return html`
             <div className="heroui-react-wrapper">
-                <${StatusPill}
+                <${StatusPill} 
                     currentSettings=${appSettings}
                     currentStats=${appStats}
                     accumulatedBonus=${accumulatedBonus}
@@ -5563,7 +6359,7 @@
                     onOpenSettings=${handleOpenSettings}
                 />
                 ${(isModalOpen || isClosing) ? html`
-                    <${SettingsModal}
+                    <${SettingsModal} 
                         isOpen=${isModalOpen}
                         isClosing=${isClosing}
                         onClose=${handleCloseModal}
@@ -5641,6 +6437,7 @@
         ensureUIHost();
         ensureButton();
         initManualButtonObserver();
+        initVideoAutoSkipController();
     }
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', bootstrap, { once: true });
@@ -5662,6 +6459,12 @@
         setManualTimeButtonEnabled: (v) => { applySettingChange('manualTimeButtonEnabled', !!v); },
         setManualTimeStacksWithAuto: (v) => { applySettingChange('manualTimeStacksWithAuto', !!v); },
         setFullVideoWatchedEnabled: (v) => { applySettingChange('fullVideoWatchedEnabled', !!v); },
+        setAutoSkipVideoEnabled: (v) => { applySettingChange('autoSkipVideoEnabled', !!v); },
+        setAddVideoDurationToTimeSpent: (v) => { applySettingChange('addVideoDurationToTimeSpent', !!v); },
+        getKnownLessonDurations: () => knownLessonDurations,
+        getCurrentVideoLesson: () => currentVideoLesson,
+        skipVideoNow: (force = true) => checkAndAutoSkipVideo(force),
+        handleApiResponse,
         getQueuedSeconds: () => queuedSeconds,
         setQueuedSeconds: (secs) => {
             queuedSeconds = secs;
@@ -5676,6 +6479,7 @@
             stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
             stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
             stats.jitsuPackets = 0; stats.manualBoosted = 0; stats.videosMaxed = 0;
+            stats.videosSkipped = 0; stats.videoTimeAdded = 0;
             accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
         },
         getAccumulated: () => accumulatedExtraSeconds,
@@ -5688,6 +6492,8 @@
         '| range:', settings.extraSecondsMin + '–' + settings.extraSecondsMax + 's',
         '| manualTimeBtn:', settings.manualTimeButtonEnabled ? 'ON' : 'OFF',
         '| fullVideoWatched:', settings.fullVideoWatchedEnabled ? 'ON' : 'OFF',
+        '| autoSkipVideo:', settings.autoSkipVideoEnabled ? 'ON' : 'OFF',
+        '| addVideoDuration:', settings.addVideoDurationToTimeSpent ? 'ON' : 'OFF',
         '| keybind:', formatKeybind(settings.uiToggleKeybind),
         '| auto-fullscreen blocked:', settings.disableAutoFullscreen ? 'ON' : 'OFF',
         '| dark mode:', settings.darkMode ? 'ON' : 'OFF',
@@ -5704,6 +6510,8 @@
         nativeConsole.log('%cLogImproperUse:         ', CSS.muted, settings.blockLogImproperUse ? 'ON' : 'OFF');
         nativeConsole.log('%cManual time button:     ', CSS.muted, settings.manualTimeButtonEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cFull video watch:       ', CSS.muted, settings.fullVideoWatchedEnabled ? 'ON' : 'OFF');
+        nativeConsole.log('%cAuto-skip video:        ', CSS.muted, settings.autoSkipVideoEnabled ? 'ON' : 'OFF');
+        nativeConsole.log('%cAdd video duration:     ', CSS.muted, settings.addVideoDurationToTimeSpent ? 'ON' : 'OFF');
         nativeConsole.log('%cDOM injection:          ', CSS.muted, settings.blockDomElements ? 'ON' : 'OFF');
         nativeConsole.log('%cWebSockets:             ', CSS.muted, settings.blockWebSockets ? 'ON' : 'OFF');
         nativeConsole.log('%csendBeacon:             ', CSS.muted, settings.blockSendBeacon ? 'ON' : 'OFF');
