@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UpLearn Telemetry Blocker & TimeSpent Booster
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
-// @version      3.6.0
-// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; inline manual "Add time" question button; dark mode; full control panel UI
+// @version      3.7.0
+// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; inline manual "Add time" question button; full video watch completion toggle; dark mode; full control panel UI
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
@@ -91,6 +91,7 @@
         extraSecondsMax:           90,
         manualTimeButtonEnabled:   true,
         manualTimeStacksWithAuto:  false,
+        fullVideoWatchedEnabled:   true,
         disableAutoFullscreen:     true,
         darkMode:                  false,
         pillVisible:               true,
@@ -157,6 +158,9 @@
                 }
                 if (typeof parsed.manualTimeStacksWithAuto !== 'boolean') {
                     parsed.manualTimeStacksWithAuto = DEFAULT_SETTINGS.manualTimeStacksWithAuto;
+                }
+                if (typeof parsed.fullVideoWatchedEnabled !== 'boolean') {
+                    parsed.fullVideoWatchedEnabled = DEFAULT_SETTINGS.fullVideoWatchedEnabled;
                 }
 
                 Object.assign(s, parsed);
@@ -367,6 +371,7 @@
         apiPosts: 0, seen: 0, boosted: 0, blocked: 0,
         groupExtra: 0, fullscreenBlocked: 0, consoleSuppressed: 0,
         logImproperUseBlocked: 0, jitsuPackets: 0, manualBoosted: 0,
+        videosMaxed: 0,
     };
 
     // ============================================================
@@ -609,6 +614,7 @@
         nativeConsole.log('%cTime boost:      ', CSS.muted, settings.timeBoostEnabled,
             `(+${settings.extraSecondsMin}–${settings.extraSecondsMax}s)`);
         nativeConsole.log('%cManual time btn: ', CSS.muted, settings.manualTimeButtonEnabled ? 'ON' : 'OFF');
+        nativeConsole.log('%cFull video watch: ', CSS.muted, settings.fullVideoWatchedEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cFullscreen:      ', CSS.muted, settings.disableAutoFullscreen ? 'blocked' : 'allowed');
         nativeConsole.log('%cDark mode:       ', CSS.muted, settings.darkMode);
         nativeConsole.groupEnd();
@@ -824,6 +830,7 @@
     // ============================================================
     const QUIZ_OP              = 'AnswerProgressQuizQuestion';
     const GROUP_OP             = 'CompleteProgressQuizGroup';
+    const VIDEO_OP             = 'CompleteVideoLesson';
     const MANUAL_BUTTON_ID     = 'us-timespent-btn';
     const MANUAL_TRIGGER_LABEL = 'submit';
 
@@ -1240,23 +1247,46 @@
      * Body Rewriting & Network Injection
      * ------------------------------------------------------------ */
     function maybeBumpTimeSpent(body, source) {
-        if (!settings.timeBoostEnabled && queuedSeconds === null) return { body, changed: false };
+        const boostActive = settings.timeBoostEnabled || queuedSeconds !== null;
+        const videoActive = settings.fullVideoWatchedEnabled;
+        if (!boostActive && !videoActive) return { body, changed: false };
         if (typeof body !== 'string')    return { body, changed: false };
 
-        const hasQuiz  = body.includes(QUIZ_OP);
-        const hasGroup = body.includes(GROUP_OP);
-        if (!hasQuiz && !hasGroup) return { body, changed: false };
+        const hasQuiz  = boostActive && body.includes(QUIZ_OP);
+        const hasGroup = boostActive && body.includes(GROUP_OP);
+        const hasVideo = videoActive && body.includes(VIDEO_OP);
+        if (!hasQuiz && !hasGroup && !hasVideo) return { body, changed: false };
 
         let json;
         try { json = JSON.parse(body); }
         catch { return { body, changed: false }; }
 
         let changed = false;
+        let manualResetNeeded = false;
 
         const patch = (obj) => {
-            if (!obj || !obj.operationName || !obj.variables) return;
+            if (!obj || !obj.variables) return;
 
-            if (obj.operationName === QUIZ_OP && typeof obj.variables.timeSpent === 'string') {
+            const opName = obj.operationName || '';
+            const isVideo = opName === VIDEO_OP ||
+                (typeof obj.query === 'string' && obj.query.includes(VIDEO_OP)) ||
+                (typeof obj.mutation === 'string' && obj.mutation.includes(VIDEO_OP));
+
+            if (videoActive && isVideo) {
+                const beforePercent = obj.variables.percentWatched;
+                const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
+                obj.variables.percentWatched = targetPercent;
+                stats.seen++;
+                stats.videosMaxed = (stats.videosMaxed || 0) + 1;
+                changed = true;
+
+                LOG(`[${source}] ${VIDEO_OP}: percentWatched ${beforePercent} → ${targetPercent} (lessonId: ${obj.variables.lessonId || 'unknown'})`);
+                nativeConsole.log(
+                    `[UpLearn Video] ${VIDEO_OP} lessonId=${obj.variables.lessonId || 'unknown'} original percentWatched=${beforePercent} → ${targetPercent}`
+                );
+            }
+
+            if (boostActive && opName === QUIZ_OP && typeof obj.variables.timeSpent === 'string') {
                 const total = parseDurationToSeconds(obj.variables.timeSpent);
                 if (total === null) return;
                 const before = obj.variables.timeSpent;
@@ -1283,7 +1313,10 @@
                 accumulatedQuestionCount += 1;
                 stats.seen++;
                 stats.boosted++;
-                if (isManual) stats.manualBoosted = (stats.manualBoosted || 0) + 1;
+                if (isManual) {
+                    stats.manualBoosted = (stats.manualBoosted || 0) + 1;
+                    manualResetNeeded = true;
+                }
                 changed = true;
 
                 if (isManual) {
@@ -1305,7 +1338,7 @@
                     });
                 }
             }
-            else if (obj.operationName === GROUP_OP && typeof obj.variables.timeSpent === 'string') {
+            else if (boostActive && opName === GROUP_OP && typeof obj.variables.timeSpent === 'string') {
                 if (!settings.timeBoostEnabled && accumulatedExtraSeconds === 0) return;
                 const total = parseDurationToSeconds(obj.variables.timeSpent);
                 if (total === null) return;
@@ -1327,7 +1360,7 @@
         else patch(json);
 
         if (changed) {
-            if (queuedSeconds !== null) {
+            if (manualResetNeeded && queuedSeconds !== null) {
                 scheduleReset();
             }
             return { body: JSON.stringify(json), changed: true };
@@ -3598,6 +3631,9 @@
             case 'manualTimeStacksWithAuto':
                 LOG('manual time stacking with auto-boost ' + (value ? 'ENABLED' : 'DISABLED'));
                 break;
+            case 'fullVideoWatchedEnabled':
+                LOG('full video watch toggle (percentWatched=1) ' + (value ? 'ENABLED' : 'DISABLED'));
+                break;
             case 'suppressJitsu':
                 LOG('Jitsu telemetry ' + (value ? 'SUPPRESSED (blocked + logged)' : 'ALLOWED (passed through + logged)'));
                 break;
@@ -4649,6 +4685,7 @@
         const updateTimeBoost = useCallback((v) => onUpdateSetting('timeBoostEnabled', v), [onUpdateSetting]);
         const updateManualBtn = useCallback((v) => onUpdateSetting('manualTimeButtonEnabled', v), [onUpdateSetting]);
         const updateManualStack = useCallback((v) => onUpdateSetting('manualTimeStacksWithAuto', v), [onUpdateSetting]);
+        const updateFullVideo = useCallback((v) => onUpdateSetting('fullVideoWatchedEnabled', v), [onUpdateSetting]);
 
         const rangeHint = (currentSettings.extraSecondsMin === currentSettings.extraSecondsMax)
             ? `Every question receives +${currentSettings.extraSecondsMin}s.`
@@ -4743,6 +4780,31 @@
                                     <//>
                                 <//>
                             </div>
+                        <//>
+                    <//>
+
+                    <${Card}>
+                        <${Card.Header}>
+                            <${Card.Title}>
+                                <span>Video Completion</span>
+                                <${Badge} variant="soft" color=${currentSettings.fullVideoWatchedEnabled ? 'success' : 'default'}>Videos<//>
+                            <//>
+                            <${Card.Description}>Always mark watched video lessons as 100% complete.<//>
+                        <//>
+                        <${Card.Content} className="core-toggles-list">
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.fullVideoWatchedEnabled}
+                                onChange=${updateFullVideo}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Always mark videos as fully watched (100%)<//>
+                                    <${Switch.Description}>Sets percentWatched to 1 on CompleteVideoLesson mutations so every video registers as fully completed<//>
+                                <//>
+                            <//>
                         <//>
                     <//>
                 </div>
@@ -5128,7 +5190,8 @@
                         prev.consoleSuppressed === stats.consoleSuppressed &&
                         prev.logImproperUseBlocked === stats.logImproperUseBlocked &&
                         prev.jitsuPackets === stats.jitsuPackets &&
-                        prev.manualBoosted === (stats.manualBoosted || 0)
+                        prev.manualBoosted === (stats.manualBoosted || 0) &&
+                        prev.videosMaxed === (stats.videosMaxed || 0)
                     ) {
                         return prev;
                     }
@@ -5163,6 +5226,10 @@
                         <div className="stat-card">
                             <span className="stat-card__label">Boosted Qs</span>
                             <span className="stat-card__value">${tabStats.boosted}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Videos 100%</span>
+                            <span className="stat-card__value">${tabStats.videosMaxed || 0}</span>
                         </div>
                         <div className="stat-card">
                             <span className="stat-card__label">Manual Boosts</span>
@@ -5594,6 +5661,7 @@
         setSuppressJitsu: (v) => { applySettingChange('suppressJitsu', !!v); },
         setManualTimeButtonEnabled: (v) => { applySettingChange('manualTimeButtonEnabled', !!v); },
         setManualTimeStacksWithAuto: (v) => { applySettingChange('manualTimeStacksWithAuto', !!v); },
+        setFullVideoWatchedEnabled: (v) => { applySettingChange('fullVideoWatchedEnabled', !!v); },
         getQueuedSeconds: () => queuedSeconds,
         setQueuedSeconds: (secs) => {
             queuedSeconds = secs;
@@ -5607,7 +5675,7 @@
             stats.apiPosts = 0; stats.seen = 0; stats.boosted = 0;
             stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
             stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
-            stats.jitsuPackets = 0; stats.manualBoosted = 0;
+            stats.jitsuPackets = 0; stats.manualBoosted = 0; stats.videosMaxed = 0;
             accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
         },
         getAccumulated: () => accumulatedExtraSeconds,
@@ -5619,6 +5687,7 @@
     LOG('=== READY | timeBoost:', settings.timeBoostEnabled,
         '| range:', settings.extraSecondsMin + '–' + settings.extraSecondsMax + 's',
         '| manualTimeBtn:', settings.manualTimeButtonEnabled ? 'ON' : 'OFF',
+        '| fullVideoWatched:', settings.fullVideoWatchedEnabled ? 'ON' : 'OFF',
         '| keybind:', formatKeybind(settings.uiToggleKeybind),
         '| auto-fullscreen blocked:', settings.disableAutoFullscreen ? 'ON' : 'OFF',
         '| dark mode:', settings.darkMode ? 'ON' : 'OFF',
@@ -5634,6 +5703,7 @@
         nativeConsole.log('%cSuppress Jitsu:         ', CSS.muted, settings.suppressJitsu ? 'YES (blocked + logged)' : 'no (allowed + logged)');
         nativeConsole.log('%cLogImproperUse:         ', CSS.muted, settings.blockLogImproperUse ? 'ON' : 'OFF');
         nativeConsole.log('%cManual time button:     ', CSS.muted, settings.manualTimeButtonEnabled ? 'ON' : 'OFF');
+        nativeConsole.log('%cFull video watch:       ', CSS.muted, settings.fullVideoWatchedEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cDOM injection:          ', CSS.muted, settings.blockDomElements ? 'ON' : 'OFF');
         nativeConsole.log('%cWebSockets:             ', CSS.muted, settings.blockWebSockets ? 'ON' : 'OFF');
         nativeConsole.log('%csendBeacon:             ', CSS.muted, settings.blockSendBeacon ? 'ON' : 'OFF');
