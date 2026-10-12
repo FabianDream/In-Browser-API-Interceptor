@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UpLearn Telemetry Blocker & TimeSpent Booster
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
-// @version      3.7.0
-// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; inline manual "Add time" question button; full video watch completion toggle; dark mode; full control panel UI
+// @version      3.8.0
+// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; inline manual "Add time" question button; full video watch completion toggle; auto-skip video to questions / completion; add full video duration to timeSpent; dark mode; full control panel UI
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
@@ -92,6 +92,8 @@
         manualTimeButtonEnabled:   true,
         manualTimeStacksWithAuto:  false,
         fullVideoWatchedEnabled:   true,
+        autoSkipVideoEnabled:      true,
+        addVideoDurationToTimeSpent: true,
         disableAutoFullscreen:     true,
         darkMode:                  false,
         pillVisible:               true,
@@ -161,6 +163,12 @@
                 }
                 if (typeof parsed.fullVideoWatchedEnabled !== 'boolean') {
                     parsed.fullVideoWatchedEnabled = DEFAULT_SETTINGS.fullVideoWatchedEnabled;
+                }
+                if (typeof parsed.autoSkipVideoEnabled !== 'boolean') {
+                    parsed.autoSkipVideoEnabled = DEFAULT_SETTINGS.autoSkipVideoEnabled;
+                }
+                if (typeof parsed.addVideoDurationToTimeSpent !== 'boolean') {
+                    parsed.addVideoDurationToTimeSpent = DEFAULT_SETTINGS.addVideoDurationToTimeSpent;
                 }
 
                 Object.assign(s, parsed);
@@ -371,7 +379,7 @@
         apiPosts: 0, seen: 0, boosted: 0, blocked: 0,
         groupExtra: 0, fullscreenBlocked: 0, consoleSuppressed: 0,
         logImproperUseBlocked: 0, jitsuPackets: 0, manualBoosted: 0,
-        videosMaxed: 0,
+        videosMaxed: 0, videosSkipped: 0, videoTimeAdded: 0,
     };
 
     // ============================================================
@@ -921,6 +929,232 @@
     }
 
     /* ------------------------------------------------------------
+     * Video Lesson State & Auto-Skip Progression
+     * ------------------------------------------------------------ */
+    const knownLessonDurations = new Map();
+    let currentVideoLesson     = null;
+    let lastSkippedTarget      = null;
+    let autoSkipThrottled      = false;
+
+    function handleApiResponse(data) {
+        if (!data || typeof data !== 'object') return;
+        if (Array.isArray(data)) {
+            data.forEach(handleApiResponse);
+            return;
+        }
+        const d = data.data || data;
+        if (!d || typeof d !== 'object') return;
+
+        // 1. GetVideoLesson response
+        if (d.videoLesson) {
+            const vl = d.videoLesson;
+            if (vl && vl.id) {
+                const lessonId = String(vl.id);
+                let dur = 0;
+                if (vl.length != null) {
+                    dur = parseDurationToSeconds(vl.length) || 0;
+                }
+                if (dur <= 0 && vl.duration != null) {
+                    dur = parseDurationToSeconds(vl.duration) || 0;
+                }
+                if (dur > 0) {
+                    knownLessonDurations.set(lessonId, dur);
+                }
+
+                const questions = [];
+                if (Array.isArray(vl.inVideoQuizQuestions)) {
+                    for (const q of vl.inVideoQuizQuestions) {
+                        if (!q) continue;
+                        const trig = Number(q.triggerTime);
+                        if (isFinite(trig) && trig >= 0) {
+                            questions.push({
+                                id: String(q.id || ''),
+                                triggerTime: trig,
+                                resumeTime: Number(q.postQuestionResumeTime) || (trig + 1),
+                            });
+                        }
+                    }
+                }
+                questions.sort((a, b) => a.triggerTime - b.triggerTime);
+
+                lastSkippedTarget = null;
+                currentVideoLesson = {
+                    id: lessonId,
+                    title: vl.title || '',
+                    duration: dur,
+                    questions: questions,
+                    answeredQuestionIds: new Set(),
+                    completed: false,
+                };
+
+                LOG(`[videoLesson] Intercepted "${vl.title || lessonId}" (duration: ${formatSeconds(dur)}, ${questions.length} in-video question(s))`);
+                VLOG('videoLesson intercepted', { lessonId, dur, questions });
+            }
+        }
+
+        // 2. In-video question response
+        if (d.answerInVideoQuestion && d.answerInVideoQuestion.question) {
+            const q = d.answerInVideoQuestion.question;
+            if (currentVideoLesson && q && q.id) {
+                currentVideoLesson.answeredQuestionIds.add(String(q.id));
+                VLOG('in-video question marked answered', q.id);
+            }
+        }
+    }
+
+    function findActiveVideoElement() {
+        try {
+            // 1. Standard HTML5 video elements in main document
+            const videos = document.querySelectorAll('video');
+            for (let i = 0; i < videos.length; i++) {
+                const v = videos[i];
+                if (v && v.isConnected && (v.offsetWidth > 0 || v.offsetHeight > 0 || (isFinite(v.duration) && v.duration > 0))) {
+                    return v;
+                }
+            }
+            if (videos.length > 0 && videos[0].isConnected) return videos[0];
+
+            // 2. Mux player custom elements
+            const muxPlayers = document.querySelectorAll('mux-player');
+            for (let i = 0; i < muxPlayers.length; i++) {
+                const mp = muxPlayers[i];
+                if (mp.shadowRoot) {
+                    const sv = mp.shadowRoot.querySelector('video');
+                    if (sv && sv.isConnected) return sv;
+                }
+                if (typeof mp.currentTime === 'number') return mp;
+            }
+
+            // 3. Wistia player custom elements or embed containers
+            const wistiaPlayers = document.querySelectorAll('wistia-player, .wistia_embed');
+            for (let i = 0; i < wistiaPlayers.length; i++) {
+                const wp = wistiaPlayers[i];
+                if (wp.shadowRoot) {
+                    const sv = wp.shadowRoot.querySelector('video');
+                    if (sv && sv.isConnected) return sv;
+                }
+                const inner = wp.querySelector('video');
+                if (inner && inner.isConnected) return inner;
+            }
+        } catch (e) {
+            WARN('findActiveVideoElement error', e);
+        }
+        return null;
+    }
+
+    function isQuestionActiveOnPage() {
+        try {
+            const submitBtn = findSubmitButton();
+            if (submitBtn && submitBtn.isConnected && submitBtn.offsetParent !== null) {
+                return true;
+            }
+            const activeModal = document.querySelector('[role="dialog"], .quiz-content, [data-testid*="question"]');
+            if (activeModal && activeModal.isConnected && activeModal.offsetParent !== null) {
+                return true;
+            }
+        } catch {}
+        return false;
+    }
+
+    function checkAndAutoSkipVideo(force = false) {
+        if (!settings.autoSkipVideoEnabled && !force) return;
+        if (autoSkipThrottled) return;
+
+        const video = findActiveVideoElement();
+        if (!video || !video.isConnected || video.ended) return;
+
+        const duration = (isFinite(video.duration) && video.duration > 0)
+            ? video.duration
+            : (currentVideoLesson?.duration || 0);
+
+        if (duration > 0 && currentVideoLesson && currentVideoLesson.duration <= 0) {
+            currentVideoLesson.duration = duration;
+            if (currentVideoLesson.id) {
+                knownLessonDurations.set(currentVideoLesson.id, duration);
+            }
+        }
+
+        // If an in-video question is active on screen, wait for user/auto answer
+        if (isQuestionActiveOnPage()) {
+            return;
+        }
+
+        const currentTime = video.currentTime || 0;
+
+        // 1. Skip to next in-video question if one exists
+        if (currentVideoLesson && Array.isArray(currentVideoLesson.questions) && currentVideoLesson.questions.length > 0) {
+            const nextQ = currentVideoLesson.questions.find((q) => {
+                return (q.triggerTime > currentTime + 0.3) && !currentVideoLesson.answeredQuestionIds.has(q.id);
+            });
+
+            if (nextQ) {
+                const target = Math.max(0, nextQ.triggerTime - 0.1);
+                if (Math.abs(currentTime - target) > 0.4 && lastSkippedTarget !== nextQ.triggerTime) {
+                    lastSkippedTarget = nextQ.triggerTime;
+                    autoSkipThrottled = true;
+                    setTimeout(() => { autoSkipThrottled = false; }, 800);
+
+                    LOG(`[autoSkip] Skipping video to question at ${formatSeconds(nextQ.triggerTime)}`);
+                    nativeConsole.log(`[UpLearn Video] Auto-skipping video from ${formatSeconds(currentTime)} to question at ${formatSeconds(nextQ.triggerTime)}`);
+                    try {
+                        video.currentTime = target;
+                        video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
+                        stats.videosSkipped = (stats.videosSkipped || 0) + 1;
+                        if (video.paused && typeof video.play === 'function') {
+                            video.play().catch(() => {});
+                        }
+                    } catch (e) {
+                        WARN('autoSkip seek failed', e);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // 2. No questions remain -> auto skip to video completion
+        if (duration > 1 && currentTime < duration - 0.8) {
+            const target = Math.max(0, duration - 0.3);
+            if (lastSkippedTarget !== 'end' && Math.abs(currentTime - target) > 0.5) {
+                lastSkippedTarget = 'end';
+                autoSkipThrottled = true;
+                setTimeout(() => { autoSkipThrottled = false; }, 1000);
+
+                LOG(`[autoSkip] No remaining questions; skipping to video completion (${formatSeconds(duration)})`);
+                nativeConsole.log(`[UpLearn Video] Auto-skipping video from ${formatSeconds(currentTime)} to completion (${formatSeconds(duration)})`);
+                try {
+                    video.currentTime = target;
+                    video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
+                    stats.videosSkipped = (stats.videosSkipped || 0) + 1;
+                    if (video.paused && typeof video.play === 'function') {
+                        video.play().catch(() => {});
+                    }
+                    setTimeout(() => {
+                        try {
+                            if (video.currentTime >= duration - 0.5) {
+                                video.dispatchEvent(new Event('ended', { bubbles: true }));
+                            }
+                        } catch {}
+                    }, 500);
+                } catch (e) {
+                    WARN('autoSkip completion seek failed', e);
+                }
+            }
+        }
+    }
+
+    function initVideoAutoSkipController() {
+        try {
+            setInterval(() => {
+                if (settings.autoSkipVideoEnabled) {
+                    checkAndAutoSkipVideo();
+                }
+            }, 600);
+        } catch (e) {
+            WARN('initVideoAutoSkipController failed', e);
+        }
+    }
+
+    /* ------------------------------------------------------------
      * Manual "Add Time" Button UI & Styles
      * ------------------------------------------------------------ */
     const MANUAL_BUTTON_CSS = `
@@ -1248,13 +1482,13 @@
      * ------------------------------------------------------------ */
     function maybeBumpTimeSpent(body, source) {
         const boostActive = settings.timeBoostEnabled || queuedSeconds !== null;
-        const videoActive = settings.fullVideoWatchedEnabled;
+        const videoActive = settings.fullVideoWatchedEnabled || settings.addVideoDurationToTimeSpent;
         if (!boostActive && !videoActive) return { body, changed: false };
         if (typeof body !== 'string')    return { body, changed: false };
 
-        const hasQuiz  = boostActive && body.includes(QUIZ_OP);
+        const hasQuiz  = boostActive && (body.includes(QUIZ_OP) || body.includes('AnswerInVideoQuestion') || body.includes('AnswerPreVideoQuestion'));
         const hasGroup = boostActive && body.includes(GROUP_OP);
-        const hasVideo = videoActive && body.includes(VIDEO_OP);
+        const hasVideo = (videoActive || boostActive) && body.includes(VIDEO_OP);
         if (!hasQuiz && !hasGroup && !hasVideo) return { body, changed: false };
 
         let json;
@@ -1272,21 +1506,84 @@
                 (typeof obj.query === 'string' && obj.query.includes(VIDEO_OP)) ||
                 (typeof obj.mutation === 'string' && obj.mutation.includes(VIDEO_OP));
 
-            if (videoActive && isVideo) {
-                const beforePercent = obj.variables.percentWatched;
-                const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
-                obj.variables.percentWatched = targetPercent;
-                stats.seen++;
-                stats.videosMaxed = (stats.videosMaxed || 0) + 1;
-                changed = true;
+            if (isVideo) {
+                let videoTouched = false;
+                const lessonId = String(obj.variables.lessonId || '');
 
-                LOG(`[${source}] ${VIDEO_OP}: percentWatched ${beforePercent} → ${targetPercent} (lessonId: ${obj.variables.lessonId || 'unknown'})`);
-                nativeConsole.log(
-                    `[UpLearn Video] ${VIDEO_OP} lessonId=${obj.variables.lessonId || 'unknown'} original percentWatched=${beforePercent} → ${targetPercent}`
-                );
+                // 1. Force 100% full watched
+                if (settings.fullVideoWatchedEnabled) {
+                    const beforePercent = obj.variables.percentWatched;
+                    const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
+                    if (beforePercent !== targetPercent) {
+                        obj.variables.percentWatched = targetPercent;
+                        stats.videosMaxed = (stats.videosMaxed || 0) + 1;
+                        videoTouched = true;
+                        changed = true;
+
+                        LOG(`[${source}] ${VIDEO_OP}: percentWatched ${beforePercent} → ${targetPercent} (lessonId: ${lessonId || 'unknown'})`);
+                        nativeConsole.log(
+                            `[UpLearn Video] ${VIDEO_OP} lessonId=${lessonId || 'unknown'} original percentWatched=${beforePercent} → ${targetPercent}`
+                        );
+                    }
+                }
+
+                // 2. Add video duration to timeSpent
+                let vidDuration = 0;
+                if (lessonId && knownLessonDurations.has(lessonId)) {
+                    vidDuration = knownLessonDurations.get(lessonId);
+                }
+                if (vidDuration <= 0 && currentVideoLesson && (currentVideoLesson.id === lessonId || !lessonId)) {
+                    vidDuration = currentVideoLesson.duration || 0;
+                }
+                if (vidDuration <= 0) {
+                    const activeVid = findActiveVideoElement();
+                    if (activeVid && isFinite(activeVid.duration) && activeVid.duration > 0) {
+                        vidDuration = Math.round(activeVid.duration);
+                    }
+                }
+                if (vidDuration <= 0 && currentVideoLesson && currentVideoLesson.duration > 0) {
+                    vidDuration = currentVideoLesson.duration;
+                }
+
+                const rawTimeSpent = obj.variables.timeSpent;
+                const origTimeSpent = Number(rawTimeSpent) || 0;
+                let extraTime = 0;
+
+                if (settings.addVideoDurationToTimeSpent && vidDuration > 0) {
+                    extraTime += vidDuration;
+                }
+
+                if (queuedSeconds !== null) {
+                    if (settings.manualTimeStacksWithAuto && settings.timeBoostEnabled) {
+                        extraTime += queuedSeconds + pickExtraSeconds();
+                    } else {
+                        extraTime += queuedSeconds;
+                    }
+                    manualResetNeeded = true;
+                }
+
+                if (extraTime > 0) {
+                    const newTimeSpent = round3(origTimeSpent + extraTime);
+                    obj.variables.timeSpent = (typeof rawTimeSpent === 'string') ? String(newTimeSpent) : newTimeSpent;
+                    if (settings.addVideoDurationToTimeSpent && vidDuration > 0) {
+                        stats.videoTimeAdded = (stats.videoTimeAdded || 0) + vidDuration;
+                    }
+                    videoTouched = true;
+                    changed = true;
+
+                    LOG(`[${source}] ${VIDEO_OP}: timeSpent ${rawTimeSpent} (+${formatSeconds(extraTime)}) → ${obj.variables.timeSpent} (lessonId: ${lessonId || 'unknown'})`);
+                    nativeConsole.log(
+                        `[UpLearn Video] ${VIDEO_OP} lessonId=${lessonId || 'unknown'} original timeSpent=${rawTimeSpent} (+${formatSeconds(extraTime)}) → ${obj.variables.timeSpent}`
+                    );
+                }
+
+                if (videoTouched) {
+                    stats.seen++;
+                }
             }
 
-            if (boostActive && opName === QUIZ_OP && typeof obj.variables.timeSpent === 'string') {
+            const isQuizOp = opName === QUIZ_OP || opName === 'AnswerInVideoQuestion' || opName === 'AnswerPreVideoQuestion';
+            if (boostActive && isQuizOp && typeof obj.variables.timeSpent === 'string') {
                 const total = parseDurationToSeconds(obj.variables.timeSpent);
                 if (total === null) return;
                 const before = obj.variables.timeSpent;
@@ -1461,7 +1758,17 @@
                                     body: changed ? newBody : text,
                                     method: input.method
                                 });
-                                return origFetch.call(self, newReq, passInit);
+                                const fetchPromise = origFetch.call(self, newReq, passInit);
+                                if (isTargetApi(url)) {
+                                    fetchPromise.then((res) => {
+                                        try {
+                                            if (res && res.ok && typeof res.clone === 'function') {
+                                                res.clone().json().then(handleApiResponse).catch(() => {});
+                                            }
+                                        } catch {}
+                                    }).catch(() => {});
+                                }
+                                return fetchPromise;
                             });
                         }
                     }
@@ -1483,7 +1790,17 @@
                 WARN('fetch interceptor error:', e);
             }
 
-            return origFetch.call(self, input, init);
+            const fetchPromise = origFetch.call(self, input, init);
+            if (isTargetApi(url)) {
+                fetchPromise.then((res) => {
+                    try {
+                        if (res && res.ok && typeof res.clone === 'function') {
+                            res.clone().json().then(handleApiResponse).catch(() => {});
+                        }
+                    } catch {}
+                }).catch(() => {});
+            }
+            return fetchPromise;
         };
         VLOG('fetch hook installed');
     }
@@ -1597,6 +1914,14 @@
                         const { body: newBody, changed } = maybeBumpTimeSpent(body, 'xhr');
                         if (changed) body = newBody;
                     }
+
+                    this.addEventListener('load', function () {
+                        try {
+                            if (this.responseText) {
+                                handleApiResponse(JSON.parse(this.responseText));
+                            }
+                        } catch {}
+                    });
                 }
             } catch (e) {
                 WARN('xhr interceptor error:', e);
@@ -3634,6 +3959,12 @@
             case 'fullVideoWatchedEnabled':
                 LOG('full video watch toggle (percentWatched=1) ' + (value ? 'ENABLED' : 'DISABLED'));
                 break;
+            case 'autoSkipVideoEnabled':
+                LOG('auto-skip video to questions / completion ' + (value ? 'ENABLED' : 'DISABLED'));
+                break;
+            case 'addVideoDurationToTimeSpent':
+                LOG('add full video duration to timeSpent ' + (value ? 'ENABLED' : 'DISABLED'));
+                break;
             case 'suppressJitsu':
                 LOG('Jitsu telemetry ' + (value ? 'SUPPRESSED (blocked + logged)' : 'ALLOWED (passed through + logged)'));
                 break;
@@ -4686,6 +5017,8 @@
         const updateManualBtn = useCallback((v) => onUpdateSetting('manualTimeButtonEnabled', v), [onUpdateSetting]);
         const updateManualStack = useCallback((v) => onUpdateSetting('manualTimeStacksWithAuto', v), [onUpdateSetting]);
         const updateFullVideo = useCallback((v) => onUpdateSetting('fullVideoWatchedEnabled', v), [onUpdateSetting]);
+        const updateAutoSkipVideo = useCallback((v) => onUpdateSetting('autoSkipVideoEnabled', v), [onUpdateSetting]);
+        const updateAddVideoDuration = useCallback((v) => onUpdateSetting('addVideoDurationToTimeSpent', v), [onUpdateSetting]);
 
         const rangeHint = (currentSettings.extraSecondsMin === currentSettings.extraSecondsMax)
             ? `Every question receives +${currentSettings.extraSecondsMin}s.`
@@ -4786,10 +5119,10 @@
                     <${Card}>
                         <${Card.Header}>
                             <${Card.Title}>
-                                <span>Video Completion</span>
-                                <${Badge} variant="soft" color=${currentSettings.fullVideoWatchedEnabled ? 'success' : 'default'}>Videos<//>
+                                <span>Video Automation & Completion</span>
+                                <${Badge} variant="soft" color=${(currentSettings.fullVideoWatchedEnabled || currentSettings.autoSkipVideoEnabled || currentSettings.addVideoDurationToTimeSpent) ? 'success' : 'default'}>Videos<//>
                             <//>
-                            <${Card.Description}>Always mark watched video lessons as 100% complete.<//>
+                            <${Card.Description}>Automate video lesson playback, skip to questions, and ensure full duration credits.<//>
                         <//>
                         <${Card.Content} className="core-toggles-list">
                             <${Switch} 
@@ -4803,6 +5136,34 @@
                                 <${Switch.Content}>
                                     <${Switch.Label}>Always mark videos as fully watched (100%)<//>
                                     <${Switch.Description}>Sets percentWatched to 1 on CompleteVideoLesson mutations so every video registers as fully completed<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.autoSkipVideoEnabled}
+                                onChange=${updateAutoSkipVideo}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Auto-skip video to questions / completion<//>
+                                    <${Switch.Description}>Automatically seeks directly to in-video quiz questions, or fast-forwards to the end if there are no questions<//>
+                                <//>
+                            <//>
+
+                            <${Switch} 
+                                size="sm"
+                                isSelected=${currentSettings.addVideoDurationToTimeSpent}
+                                onChange=${updateAddVideoDuration}
+                            >
+                                <${Switch.Control}>
+                                    <${Switch.Thumb} />
+                                <//>
+                                <${Switch.Content}>
+                                    <${Switch.Label}>Add video duration to study time<//>
+                                    <${Switch.Description}>Adds the video's full length to CompleteVideoLesson timeSpent so you get full study time credit<//>
                                 <//>
                             <//>
                         <//>
@@ -5191,7 +5552,9 @@
                         prev.logImproperUseBlocked === stats.logImproperUseBlocked &&
                         prev.jitsuPackets === stats.jitsuPackets &&
                         prev.manualBoosted === (stats.manualBoosted || 0) &&
-                        prev.videosMaxed === (stats.videosMaxed || 0)
+                        prev.videosMaxed === (stats.videosMaxed || 0) &&
+                        prev.videosSkipped === (stats.videosSkipped || 0) &&
+                        prev.videoTimeAdded === (stats.videoTimeAdded || 0)
                     ) {
                         return prev;
                     }
@@ -5230,6 +5593,14 @@
                         <div className="stat-card">
                             <span className="stat-card__label">Videos 100%</span>
                             <span className="stat-card__value">${tabStats.videosMaxed || 0}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Videos Skipped</span>
+                            <span className="stat-card__value">${tabStats.videosSkipped || 0}</span>
+                        </div>
+                        <div className="stat-card">
+                            <span className="stat-card__label">Video Time Added</span>
+                            <span className="stat-card__value">+${formatSeconds(tabStats.videoTimeAdded || 0)}</span>
                         </div>
                         <div className="stat-card">
                             <span className="stat-card__label">Manual Boosts</span>
@@ -5641,6 +6012,7 @@
         ensureUIHost();
         ensureButton();
         initManualButtonObserver();
+        initVideoAutoSkipController();
     }
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', bootstrap, { once: true });
@@ -5662,6 +6034,12 @@
         setManualTimeButtonEnabled: (v) => { applySettingChange('manualTimeButtonEnabled', !!v); },
         setManualTimeStacksWithAuto: (v) => { applySettingChange('manualTimeStacksWithAuto', !!v); },
         setFullVideoWatchedEnabled: (v) => { applySettingChange('fullVideoWatchedEnabled', !!v); },
+        setAutoSkipVideoEnabled: (v) => { applySettingChange('autoSkipVideoEnabled', !!v); },
+        setAddVideoDurationToTimeSpent: (v) => { applySettingChange('addVideoDurationToTimeSpent', !!v); },
+        getKnownLessonDurations: () => knownLessonDurations,
+        getCurrentVideoLesson: () => currentVideoLesson,
+        skipVideoNow: (force = true) => checkAndAutoSkipVideo(force),
+        handleApiResponse,
         getQueuedSeconds: () => queuedSeconds,
         setQueuedSeconds: (secs) => {
             queuedSeconds = secs;
@@ -5676,6 +6054,7 @@
             stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
             stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
             stats.jitsuPackets = 0; stats.manualBoosted = 0; stats.videosMaxed = 0;
+            stats.videosSkipped = 0; stats.videoTimeAdded = 0;
             accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
         },
         getAccumulated: () => accumulatedExtraSeconds,
@@ -5688,6 +6067,8 @@
         '| range:', settings.extraSecondsMin + '–' + settings.extraSecondsMax + 's',
         '| manualTimeBtn:', settings.manualTimeButtonEnabled ? 'ON' : 'OFF',
         '| fullVideoWatched:', settings.fullVideoWatchedEnabled ? 'ON' : 'OFF',
+        '| autoSkipVideo:', settings.autoSkipVideoEnabled ? 'ON' : 'OFF',
+        '| addVideoDuration:', settings.addVideoDurationToTimeSpent ? 'ON' : 'OFF',
         '| keybind:', formatKeybind(settings.uiToggleKeybind),
         '| auto-fullscreen blocked:', settings.disableAutoFullscreen ? 'ON' : 'OFF',
         '| dark mode:', settings.darkMode ? 'ON' : 'OFF',
@@ -5704,6 +6085,8 @@
         nativeConsole.log('%cLogImproperUse:         ', CSS.muted, settings.blockLogImproperUse ? 'ON' : 'OFF');
         nativeConsole.log('%cManual time button:     ', CSS.muted, settings.manualTimeButtonEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cFull video watch:       ', CSS.muted, settings.fullVideoWatchedEnabled ? 'ON' : 'OFF');
+        nativeConsole.log('%cAuto-skip video:        ', CSS.muted, settings.autoSkipVideoEnabled ? 'ON' : 'OFF');
+        nativeConsole.log('%cAdd video duration:     ', CSS.muted, settings.addVideoDurationToTimeSpent ? 'ON' : 'OFF');
         nativeConsole.log('%cDOM injection:          ', CSS.muted, settings.blockDomElements ? 'ON' : 'OFF');
         nativeConsole.log('%cWebSockets:             ', CSS.muted, settings.blockWebSockets ? 'ON' : 'OFF');
         nativeConsole.log('%csendBeacon:             ', CSS.muted, settings.blockSendBeacon ? 'ON' : 'OFF');

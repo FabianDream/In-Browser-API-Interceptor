@@ -1,14 +1,13 @@
 // ==UserScript==
-// @name         UpLearn Telemetry + Fullscreen + Tab-Switch Blocker
+// @name         UpLearn Telemetry + Fullscreen + Tab-Switch Blocker (Hardened)
 // @namespace    https://github.com/local/uplearn-blocker
-// @version      1.1.4
-// @description  Blocks telemetry, third-party trackers, auto-fullscreen, and tab-switch/blur detection across all userscript managers.
+// @version      1.2.0
+// @description  Blocks telemetry, third-party trackers, WebWorker beacons, auto-fullscreen, and tab-switch/blur detection.
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
 // @grant        none
 // @inject-into  page
-// @noframes
 //
 // @webRequest   [{"selector":{"include":"://jitsu.uplearn.co.uk/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://jitsu.com/"},"action":"cancel"}]
@@ -20,10 +19,15 @@
 // @webRequest   [{"selector":{"include":"://js.intercomcdn.com/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://nexus-websocket-.intercom.io/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://www.googletagmanager.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://google-analytics.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://analytics.google.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://googleadservices.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://doubleclick.net/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://connect.facebook.net/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://sc-static.net/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://bat.bing.com/"},"action":"cancel"}]
 // @webRequest   [{"selector":{"include":"://bzrcdn.openai.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://*.posthog.com/"},"action":"cancel"}]
 // ==/UserScript==
 
 (function () {
@@ -32,11 +36,6 @@
     const LOG  = (...a) => console.log('%c[UL]', 'color:#00e5ff;font-weight:bold', ...a);
     const WARN = (...a) => console.warn('[UL]', ...a);
 
-    LOG('blocker loaded on', location.host);
-
-    // ============================================================
-    // REUSABLE STATIC HELPERS & CONSTANTS
-    // ============================================================
     function noop() {}
     function returnVisible() { return 'visible'; }
     function returnFalse() { return false; }
@@ -61,31 +60,25 @@
     }
 
     // ============================================================
-    // 1. TELEMETRY HOST DEFINITIONS & ULTRA-FAST MATCHER
+    // 1. TELEMETRY HOST DEFINITIONS & MATCHER
     // ============================================================
     const API_HOST    = 'web.uplearn.co.uk';
     const API_PATH_RE = /\/api\/?$/;
 
-    // Compiled regex matching all blocked telemetry hostnames & domains in a single pass.
-    // 'web.uplearn.co.uk' is intentionally excluded / unblocked.
-    const TELEMETRY_HOST_RE = /(?:^|\.)(?:jitsu\.uplearn\.co\.uk|jitsu\.com|openreplay\.uplearn\.co\.uk|sentry\.io|cloudflareinsights\.com|intercom\.io|intercomcdn\.com|googletagmanager\.com|google-analytics\.com|analytics\.google\.com|facebook\.net|sc-static\.net|bat\.bing\.com|bzrcdn\.openai\.com|fullstory\.com|hotjar\.com|mixpanel\.com|segment\.io|amplitude\.com|posthog\.com)\.?$/i;
+    // Added googleadservices, doubleclick, clarity, and wildcard posthog
+    const TELEMETRY_HOST_RE = /(?:^|\.)(?:jitsu\.uplearn\.co\.uk|jitsu\.com|openreplay\.uplearn\.co\.uk|sentry\.io|cloudflareinsights\.com|intercom\.io|intercomcdn\.com|googletagmanager\.com|google-analytics\.com|analytics\.google\.com|googleadservices\.com|doubleclick\.net|facebook\.net|sc-static\.net|bat\.bing\.com|clarity\.ms|bzrcdn\.openai\.com|fullstory\.com|hotjar\.com|mixpanel\.com|segment\.io|amplitude\.com|posthog\.com)\.?$/i;
 
-    // Fast hostname extractor avoiding expensive `new URL()` allocations
     function getHostname(url) {
         if (!url || typeof url !== 'string') return '';
         const len = url.length;
         let start = 0;
-        // Skip leading whitespace
         while (start < len && url.charCodeAt(start) <= 32) start++;
         if (start >= len) return '';
 
         const c0 = url.charCodeAt(start);
         const c1 = url.charCodeAt(start + 1);
 
-        // Fast exit for relative URLs: /path (not //domain), ./path, ../path, #hash
-        if ((c0 === 47 && c1 !== 47) || c0 === 46 || c0 === 35) {
-            return '';
-        }
+        if ((c0 === 47 && c1 !== 47) || c0 === 46 || c0 === 35) return '';
 
         const protoIdx = url.indexOf('://', start);
         if (protoIdx !== -1) {
@@ -100,22 +93,16 @@
         let atIdx = -1;
         while (end < len) {
             const c = url.charCodeAt(end);
-            if (c === 47 || c === 63 || c === 35 || c <= 32) break; // '/', '?', '#', whitespace
-            if (c === 64) atIdx = end; // '@' (credentials)
+            if (c === 47 || c === 63 || c === 35 || c <= 32) break;
+            if (c === 64) atIdx = end;
             end++;
         }
         if (atIdx !== -1) start = atIdx + 1;
 
-        // Strip port if present
         const colonIdx = url.indexOf(':', start);
-        if (colonIdx !== -1 && colonIdx < end) {
-            end = colonIdx;
-        }
+        if (colonIdx !== -1 && colonIdx < end) end = colonIdx;
 
-        // Strip trailing dots from FQDN hostname if present
-        while (end > start && url.charCodeAt(end - 1) === 46) {
-            end--;
-        }
+        while (end > start && url.charCodeAt(end - 1) === 46) end--;
 
         return url.slice(start, end).toLowerCase();
     }
@@ -136,17 +123,13 @@
 
     function isTargetApi(url) {
         if (!url) return false;
-        if (typeof url !== 'string') {
-            url = url.url || url.href || String(url);
-        }
+        if (typeof url !== 'string') url = url.url || url.href || String(url);
         if (!url.includes('api')) return false;
 
-        // Fast path for relative URLs: /api, /api/, /api?..., /api/?...
         if (url.charCodeAt(0) === 47) {
             if (url === '/api' || url === '/api/') return true;
             if (url.startsWith('/api?') || url.startsWith('/api/?') || url.startsWith('/api#')) return true;
         }
-        // Fast path for absolute URLs matching API_HOST
         if (url.startsWith('https://web.uplearn.co.uk/api') || url.startsWith('//web.uplearn.co.uk/api') || url.startsWith('http://web.uplearn.co.uk/api')) {
             const idx = url.indexOf('/api');
             const after = url.slice(idx + 4);
@@ -178,7 +161,7 @@
     }
 
     // ============================================================
-    // 2. DOM & SCRIPT/IFRAME INJECTION BLOCKER
+    // 2. DOM & IMAGE/SCRIPT/IFRAME INJECTION BLOCKER
     // ============================================================
     function hookSrcProperty(proto, tag) {
         const desc = Object.getOwnPropertyDescriptor(proto, 'src');
@@ -199,65 +182,52 @@
 
     if (typeof HTMLScriptElement !== 'undefined') hookSrcProperty(HTMLScriptElement.prototype, 'script');
     if (typeof HTMLIFrameElement !== 'undefined') hookSrcProperty(HTMLIFrameElement.prototype, 'iframe');
+    if (typeof HTMLImageElement  !== 'undefined') hookSrcProperty(HTMLImageElement.prototype,  'img');
+
+    // Intercept new Image() beacons
+    const OrigImage = window.Image;
+    if (OrigImage) {
+        window.Image = function (...args) {
+            const img = new OrigImage(...args);
+            return img;
+        };
+        window.Image.prototype = OrigImage.prototype;
+    }
 
     const origSetAttribute = Element.prototype.setAttribute;
     Element.prototype.setAttribute = function (name, value) {
-        if ((name === 'src' || (typeof name === 'string' && name.length === 3 && name.toLowerCase() === 'src')) && isTelemetryUrl(value)) {
+        if ((name === 'src' || (typeof name === 'string' && name.toLowerCase() === 'src')) && isTelemetryUrl(value)) {
             LOG('blocked setAttribute(src):', value);
             return;
         }
         return origSetAttribute.call(this, name, value);
     };
 
-    function purgeTelemetryChildren(container) {
-        if (!container.getElementsByTagName) return;
-        const scripts = container.getElementsByTagName('script');
-        for (let i = scripts.length - 1; i >= 0; i--) {
-            const s = scripts[i];
-            const src = s.getAttribute('src') || s.src;
-            if (src && isTelemetryUrl(src)) {
-                LOG('purged <script> from DOM container:', src);
-                s.remove();
+    // ============================================================
+    // 3. WEB WORKER NEUTER (Stops OpenReplay & Sentry worker uploaders)
+    // ============================================================
+    const OrigWorker = window.Worker;
+    if (OrigWorker) {
+        window.Worker = function (scriptURL, options) {
+            const urlStr = String(scriptURL || '');
+            // Check if worker URL points to telemetry or is an OpenReplay/Sentry Blob
+            if (isTelemetryUrl(urlStr) || urlStr.startsWith('blob:')) {
+                LOG('blocked telemetry WebWorker:', urlStr);
+                // Return a dummy worker that does nothing
+                const dummy = new EventTarget();
+                dummy.postMessage = noop;
+                dummy.terminate = noop;
+                dummy.onerror = null;
+                dummy.onmessage = null;
+                return dummy;
             }
-        }
-        const iframes = container.getElementsByTagName('iframe');
-        for (let i = iframes.length - 1; i >= 0; i--) {
-            const f = iframes[i];
-            const src = f.getAttribute('src') || f.src;
-            if (src && isTelemetryUrl(src)) {
-                LOG('purged <iframe> from DOM container:', src);
-                f.remove();
-            }
-        }
+            return new OrigWorker(scriptURL, options);
+        };
+        window.Worker.prototype = OrigWorker.prototype;
     }
 
-    // Remove any static or dynamically appended tracker elements
-    const domObserver = new MutationObserver((mutations) => {
-        for (let i = 0; i < mutations.length; i++) {
-            const added = mutations[i].addedNodes;
-            for (let j = 0; j < added.length; j++) {
-                const node = added[j];
-                if (node.nodeType !== 1) continue;
-                const tag = node.tagName;
-                if (tag === 'SCRIPT' || tag === 'IFRAME' || tag === 'script' || tag === 'iframe') {
-                    const src = node.getAttribute('src') || node.src;
-                    if (src && isTelemetryUrl(src)) {
-                        LOG(`purged <${tag.toLowerCase()}> from DOM:`, src);
-                        node.remove();
-                        continue;
-                    }
-                }
-                if (node.firstElementChild !== null || (node.children && node.children.length > 0)) {
-                    purgeTelemetryChildren(node);
-                }
-            }
-        }
-    });
-
-    domObserver.observe(document.documentElement || document, { childList: true, subtree: true });
-
     // ============================================================
-    // 3. WEBSOCKET BLOCKER (Intercom / Analytics Sockets)
+    // 4. WEBSOCKET BLOCKER
     // ============================================================
     const OrigWebSocket = window.WebSocket;
     if (OrigWebSocket) {
@@ -266,33 +236,16 @@
                 LOG('blocked WebSocket connection:', url);
                 const dummy = new EventTarget();
                 Object.setPrototypeOf(dummy, OrigWebSocket.prototype);
-                dummy.CONNECTING = 0;
-                dummy.OPEN = 1;
-                dummy.CLOSING = 2;
-                dummy.CLOSED = 3;
                 dummy.readyState = 3; // CLOSED
-                dummy.url = String(url);
-                dummy.protocol = '';
-                dummy.extensions = '';
-                dummy.bufferedAmount = 0;
-                dummy.binaryType = 'blob';
-                dummy.onopen = null;
-                dummy.onmessage = null;
-                dummy.onerror = null;
-                dummy.onclose = null;
                 dummy.send = noop;
                 dummy.close = noop;
-
                 setTimeout(() => {
                     try {
                         const err = new Event('error');
-                        if (typeof dummy.onerror === 'function') dummy.onerror(err);
                         dummy.dispatchEvent(err);
-
                         const closeEvt = typeof CloseEvent !== 'undefined'
                             ? new CloseEvent('close', { code: 1006, reason: 'Blocked' })
                             : new Event('close');
-                        if (typeof dummy.onclose === 'function') dummy.onclose(closeEvt);
                         dummy.dispatchEvent(closeEvt);
                     } catch {}
                 }, 0);
@@ -308,7 +261,7 @@
     }
 
     // ============================================================
-    // 4. FETCH / XHR / SEND-BEACON INTERCEPTORS
+    // 5. FETCH / XHR / BEACON INTERCEPTORS
     // ============================================================
     const origFetch = window.fetch ? window.fetch.bind(window) : null;
     if (origFetch) {
@@ -328,19 +281,15 @@
                     const body = init ? init.body : null;
 
                     if (body == null && typeof Request !== 'undefined' && input instanceof Request) {
-                        const ct = (input.headers.get('content-type') || '').toLowerCase();
-                        if (ct.includes('application/json')) {
-                            const passInit = init;
-                            try {
-                                return input.clone().text().then((text) => {
-                                    if (bodyLooksLikeLogImproperUse(text)) {
-                                        LOG('dropped LogImproperUse (Request body)');
-                                        return syntheticOk();
-                                    }
-                                    return passInit !== undefined ? origFetch(input, passInit) : origFetch(input);
-                                }).catch(() => (passInit !== undefined ? origFetch(input, passInit) : origFetch(input)));
-                            } catch {}
-                        }
+                        try {
+                            return input.clone().text().then((text) => {
+                                if (bodyLooksLikeLogImproperUse(text)) {
+                                    LOG('dropped LogImproperUse (Request body)');
+                                    return syntheticOk();
+                                }
+                                return init !== undefined ? origFetch(input, init) : origFetch(input);
+                            }).catch(() => (init !== undefined ? origFetch(input, init) : origFetch(input)));
+                        } catch {}
                     }
 
                     if (body != null && bodyLooksLikeLogImproperUse(body)) {
@@ -356,28 +305,6 @@
         };
     }
 
-    function mockXhr(xhr, status, statusText, responseText, jsonResponse) {
-        Object.defineProperties(xhr, {
-            readyState:   { value: 4, configurable: true },
-            status:       { value: status, configurable: true },
-            statusText:   { value: statusText, configurable: true },
-            responseText: { value: responseText, configurable: true },
-            response:     {
-                get() { return xhr.responseType === 'json' ? jsonResponse : responseText; },
-                configurable: true
-            }
-        });
-        setTimeout(() => {
-            try {
-                xhr.dispatchEvent(new Event('readystatechange'));
-                const loadEvt = typeof ProgressEvent !== 'undefined' ? new ProgressEvent('load') : new Event('load');
-                xhr.dispatchEvent(loadEvt);
-                const loadEndEvt = typeof ProgressEvent !== 'undefined' ? new ProgressEvent('loadend') : new Event('loadend');
-                xhr.dispatchEvent(loadEndEvt);
-            } catch {}
-        }, 0);
-    }
-
     const OrigXHR = window.XMLHttpRequest;
     if (OrigXHR) {
         const origOpen = OrigXHR.prototype.open;
@@ -386,11 +313,6 @@
         OrigXHR.prototype.open = function (method, url) {
             this.__ul_method = method;
             this.__ul_url    = url;
-            delete this.readyState;
-            delete this.status;
-            delete this.statusText;
-            delete this.responseText;
-            delete this.response;
             return origOpen.apply(this, arguments);
         };
 
@@ -401,13 +323,33 @@
 
                 if (isTelemetryUrl(url)) {
                     LOG('blocked telemetry xhr:', url);
-                    mockXhr(this, 204, 'No Content', '', null);
+                    Object.defineProperties(this, {
+                        readyState: { value: 4 },
+                        status:     { value: 204 },
+                        statusText: { value: 'No Content' },
+                    });
+                    setTimeout(() => {
+                        this.dispatchEvent(new Event('readystatechange'));
+                        this.dispatchEvent(new Event('load'));
+                        this.dispatchEvent(new Event('loadend'));
+                    }, 0);
                     return;
                 }
 
                 if (isPostMethod(method) && isTargetApi(url) && bodyLooksLikeLogImproperUse(body)) {
                     LOG('dropped LogImproperUse (xhr)');
-                    mockXhr(this, 200, 'OK', SYNTHETIC_OK_BODY, SYNTHETIC_OK_JSON);
+                    Object.defineProperties(this, {
+                        readyState:   { value: 4 },
+                        status:       { value: 200 },
+                        statusText:   { value: 'OK' },
+                        responseText: { value: SYNTHETIC_OK_BODY },
+                        response:     { get: () => (this.responseType === 'json' ? SYNTHETIC_OK_JSON : SYNTHETIC_OK_BODY) },
+                    });
+                    setTimeout(() => {
+                        this.dispatchEvent(new Event('readystatechange'));
+                        this.dispatchEvent(new Event('load'));
+                        this.dispatchEvent(new Event('loadend'));
+                    }, 0);
                     return;
                 }
             } catch (e) {
@@ -431,46 +373,36 @@
     }
 
     // ============================================================
-    // 5. FULLSCREEN BLOCKER
+    // 6. FULLSCREEN BLOCKER & AVAILABILITY SPOOFER
     // ============================================================
-    const FULLSCREEN_METHODS = [
-        'requestFullscreen',
-        'webkitRequestFullscreen',
-        'webkitRequestFullScreen',
-        'mozRequestFullScreen',
-        'msRequestFullscreen',
-    ];
-
-    function blockFullscreen() {
-        LOG('blocked requestFullscreen on', this.tagName || String(this));
+    function installFullscreenBlocker() {
+        const docDescs = {
+            fullscreenEnabled:       { get: returnFalse, configurable: true },
+            webkitFullscreenEnabled: { get: returnFalse, configurable: true },
+            mozFullScreenEnabled:    { get: returnFalse, configurable: true },
+            msFullscreenEnabled:     { get: returnFalse, configurable: true },
+        };
         try {
-            const doc = document;
-            const fsEl = doc.fullscreenElement || doc.webkitFullscreenElement || doc.mozFullScreenElement || doc.msFullscreenElement;
-            if (fsEl) {
-                const exit = doc.exitFullscreen || doc.webkitExitFullscreen || doc.mozCancelFullScreen || doc.msExitFullscreen;
-                if (exit) exit.call(doc).catch(noop);
+            Object.defineProperties(document, docDescs);
+            if (typeof Document !== 'undefined' && Document.prototype) {
+                Object.defineProperties(Document.prototype, docDescs);
             }
         } catch {}
-        return Promise.reject(new DOMException('Fullscreen request blocked by userscript', 'NotAllowedError'));
-    }
-    blockFullscreen.__ul_patched = true;
 
-    function installFullscreenBlocker() {
+        const rejectFs = () => Promise.reject(new DOMException('Fullscreen blocked', 'NotAllowedError'));
         const proto = Element.prototype;
-        for (let i = 0; i < FULLSCREEN_METHODS.length; i++) {
-            const name = FULLSCREEN_METHODS[i];
-            if (!proto[name] || proto[name].__ul_patched) continue;
+        ['requestFullscreen', 'webkitRequestFullscreen', 'webkitRequestFullScreen', 'mozRequestFullScreen', 'msRequestFullscreen'].forEach((m) => {
             try {
-                Object.defineProperty(proto, name, { value: blockFullscreen, writable: true, configurable: true });
+                Object.defineProperty(proto, m, { value: rejectFs, writable: true, configurable: true });
             } catch {
-                proto[name] = blockFullscreen;
+                proto[m] = rejectFs;
             }
-        }
+        });
     }
     installFullscreenBlocker();
 
     // ============================================================
-    // 6. TAB-SWITCH / VISIBILITY / FOCUS DETECTION BLOCKER
+    // 7. TAB-SWITCH / VISIBILITY / FOCUS SPOOFER
     // ============================================================
     const VISIBILITY_DESCS = {
         visibilityState:       { get: returnVisible, configurable: true },
@@ -485,28 +417,15 @@
             if (typeof Document !== 'undefined' && Document.prototype) {
                 Object.defineProperties(Document.prototype, VISIBILITY_DESCS);
             }
-        } catch (e) { WARN('visibility patch failed', e); }
-    }
-    patchVisibilityProps();
-
-    function installHasFocusPatch() {
-        try {
             document.hasFocus = returnTrue;
             if (typeof Document !== 'undefined' && Document.prototype) {
                 Document.prototype.hasFocus = returnTrue;
             }
         } catch {}
     }
-    installHasFocusPatch();
+    patchVisibilityProps();
 
-    const SUPPRESSED_EVENTS = new Set([
-        'visibilitychange',
-        'webkitvisibilitychange',
-        'blur',
-        'focusout',
-        'pagehide',
-        'freeze',
-    ]);
+    const SUPPRESSED_EVENTS = new Set(['visibilitychange', 'webkitvisibilitychange', 'blur', 'focusout', 'pagehide', 'freeze']);
 
     let origProtoAdd = EventTarget.prototype.addEventListener;
     try {
@@ -516,10 +435,9 @@
             }
             return origProtoAdd.call(this, type, listener, options);
         };
-    } catch (e) { WARN('addEventListener patch failed', e); }
+    } catch {}
 
     const KILL = (e) => {
-        // Allow in-page input/form element blur/focusout events to proceed normally
         if ((e.type === 'blur' || e.type === 'focusout') && e.target && e.target !== window && e.target !== document) {
             return;
         }
@@ -527,41 +445,17 @@
         e.stopPropagation();
     };
 
-    const KILL_EVENTS = ['visibilitychange', 'webkitvisibilitychange', 'blur', 'focusout', 'pagehide', 'freeze'];
-    for (let i = 0; i < KILL_EVENTS.length; i++) {
-        const evt = KILL_EVENTS[i];
+    ['visibilitychange', 'webkitvisibilitychange', 'blur', 'focusout', 'pagehide', 'freeze'].forEach((evt) => {
         try {
-            origProtoAdd.call(window,   evt, KILL, true);
+            origProtoAdd.call(window, evt, KILL, true);
             origProtoAdd.call(document, evt, KILL, true);
         } catch {}
-    }
+    });
 
-    const NULL_PROP_DESC = { get: returnNull, set: noop, configurable: true };
-    const BLOCKED_PROPS = ['onblur', 'onfocusout', 'onpagehide', 'onvisibilitychange', 'onwebkitvisibilitychange', 'onfreeze'];
-    function installBlockedProps() {
-        for (let i = 0; i < BLOCKED_PROPS.length; i++) {
-            const prop = BLOCKED_PROPS[i];
-            try {
-                Object.defineProperty(window,   prop, NULL_PROP_DESC);
-                Object.defineProperty(document, prop, NULL_PROP_DESC);
-            } catch {}
-        }
-    }
-    installBlockedProps();
-
-    // Lightweight health-check guard instead of unconditional Object.defineProperty thrashing
     setInterval(() => {
-        if (document.visibilityState !== 'visible' || document.hidden !== false || document.webkitHidden !== false) {
-            patchVisibilityProps();
-        }
-        if (document.hasFocus !== returnTrue) {
-            installHasFocusPatch();
-        }
-        if (window.onblur !== null || document.onblur !== null || window.onvisibilitychange !== null || document.onvisibilitychange !== null) {
-            installBlockedProps();
-        }
-        installFullscreenBlocker();
+        if (document.visibilityState !== 'visible' || document.hidden !== false) patchVisibilityProps();
+        if (document.fullscreenEnabled !== false) installFullscreenBlocker();
     }, 2000);
 
-    LOG('=== READY | telemetry: blocked | fullscreen: blocked | tab-switch detection: blocked ===');
+    LOG('=== READY | telemetry: blocked | workers: neutered | fullscreen: disabled | tab-switch: blocked ===');
 })();
