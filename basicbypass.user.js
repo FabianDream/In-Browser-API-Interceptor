@@ -40,19 +40,23 @@
     function returnVisible() { return 'visible'; }
     function returnFalse() { return false; }
     function returnTrue() { return true; }
-    function returnNull() { return null; }
 
     const SYNTHETIC_OK_JSON = { data: { logImproperUse: true } };
     const SYNTHETIC_OK_BODY = JSON.stringify(SYNTHETIC_OK_JSON);
     const JSON_HEADERS      = { 'Content-Type': 'application/json' };
     const NO_CONTENT_INIT   = { status: 204, statusText: 'No Content' };
+    const OK_RESPONSE_INIT  = { status: 200, statusText: 'OK', headers: JSON_HEADERS };
 
     function syntheticOk() {
-        return new Response(SYNTHETIC_OK_BODY, {
-            status: 200,
-            statusText: 'OK',
-            headers: JSON_HEADERS,
-        });
+        return new Response(SYNTHETIC_OK_BODY, OK_RESPONSE_INIT);
+    }
+
+    function syntheticNoContent() {
+        try {
+            return new Response(null, NO_CONTENT_INIT);
+        } catch {
+            return new Response('', NO_CONTENT_INIT);
+        }
     }
 
     function isPostMethod(method) {
@@ -76,49 +80,85 @@
         if (start >= len) return '';
 
         const c0 = url.charCodeAt(start);
-        const c1 = url.charCodeAt(start + 1);
-
-        if ((c0 === 47 && c1 !== 47) || c0 === 46 || c0 === 35) return '';
-
-        const protoIdx = url.indexOf('://', start);
-        if (protoIdx !== -1) {
-            start = protoIdx + 3;
-        } else if (c0 === 47 && c1 === 47) {
+        if (c0 === 47) {
+            if (url.charCodeAt(start + 1) !== 47) return '';
             start += 2;
         } else {
-            return '';
+            const lower0 = c0 | 32;
+            if (lower0 < 97 || lower0 > 122) return '';
+            const maxScan = start + 32 < len ? start + 32 : len;
+            let protoIdx = -1;
+            for (let i = start + 1; i < maxScan; i++) {
+                const c = url.charCodeAt(i);
+                if (c === 58) {
+                    if (url.charCodeAt(i + 1) === 47 && url.charCodeAt(i + 2) === 47) {
+                        protoIdx = i;
+                        break;
+                    }
+                    continue;
+                }
+                const cl = c | 32;
+                if ((cl >= 97 && cl <= 122) || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46) {
+                    continue;
+                }
+                return '';
+            }
+            if (protoIdx === -1) return '';
+            start = protoIdx + 3;
+        }
+
+        while (start < len) {
+            const sc = url.charCodeAt(start);
+            if (sc !== 47 && sc !== 92) break;
+            start++;
         }
 
         let end = start;
         let atIdx = -1;
+        let colonIdx = -1;
         while (end < len) {
             const c = url.charCodeAt(end);
-            if (c === 47 || c === 63 || c === 35 || c <= 32) break;
-            if (c === 64) atIdx = end;
+            if (c === 47 || c === 92 || c === 63 || c === 35 || c <= 32) break;
+            if (c === 64) {
+                atIdx = end;
+                colonIdx = -1;
+            } else if (c === 58 && colonIdx === -1) {
+                colonIdx = end;
+            } else if (c === 93) {
+                colonIdx = -1;
+            }
             end++;
         }
         if (atIdx !== -1) start = atIdx + 1;
-
-        const colonIdx = url.indexOf(':', start);
-        if (colonIdx !== -1 && colonIdx < end) end = colonIdx;
+        if (colonIdx !== -1) end = colonIdx;
 
         while (end > start && url.charCodeAt(end - 1) === 46) end--;
 
-        return url.slice(start, end).toLowerCase();
+        return end > start ? url.slice(start, end).toLowerCase() : '';
     }
 
     function isTelemetryUrl(url) {
         if (!url) return false;
         if (typeof url !== 'string') {
-            if (typeof url.hostname === 'string') {
-                let hn = url.hostname.toLowerCase();
-                while (hn.charCodeAt(hn.length - 1) === 46) hn = hn.slice(0, -1);
-                return TELEMETRY_HOST_RE.test(hn);
+            if (typeof url.hostname === 'string' && url.hostname.length > 0) {
+                let hn = url.hostname;
+                let end = hn.length;
+                while (end > 0 && hn.charCodeAt(end - 1) === 46) end--;
+                if (end === 0) return false;
+                if (end < hn.length) hn = hn.slice(0, end);
+                return hn !== API_HOST && TELEMETRY_HOST_RE.test(hn);
             }
             url = url.url || url.href || String(url);
         }
         const host = getHostname(url);
-        return host ? TELEMETRY_HOST_RE.test(host) : false;
+        return host !== '' && host !== API_HOST && TELEMETRY_HOST_RE.test(host);
+    }
+
+    function isApiBoundary(str, idx) {
+        if (str.charCodeAt(idx) === 47) idx++;
+        if (idx === str.length) return true;
+        const c = str.charCodeAt(idx);
+        return c === 63 || c === 35;
     }
 
     function isTargetApi(url) {
@@ -127,13 +167,13 @@
         if (!url.includes('api')) return false;
 
         if (url.charCodeAt(0) === 47) {
-            if (url === '/api' || url === '/api/') return true;
-            if (url.startsWith('/api?') || url.startsWith('/api/?') || url.startsWith('/api#')) return true;
-        }
-        if (url.startsWith('https://web.uplearn.co.uk/api') || url.startsWith('//web.uplearn.co.uk/api') || url.startsWith('http://web.uplearn.co.uk/api')) {
-            const idx = url.indexOf('/api');
-            const after = url.slice(idx + 4);
-            if (after === '' || after === '/' || after.charCodeAt(0) === 63 || after.charCodeAt(0) === 35) return true;
+            if (url.startsWith('/api') && isApiBoundary(url, 4)) return true;
+            if (url.startsWith('//web.uplearn.co.uk/api') && isApiBoundary(url, 23)) return true;
+        } else if (
+            (url.startsWith('https://web.uplearn.co.uk/api') && isApiBoundary(url, 29)) ||
+            (url.startsWith('http://web.uplearn.co.uk/api') && isApiBoundary(url, 28))
+        ) {
+            return true;
         }
 
         try {
@@ -146,13 +186,28 @@
     }
 
     const LOG_IMPROPER_USE_RE = /logimproperuse/i;
+    let sharedTextDecoder = null;
 
     function bodyLooksLikeLogImproperUse(body) {
         if (!body) return false;
         if (typeof body !== 'string') {
             try {
-                if (body instanceof URLSearchParams) body = body.toString();
-                else return false;
+                if (body instanceof URLSearchParams) {
+                    body = body.toString();
+                } else if (typeof ArrayBuffer !== 'undefined' && (ArrayBuffer.isView(body) || body instanceof ArrayBuffer)) {
+                    if (!sharedTextDecoder && typeof TextDecoder !== 'undefined') {
+                        sharedTextDecoder = new TextDecoder();
+                    }
+                    if (!sharedTextDecoder) return false;
+                    body = sharedTextDecoder.decode(body);
+                } else if (typeof FormData !== 'undefined' && body instanceof FormData) {
+                    for (const [, val] of body) {
+                        if (typeof val === 'string' && LOG_IMPROPER_USE_RE.test(val)) return true;
+                    }
+                    return false;
+                } else {
+                    return false;
+                }
             } catch {
                 return false;
             }
@@ -164,6 +219,7 @@
     // 2. DOM & IMAGE/SCRIPT/IFRAME INJECTION BLOCKER
     // ============================================================
     function hookSrcProperty(proto, tag) {
+        if (!proto) return;
         const desc = Object.getOwnPropertyDescriptor(proto, 'src');
         if (desc && desc.set) {
             Object.defineProperty(proto, 'src', {
@@ -176,6 +232,7 @@
                     return desc.set.call(this, val);
                 },
                 configurable: true,
+                enumerable: desc.enumerable,
             });
         }
     }
@@ -184,19 +241,17 @@
     if (typeof HTMLIFrameElement !== 'undefined') hookSrcProperty(HTMLIFrameElement.prototype, 'iframe');
     if (typeof HTMLImageElement  !== 'undefined') hookSrcProperty(HTMLImageElement.prototype,  'img');
 
-    // Intercept new Image() beacons
     const OrigImage = window.Image;
-    if (OrigImage) {
-        window.Image = function (...args) {
-            const img = new OrigImage(...args);
-            return img;
-        };
-        window.Image.prototype = OrigImage.prototype;
+    if (OrigImage && OrigImage.prototype && (typeof HTMLImageElement === 'undefined' || OrigImage.prototype !== HTMLImageElement.prototype)) {
+        hookSrcProperty(OrigImage.prototype, 'img');
     }
 
     const origSetAttribute = Element.prototype.setAttribute;
     Element.prototype.setAttribute = function (name, value) {
-        if ((name === 'src' || (typeof name === 'string' && name.toLowerCase() === 'src')) && isTelemetryUrl(value)) {
+        if (
+            (name === 'src' || (typeof name === 'string' && name.length === 3 && name.toLowerCase() === 'src')) &&
+            isTelemetryUrl(value)
+        ) {
             LOG('blocked setAttribute(src):', value);
             return;
         }
@@ -208,22 +263,32 @@
     // ============================================================
     const OrigWorker = window.Worker;
     if (OrigWorker) {
-        window.Worker = function (scriptURL, options) {
-            const urlStr = String(scriptURL || '');
+        const WORKER_DUMMY_DESCS = {
+            postMessage:    { value: noop, writable: true, configurable: true },
+            terminate:      { value: noop, writable: true, configurable: true },
+            onerror:        { value: null, writable: true, configurable: true },
+            onmessage:      { value: null, writable: true, configurable: true },
+            onmessageerror: { value: null, writable: true, configurable: true },
+        };
+        const BLOB_PREFIX_RE = /^\s*blob:/i;
+
+        const PatchedWorker = function (scriptURL, options) {
+            const urlStr = typeof scriptURL === 'string' ? scriptURL : String(scriptURL || '');
             // Check if worker URL points to telemetry or is an OpenReplay/Sentry Blob
-            if (isTelemetryUrl(urlStr) || urlStr.startsWith('blob:')) {
+            if (BLOB_PREFIX_RE.test(urlStr) || isTelemetryUrl(scriptURL)) {
                 LOG('blocked telemetry WebWorker:', urlStr);
-                // Return a dummy worker that does nothing
                 const dummy = new EventTarget();
-                dummy.postMessage = noop;
-                dummy.terminate = noop;
-                dummy.onerror = null;
-                dummy.onmessage = null;
+                Object.setPrototypeOf(dummy, OrigWorker.prototype);
+                Object.defineProperties(dummy, WORKER_DUMMY_DESCS);
                 return dummy;
             }
-            return new OrigWorker(scriptURL, options);
+            return arguments.length > 1 && options !== undefined
+                ? new OrigWorker(scriptURL, options)
+                : new OrigWorker(scriptURL);
         };
-        window.Worker.prototype = OrigWorker.prototype;
+        PatchedWorker.prototype = OrigWorker.prototype;
+        Object.setPrototypeOf(PatchedWorker, OrigWorker);
+        window.Worker = PatchedWorker;
     }
 
     // ============================================================
@@ -231,21 +296,40 @@
     // ============================================================
     const OrigWebSocket = window.WebSocket;
     if (OrigWebSocket) {
+        const WS_DUMMY_DESCS = {
+            readyState:     { value: 3, writable: true, configurable: true },
+            protocol:       { value: '', writable: true, configurable: true },
+            extensions:     { value: '', writable: true, configurable: true },
+            bufferedAmount: { value: 0, writable: true, configurable: true },
+            binaryType:     { value: 'blob', writable: true, configurable: true },
+            send:           { value: noop, writable: true, configurable: true },
+            close:          { value: noop, writable: true, configurable: true },
+            onopen:         { value: null, writable: true, configurable: true },
+            onerror:        { value: null, writable: true, configurable: true },
+            onclose:        { value: null, writable: true, configurable: true },
+            onmessage:      { value: null, writable: true, configurable: true },
+        };
+
         const PatchedWebSocket = function (url, protocols) {
             if (isTelemetryUrl(url)) {
                 LOG('blocked WebSocket connection:', url);
                 const dummy = new EventTarget();
                 Object.setPrototypeOf(dummy, OrigWebSocket.prototype);
-                dummy.readyState = 3; // CLOSED
-                dummy.send = noop;
-                dummy.close = noop;
+                Object.defineProperties(dummy, WS_DUMMY_DESCS);
+                Object.defineProperty(dummy, 'url', {
+                    value: String(url),
+                    writable: true,
+                    configurable: true,
+                });
                 setTimeout(() => {
                     try {
                         const err = new Event('error');
+                        if (typeof dummy.onerror === 'function') dummy.onerror.call(dummy, err);
                         dummy.dispatchEvent(err);
                         const closeEvt = typeof CloseEvent !== 'undefined'
                             ? new CloseEvent('close', { code: 1006, reason: 'Blocked' })
                             : new Event('close');
+                        if (typeof dummy.onclose === 'function') dummy.onclose.call(dummy, closeEvt);
                         dummy.dispatchEvent(closeEvt);
                     } catch {}
                 }, 0);
@@ -267,17 +351,13 @@
     if (origFetch) {
         window.fetch = function (input, init) {
             try {
-                const url = typeof input === 'string'
-                    ? input
-                    : (input && (input.url || input.href || String(input))) || '';
-
-                if (isTelemetryUrl(url)) {
-                    LOG('blocked telemetry fetch:', url);
-                    return Promise.resolve(new Response('', NO_CONTENT_INIT));
+                if (isTelemetryUrl(input)) {
+                    LOG('blocked telemetry fetch:', input);
+                    return Promise.resolve(syntheticNoContent());
                 }
 
                 const rawMethod = (init && init.method) || (input && input.method);
-                if (isPostMethod(rawMethod) && isTargetApi(url)) {
+                if (isPostMethod(rawMethod) && isTargetApi(input)) {
                     const body = init ? init.body : null;
 
                     if (body == null && typeof Request !== 'undefined' && input instanceof Request) {
@@ -285,6 +365,18 @@
                             return input.clone().text().then((text) => {
                                 if (bodyLooksLikeLogImproperUse(text)) {
                                     LOG('dropped LogImproperUse (Request body)');
+                                    return syntheticOk();
+                                }
+                                return init !== undefined ? origFetch(input, init) : origFetch(input);
+                            }).catch(() => (init !== undefined ? origFetch(input, init) : origFetch(input)));
+                        } catch {}
+                    }
+
+                    if (typeof Blob !== 'undefined' && body instanceof Blob) {
+                        try {
+                            return body.text().then((text) => {
+                                if (bodyLooksLikeLogImproperUse(text)) {
+                                    LOG('dropped LogImproperUse (Blob body)');
                                     return syntheticOk();
                                 }
                                 return init !== undefined ? origFetch(input, init) : origFetch(input);
@@ -310,9 +402,50 @@
         const origOpen = OrigXHR.prototype.open;
         const origSend = OrigXHR.prototype.send;
 
+        const XHR_BLOCKED_DESCS = {
+            readyState:   { value: 4, configurable: true },
+            status:       { value: 204, configurable: true },
+            statusText:   { value: 'No Content', configurable: true },
+            responseText: { value: '', configurable: true },
+            response:     { value: '', configurable: true },
+        };
+
+        const XHR_OK_DESCS = {
+            readyState:   { value: 4, configurable: true },
+            status:       { value: 200, configurable: true },
+            statusText:   { value: 'OK', configurable: true },
+            responseText: { value: SYNTHETIC_OK_BODY, configurable: true },
+            response: {
+                get() {
+                    return this.responseType === 'json' ? SYNTHETIC_OK_JSON : SYNTHETIC_OK_BODY;
+                },
+                configurable: true,
+            },
+        };
+
+        function dispatchXhrDone(xhr, seq) {
+            setTimeout(() => {
+                if (xhr.__ul_seq !== seq) return;
+                try {
+                    xhr.dispatchEvent(new Event('readystatechange'));
+                    xhr.dispatchEvent(new Event('load'));
+                    xhr.dispatchEvent(new Event('loadend'));
+                } catch {}
+            }, 0);
+        }
+
         OrigXHR.prototype.open = function (method, url) {
             this.__ul_method = method;
             this.__ul_url    = url;
+            this.__ul_seq    = (this.__ul_seq || 0) + 1;
+            if (this.__ul_spoofed) {
+                this.__ul_spoofed = false;
+                delete this.readyState;
+                delete this.status;
+                delete this.statusText;
+                delete this.responseText;
+                delete this.response;
+            }
             return origOpen.apply(this, arguments);
         };
 
@@ -323,33 +456,19 @@
 
                 if (isTelemetryUrl(url)) {
                     LOG('blocked telemetry xhr:', url);
-                    Object.defineProperties(this, {
-                        readyState: { value: 4 },
-                        status:     { value: 204 },
-                        statusText: { value: 'No Content' },
-                    });
-                    setTimeout(() => {
-                        this.dispatchEvent(new Event('readystatechange'));
-                        this.dispatchEvent(new Event('load'));
-                        this.dispatchEvent(new Event('loadend'));
-                    }, 0);
+                    this.__ul_spoofed = true;
+                    const seq = (this.__ul_seq = (this.__ul_seq || 0) + 1);
+                    Object.defineProperties(this, XHR_BLOCKED_DESCS);
+                    dispatchXhrDone(this, seq);
                     return;
                 }
 
                 if (isPostMethod(method) && isTargetApi(url) && bodyLooksLikeLogImproperUse(body)) {
                     LOG('dropped LogImproperUse (xhr)');
-                    Object.defineProperties(this, {
-                        readyState:   { value: 4 },
-                        status:       { value: 200 },
-                        statusText:   { value: 'OK' },
-                        responseText: { value: SYNTHETIC_OK_BODY },
-                        response:     { get: () => (this.responseType === 'json' ? SYNTHETIC_OK_JSON : SYNTHETIC_OK_BODY) },
-                    });
-                    setTimeout(() => {
-                        this.dispatchEvent(new Event('readystatechange'));
-                        this.dispatchEvent(new Event('load'));
-                        this.dispatchEvent(new Event('loadend'));
-                    }, 0);
+                    this.__ul_spoofed = true;
+                    const seq = (this.__ul_seq = (this.__ul_seq || 0) + 1);
+                    Object.defineProperties(this, XHR_OK_DESCS);
+                    dispatchXhrDone(this, seq);
                     return;
                 }
             } catch (e) {
@@ -367,6 +486,10 @@
                     LOG('blocked sendBeacon:', url);
                     return true;
                 }
+                if (isTargetApi(url) && bodyLooksLikeLogImproperUse(data)) {
+                    LOG('dropped LogImproperUse (sendBeacon)');
+                    return true;
+                }
             } catch {}
             return origBeacon(url, data);
         };
@@ -375,29 +498,39 @@
     // ============================================================
     // 6. FULLSCREEN BLOCKER & AVAILABILITY SPOOFER
     // ============================================================
+    const FULLSCREEN_DOC_DESCS = {
+        fullscreenEnabled:       { get: returnFalse, configurable: true },
+        webkitFullscreenEnabled: { get: returnFalse, configurable: true },
+        mozFullScreenEnabled:    { get: returnFalse, configurable: true },
+        msFullscreenEnabled:     { get: returnFalse, configurable: true },
+    };
+    const rejectFs = () => Promise.reject(new DOMException('Fullscreen blocked', 'NotAllowedError'));
+    const FS_METHOD_DESC = { value: rejectFs, writable: true, configurable: true };
+    const FS_METHODS = [
+        'requestFullscreen',
+        'webkitRequestFullscreen',
+        'webkitRequestFullScreen',
+        'mozRequestFullScreen',
+        'msRequestFullscreen',
+    ];
+
     function installFullscreenBlocker() {
-        const docDescs = {
-            fullscreenEnabled:       { get: returnFalse, configurable: true },
-            webkitFullscreenEnabled: { get: returnFalse, configurable: true },
-            mozFullScreenEnabled:    { get: returnFalse, configurable: true },
-            msFullscreenEnabled:     { get: returnFalse, configurable: true },
-        };
         try {
-            Object.defineProperties(document, docDescs);
+            Object.defineProperties(document, FULLSCREEN_DOC_DESCS);
             if (typeof Document !== 'undefined' && Document.prototype) {
-                Object.defineProperties(Document.prototype, docDescs);
+                Object.defineProperties(Document.prototype, FULLSCREEN_DOC_DESCS);
             }
         } catch {}
 
-        const rejectFs = () => Promise.reject(new DOMException('Fullscreen blocked', 'NotAllowedError'));
         const proto = Element.prototype;
-        ['requestFullscreen', 'webkitRequestFullscreen', 'webkitRequestFullScreen', 'mozRequestFullScreen', 'msRequestFullscreen'].forEach((m) => {
+        for (let i = 0; i < FS_METHODS.length; i++) {
+            const m = FS_METHODS[i];
             try {
-                Object.defineProperty(proto, m, { value: rejectFs, writable: true, configurable: true });
+                Object.defineProperty(proto, m, FS_METHOD_DESC);
             } catch {
                 proto[m] = rejectFs;
             }
-        });
+        }
     }
     installFullscreenBlocker();
 
@@ -425,36 +558,77 @@
     }
     patchVisibilityProps();
 
-    const SUPPRESSED_EVENTS = new Set(['visibilitychange', 'webkitvisibilitychange', 'blur', 'focusout', 'pagehide', 'freeze']);
+    const SUPPRESSED_EVENTS = new Set([
+        'visibilitychange',
+        'webkitvisibilitychange',
+        'blur',
+        'focusout',
+        'pagehide',
+        'freeze',
+    ]);
 
-    let origProtoAdd = EventTarget.prototype.addEventListener;
+    const origProtoAdd = EventTarget.prototype.addEventListener;
+    const origWinAdd   = window.addEventListener || origProtoAdd;
+    const origDocAdd   = document.addEventListener || origProtoAdd;
+    const winDesc      = Object.getOwnPropertyDescriptor(window, 'window');
+    const rawWin       = (winDesc && winDesc.value) || window;
     try {
-        EventTarget.prototype.addEventListener = function (type, listener, options) {
-            if ((this === window || this === document) && SUPPRESSED_EVENTS.has(type)) {
-                return;
+        const patchedAddEventListener = function (type, listener, options) {
+            const target = this == null || this === window ? rawWin : this;
+            if (target === rawWin || target === document) {
+                if (SUPPRESSED_EVENTS.has(type)) return;
+                if (target === document) {
+                    return origDocAdd.call(document, type, listener, options);
+                }
+                try {
+                    return origWinAdd.call(rawWin, type, listener, options);
+                } catch {
+                    return origWinAdd.call(window, type, listener, options);
+                }
             }
             return origProtoAdd.call(this, type, listener, options);
         };
+        EventTarget.prototype.addEventListener = patchedAddEventListener;
+        if (window.addEventListener !== patchedAddEventListener) {
+            window.addEventListener = patchedAddEventListener;
+        }
+        if (document.addEventListener !== patchedAddEventListener) {
+            document.addEventListener = patchedAddEventListener;
+        }
     } catch {}
 
     const KILL = (e) => {
-        if ((e.type === 'blur' || e.type === 'focusout') && e.target && e.target !== window && e.target !== document) {
+        if (
+            (e.type === 'blur' || e.type === 'focusout') &&
+            e.target &&
+            e.target !== window &&
+            e.target !== rawWin &&
+            e.target !== document
+        ) {
             return;
         }
         e.stopImmediatePropagation();
         e.stopPropagation();
     };
 
-    ['visibilitychange', 'webkitvisibilitychange', 'blur', 'focusout', 'pagehide', 'freeze'].forEach((evt) => {
+    for (const evt of SUPPRESSED_EVENTS) {
         try {
-            origProtoAdd.call(window, evt, KILL, true);
-            origProtoAdd.call(document, evt, KILL, true);
+            origWinAdd.call(rawWin, evt, KILL, true);
+        } catch {
+            try { origWinAdd.call(window, evt, KILL, true); } catch {}
+        }
+        try {
+            origDocAdd.call(document, evt, KILL, true);
         } catch {}
-    });
+    }
 
     setInterval(() => {
-        if (document.visibilityState !== 'visible' || document.hidden !== false) patchVisibilityProps();
-        if (document.fullscreenEnabled !== false) installFullscreenBlocker();
+        if (document.visibilityState !== 'visible' || document.hidden !== false || document.hasFocus !== returnTrue) {
+            patchVisibilityProps();
+        }
+        if (document.fullscreenEnabled !== false) {
+            installFullscreenBlocker();
+        }
     }, 2000);
 
     LOG('=== READY | telemetry: blocked | workers: neutered | fullscreen: disabled | tab-switch: blocked ===');

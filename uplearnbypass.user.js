@@ -317,20 +317,28 @@
     const JITSU_HOSTS = TELEMETRY_SERVICES.jitsu.hosts;
 
     const hostCache = new Map();
+    const hostServiceCache = new Map();
+
     function hostOf(url) {
         if (!url || typeof url !== 'string') return '';
         let h = hostCache.get(url);
         if (h !== undefined) return h;
-        try { h = new URL(url, location.href).hostname.toLowerCase(); }
-        catch { h = ''; }
-        if (hostCache.size > 250) hostCache.clear();
+        if (url.charCodeAt(0) === 47 && url.charCodeAt(1) !== 47) {
+            h = (typeof location !== 'undefined' && location.hostname) ? location.hostname.toLowerCase() : API_HOST;
+        } else {
+            try { h = new URL(url, location.href).hostname.toLowerCase(); }
+            catch { h = ''; }
+        }
+        if (hostCache.size >= 250) {
+            hostCache.delete(hostCache.keys().next().value);
+        }
         hostCache.set(url, h);
         return h;
     }
 
     function isJitsuHost(h) {
         if (!h) return false;
-        if (h === 'web.uplearn.co.uk' || (typeof location !== 'undefined' && h === location.hostname)) return false;
+        if (h === API_HOST || (typeof location !== 'undefined' && h === location.hostname)) return false;
         for (let i = 0; i < JITSU_HOSTS.length; i++) {
             const t = JITSU_HOSTS[i];
             if (h === t || h.endsWith('.' + t)) return true;
@@ -343,54 +351,59 @@
         return isJitsuHost(hostOf(url));
     }
 
-    function matchTelemetryService(url) {
-        if (!url) return null;
-        const h = hostOf(url);
-        if (!h) return null;
-        if (h === 'web.uplearn.co.uk' || (typeof location !== 'undefined' && h === location.hostname)) return null;
-
-        // Jitsu is controlled by settings.suppressJitsu (synced with telemetryServices.jitsu and presets)
-        if (isJitsuHost(h)) {
-            if (!settings.suppressJitsu && !(settings.telemetryServices && settings.telemetryServices.jitsu)) return null;
-            return { key: 'jitsu', label: 'Jitsu', host: h, pattern: JITSU_HOSTS[0] };
-        }
-
-        const enabled = settings.telemetryServices || {};
-        for (const key in TELEMETRY_SERVICES) {
-            if (key === 'jitsu') continue;
-            if (!enabled[key]) continue;
-            const hosts = TELEMETRY_SERVICES[key].hosts;
-            for (let i = 0; i < hosts.length; i++) {
-                const t = hosts[i];
-                if (h === t || h.endsWith('.' + t)) {
-                    return { key, label: TELEMETRY_SERVICES[key].label, host: h, pattern: t };
-                }
-            }
-        }
-        return null;
-    }
-
     function matchAnyTelemetryService(url) {
         if (!url) return null;
         const h = hostOf(url);
         if (!h) return null;
-        if (h === 'web.uplearn.co.uk' || (typeof location !== 'undefined' && h === location.hostname)) return null;
-        for (const key in TELEMETRY_SERVICES) {
+        if (h === API_HOST || (typeof location !== 'undefined' && h === location.hostname)) return null;
+        let cached = hostServiceCache.get(h);
+        if (cached !== undefined) return cached;
+
+        let found = null;
+        outer: for (const key in TELEMETRY_SERVICES) {
             const hosts = TELEMETRY_SERVICES[key].hosts;
             for (let i = 0; i < hosts.length; i++) {
                 const t = hosts[i];
                 if (h === t || h.endsWith('.' + t)) {
-                    return { key, label: TELEMETRY_SERVICES[key].label, host: h, pattern: t };
+                    found = { key, label: TELEMETRY_SERVICES[key].label, host: h, pattern: t };
+                    break outer;
                 }
             }
         }
-        return null;
+        if (hostServiceCache.size >= 250) {
+            hostServiceCache.delete(hostServiceCache.keys().next().value);
+        }
+        hostServiceCache.set(h, found);
+        return found;
+    }
+
+    function isServiceMatchBlocked(m) {
+        if (!m) return false;
+        // Jitsu is controlled by settings.suppressJitsu (synced with telemetryServices.jitsu and presets)
+        if (m.key === 'jitsu') {
+            return !!(settings.suppressJitsu && (!settings.telemetryServices || settings.telemetryServices.jitsu !== false));
+        }
+        return !!(settings.telemetryServices && settings.telemetryServices[m.key]);
+    }
+
+    function matchTelemetryService(url) {
+        const m = matchAnyTelemetryService(url);
+        return isServiceMatchBlocked(m) ? m : null;
     }
 
     function isTelemetryUrl(url) { return !!matchTelemetryService(url); }
 
     function isTargetApi(url) {
         if (!url || typeof url !== 'string') return false;
+        if (
+            url === '/api' ||
+            url === '/api/' ||
+            url === 'https://web.uplearn.co.uk/api' ||
+            url === 'https://web.uplearn.co.uk/api/'
+        ) {
+            return true;
+        }
+        if (!url.includes('/api')) return false;
         if (!url.includes(API_HOST) && !url.startsWith('/api')) return false;
         try {
             const u = new URL(url, location.href);
@@ -411,42 +424,36 @@
     // ============================================================
     // CONSOLE NOISE FILTER
     // ============================================================
-    const NOISE_PATTERNS = [
-        /\[J-(?:ERROR|WARN|DEBUG|INFO|LOG)\]/i,
-        /\[Jitsu\]/i,
-        /Failed to send data to/i,
-        /Dropping queued event after/i,
-        /max send attempts/i,
-        /\[Sentry\]/i,
-    ];
+    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-    const ALL_TELEMETRY_HOSTS = (() => {
-        const arr = [];
+    const ALWAYS_NOISE_RE = (() => {
+        const parts = ['\\[Sentry\\]'];
         for (const k in TELEMETRY_SERVICES) {
-            for (const h of TELEMETRY_SERVICES[k].hosts) arr.push(h);
+            if (k === 'jitsu') continue;
+            for (const h of TELEMETRY_SERVICES[k].hosts) parts.push(escapeRegExp(h));
         }
-        return arr;
+        return new RegExp(parts.join('|'), 'i');
+    })();
+
+    const JITSU_NOISE_RE = (() => {
+        const parts = [
+            '\\[J-(?:ERROR|WARN|DEBUG|INFO|LOG)\\]',
+            '\\[Jitsu\\]',
+            'Failed to send data to',
+            'Dropping queued event after',
+            'max send attempts',
+        ];
+        for (const h of JITSU_SERVICES_HOSTS_REF()) parts.push(escapeRegExp(h));
+        return new RegExp(parts.join('|'), 'i');
+        function JITSU_SERVICES_HOSTS_REF() { return TELEMETRY_SERVICES.jitsu.hosts; }
     })();
 
     function textMatchesNoise(text) {
         if (typeof text !== 'string' || !text) return false;
+        if (ALWAYS_NOISE_RE.test(text)) return true;
         // If Jitsu is being ALLOWED (suppressJitsu === false), don't silence its own
         // log lines — the user asked to see what it's doing.
-        const showJitsuNoise = !settings.suppressJitsu;
-        for (let i = 0; i < NOISE_PATTERNS.length; i++) {
-            if (NOISE_PATTERNS[i].test(text)) {
-                if (showJitsuNoise && i < 5) continue; // first 5 patterns are Jitsu-specific
-                return true;
-            }
-        }
-        const lower = text.toLowerCase();
-        for (let i = 0; i < ALL_TELEMETRY_HOSTS.length; i++) {
-            const h = ALL_TELEMETRY_HOSTS[i];
-            if (lower.indexOf(h) !== -1) {
-                if (showJitsuNoise && isJitsuHost(h)) continue;
-                return true;
-            }
-        }
+        if (settings.suppressJitsu && JITSU_NOISE_RE.test(text)) return true;
         return false;
     }
 
@@ -562,30 +569,37 @@
         nativeConsole.groupEnd();
     }
 
+    const OP_TYPE_RE = /^\s*(mutation|query|subscription)/i;
+
     // Dedicated reporter for LogImproperUse so it stands out from generic
     // telemetry blocks. Bumps its own counter and uses pink styling.
     function reportLogImproperUse(source, url, body) {
-        if (settings.logLevel === 'silent') return;
         stats.logImproperUseBlocked++;
+        if (settings.logLevel === 'silent') return;
 
         let opName = 'LogImproperUse';
         let opType = '';
         let variableNames = [];
         try {
             const parsed = JSON.parse(body);
-            if (parsed && typeof parsed === 'object') {
-                if (typeof parsed.operationName === 'string' && parsed.operationName) {
-                    opName = parsed.operationName;
+            const target = Array.isArray(parsed) ? parsed[0] : parsed;
+            if (target && typeof target === 'object') {
+                if (typeof target.operationName === 'string' && target.operationName) {
+                    opName = target.operationName;
                 }
-                if (parsed.variables && typeof parsed.variables === 'object') {
-                    variableNames = Object.keys(parsed.variables);
+                if (target.variables && typeof target.variables === 'object') {
+                    variableNames = Object.keys(target.variables);
+                }
+                if (typeof target.query === 'string') {
+                    const m = OP_TYPE_RE.exec(target.query);
+                    if (m) opType = m[1].toLowerCase();
                 }
             }
         } catch {}
-        try {
-            const opTypeMatch = /^\s*(mutation|query|subscription)/i.exec(body);
+        if (!opType && typeof body === 'string') {
+            const opTypeMatch = OP_TYPE_RE.exec(body);
             if (opTypeMatch) opType = opTypeMatch[1].toLowerCase();
-        } catch {}
+        }
 
         const bodyPreviewShort = truncateBody(body, 140);
         const bodyPreviewFull  = truncateBody(body, 2400);
@@ -686,8 +700,7 @@
         const origSetAttribute = Element.prototype.setAttribute;
         Element.prototype.setAttribute = function (name, value) {
             if (settings.blockDomElements &&
-                typeof name === 'string' &&
-                name.toLowerCase() === 'src' &&
+                (name === 'src' || (typeof name === 'string' && name.length === 3 && name.toLowerCase() === 'src')) &&
                 isTelemetryUrl(value)) {
                 reportBlock('setAttribute("src")', value, {
                     element: this.tagName ? this.tagName.toLowerCase() : 'unknown',
@@ -701,12 +714,19 @@
     try {
         const domObserver = new MutationObserver((mutations) => {
             if (!settings.blockDomElements) return;
-            for (const m of mutations) {
-                for (const node of m.addedNodes) {
-                    if (node.nodeType !== Node.ELEMENT_NODE) continue;
-                    const tag = node.tagName.toLowerCase();
-                    if (tag === 'script' || tag === 'iframe') {
-                        const src = node.src || node.getAttribute('src');
+            for (let i = 0; i < mutations.length; i++) {
+                const added = mutations[i].addedNodes;
+                for (let j = 0; j < added.length; j++) {
+                    const node = added[j];
+                    if (node.nodeType !== 1) continue;
+                    const rawTag = node.tagName;
+                    if (
+                        rawTag === 'SCRIPT' ||
+                        rawTag === 'IFRAME' ||
+                        (typeof rawTag === 'string' && rawTag.length === 6 && (rawTag.toLowerCase() === 'script' || rawTag.toLowerCase() === 'iframe'))
+                    ) {
+                        const tag = rawTag.toLowerCase();
+                        const src = node.src || (typeof node.getAttribute === 'function' ? node.getAttribute('src') : '');
                         if (isTelemetryUrl(src)) {
                             reportBlock(`DOM injection (<${tag}>)`, src, {
                                 element: tag,
@@ -760,10 +780,13 @@
     const DARK_PRE_INVERT_BG  = '#ffffff';
 
     function ensureDarkModeStyles() {
-        if (document.getElementById(DARK_MODE_STYLE_ID)) return;
-        const style = document.createElement('style');
-        style.id = DARK_MODE_STYLE_ID;
-        style.textContent = `
+        try {
+            if (document.getElementById(DARK_MODE_STYLE_ID)) return;
+            const root = document.head || document.documentElement;
+            if (!root) return;
+            const style = document.createElement('style');
+            style.id = DARK_MODE_STYLE_ID;
+            style.textContent = `
             html.ul-dark-mode,
             html.ul-dark-mode body { background-color: ${DARK_BASE_COLOR} !important; }
             html.ul-dark-mode #root {
@@ -793,15 +816,18 @@
                 filter: invert(1) hue-rotate(180deg) contrast(${CHILD_CONTRAST});
             }
         `;
-        (document.head || document.documentElement).appendChild(style);
+            root.appendChild(style);
+        } catch {}
     }
 
     function applyDarkMode() {
         try {
             const html = document.documentElement;
             if (!html) return;
-            if (settings.darkMode) html.classList.add('ul-dark-mode');
-            else html.classList.remove('ul-dark-mode');
+            if (settings.darkMode) ensureDarkModeStyles();
+            const has = html.classList.contains('ul-dark-mode');
+            if (settings.darkMode && !has) html.classList.add('ul-dark-mode');
+            else if (!settings.darkMode && has) html.classList.remove('ul-dark-mode');
         } catch (e) { WARN('dark mode apply failed', e); }
     }
 
@@ -809,27 +835,18 @@
     applyDarkMode();
 
     try {
-        const obs = new MutationObserver(() => {
-            const html = document.documentElement;
-            if (!html) return;
-            const has = html.classList.contains('ul-dark-mode');
-            if (settings.darkMode && !has) html.classList.add('ul-dark-mode');
-            else if (!settings.darkMode && has) html.classList.remove('ul-dark-mode');
-        });
+        const obs = new MutationObserver(applyDarkMode);
         obs.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
     } catch {}
 
-    setInterval(() => {
-        const html = document.documentElement;
-        if (!html) return;
-        const has = html.classList.contains('ul-dark-mode');
-        if (settings.darkMode && !has) html.classList.add('ul-dark-mode');
-        else if (!settings.darkMode && has) html.classList.remove('ul-dark-mode');
-    }, 3000);
+    setInterval(applyDarkMode, 3000);
 
     // ============================================================
     // LOGIMPROPERUSE DETECTION
     // ============================================================
+    const LOG_IMPROPER_RE = /logimproperuse/i;
+    const LOG_IMPROPER_PAYLOAD = JSON.stringify({ data: { logImproperUse: true } });
+
     function bodyLooksLikeLogImproperUse(body) {
         if (body == null) return false;
         if (typeof body !== 'string') {
@@ -838,20 +855,11 @@
                 else return false;
             } catch { return false; }
         }
-        if (!/LogImproperUse|logImproperUse/i.test(body)) return false;
-        try {
-            const parsed = JSON.parse(body);
-            const op = parsed && (parsed.operationName || '');
-            if (/LogImproperUse/i.test(op)) return true;
-            const q = parsed && parsed.query;
-            if (typeof q === 'string' && /LogImproperUse|logImproperUse/i.test(q)) return true;
-        } catch { /* not JSON */ }
-        return true;
+        return LOG_IMPROPER_RE.test(body);
     }
 
     function logImproperUseSyntheticResponse() {
-        const body = JSON.stringify({ data: { logImproperUse: true } });
-        return new Response(body, {
+        return new Response(LOG_IMPROPER_PAYLOAD, {
             status: 200, statusText: 'OK',
             headers: { 'Content-Type': 'application/json' }
         });
@@ -900,6 +908,11 @@
         return `${hh}h ${mm % 60}m ${ss}s`;
     }
 
+    const ISO_DURATION_RE = /^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i;
+    const COLON_TIME_RE   = /^\d+(?::[0-5]?\d){1,2}(?:\.\d+)?$/;
+    const UNIT_TIME_RE    = /(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/gi;
+    const BARE_NUM_RE     = /^\d+(\.\d+)?$/;
+
     function parseDurationToSeconds(raw) {
         if (raw == null) return null;
         if (typeof raw === 'number') {
@@ -909,8 +922,8 @@
         if (!s) return null;
 
         // ISO-8601 (e.g. PT1M15S, PT45.5S, P0DT1M15S)
-        if (/^P/i.test(s)) {
-            const m = /^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i.exec(s);
+        if (s.charCodeAt(0) === 80 || s.charCodeAt(0) === 112) {
+            const m = ISO_DURATION_RE.exec(s);
             if (!m) return null;
             const d  = parseFloat(m[1] || 0);
             const h  = parseFloat(m[2] || 0);
@@ -920,30 +933,30 @@
         }
 
         // mm:ss or hh:mm:ss (including optional fractional seconds like 00:01:15.5)
-        if (/^\d+(?::[0-5]?\d){1,2}(?:\.\d+)?$/.test(s)) {
-            const parts = s.split(':').map(parseFloat);
+        if (COLON_TIME_RE.test(s)) {
+            const parts = s.split(':');
             let secs = 0;
-            for (const p of parts) secs = secs * 60 + p;
+            for (let i = 0; i < parts.length; i++) secs = secs * 60 + parseFloat(parts[i]);
             return secs;
         }
 
         // "1h 30m 20s", "90s", "1.5m", "2 min"
-        const unitRe = /(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/gi;
+        UNIT_TIME_RE.lastIndex = 0;
         let total = 0;
         let matched = false;
         let m;
-        while ((m = unitRe.exec(s)) !== null) {
+        while ((m = UNIT_TIME_RE.exec(s)) !== null) {
             matched = true;
             const value = parseFloat(m[1]);
-            const unit  = m[2].toLowerCase();
-            if (unit[0] === 'h')      total += value * 3600;
-            else if (unit[0] === 'm') total += value * 60;
-            else                      total += value;
+            const c = m[2].charCodeAt(0) | 32; // fast lowercase ASCII char
+            if (c === 104)      total += value * 3600; // 'h'
+            else if (c === 109) total += value * 60;   // 'm'
+            else                total += value;
         }
         if (matched) return total;
 
         // Bare number => seconds
-        if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+        if (BARE_NUM_RE.test(s)) return parseFloat(s);
 
         return null;
     }
@@ -963,12 +976,21 @@
     let currentVideoLesson                 = null;
     let lastSkippedTarget                  = null;
     let autoSkipThrottled                  = false;
+    let autoSkipThrottleTimer              = null;
     let lastSubmittedInVideoQuestionId     = null;
     let lastSubmittedPreVideoQuestionId    = null;
     let lastActiveVideoElement             = null;
-    let videoDetectedTimestamp             = 0;
     let lastQuestionAnsweredAt             = 0;
     let waitingForPostAnswerResume         = false;
+
+    function throttleAutoSkip() {
+        autoSkipThrottled = true;
+        if (autoSkipThrottleTimer) clearTimeout(autoSkipThrottleTimer);
+        autoSkipThrottleTimer = setTimeout(() => {
+            autoSkipThrottleTimer = null;
+            autoSkipThrottled = false;
+        }, 1500);
+    }
 
     function isQuestionAnswered(q) {
         if (!q || !currentVideoLesson || !currentVideoLesson.answeredQuestionIds) return false;
@@ -987,10 +1009,10 @@
     }
 
     function inspectOutgoingGraphQL(body) {
-        if (!body || typeof body !== 'string') return;
+        if (!body || typeof body !== 'string') return undefined;
         if (!body.includes('AnswerInVideoQuestion') && !body.includes('answerInVideoQuestion') &&
             !body.includes('AnswerPreVideoQuestion') && !body.includes('answerPreVideoQuestion')) {
-            return;
+            return undefined;
         }
         try {
             const json = JSON.parse(body);
@@ -1016,7 +1038,10 @@
             };
             if (Array.isArray(json)) json.forEach(checkOp);
             else checkOp(json);
-        } catch {}
+            return json;
+        } catch {
+            return null;
+        }
     }
 
     function handleApiResponse(data) {
@@ -1242,40 +1267,45 @@
         return false;
     }
 
+    const QUIZ_ACTION_LABELS = new Set([
+        'submit',
+        'submit answer',
+        'check',
+        'check answer',
+        'continue',
+        'continue video',
+        'resume',
+        'resume video',
+        'try again',
+        'next',
+        'next question',
+    ]);
+
     function isQuestionActiveOnPage() {
         try {
-            const host = typeof document.getElementById === 'function'
-                ? document.getElementById('__ul-heroui-host')
-                : null;
-
-            const submitBtn = findSubmitButton();
-            if (submitBtn && isElementVisible(submitBtn)) {
-                if (!host || !host.contains || !host.contains(submitBtn)) {
-                    return true;
-                }
-            }
+            const host = (uiHostEl && uiHostEl.isConnected)
+                ? uiHostEl
+                : (typeof document.getElementById === 'function' ? document.getElementById('__ul-heroui-host') : null);
 
             if (typeof document.querySelectorAll === 'function') {
                 // Check visible quiz action buttons (Submit, Check, Continue, Resume, Try Again)
+                // Check text label BEFORE layout visibility to avoid synchronous reflows on unrelated buttons
                 const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"]');
-                for (let i = 0; i < buttons.length; i++) {
-                    const btn = buttons[i];
-                    if (!isElementVisible(btn)) continue;
-                    if (host && typeof host.contains === 'function' && host.contains(btn)) continue;
-                    const txt = (btn.innerText || btn.textContent || btn.value || '').trim().toLowerCase();
-                    if (
-                        txt === 'submit' ||
-                        txt === 'submit answer' ||
-                        txt === 'check' ||
-                        txt === 'check answer' ||
-                        txt === 'continue' ||
-                        txt === 'continue video' ||
-                        txt === 'resume' ||
-                        txt === 'resume video' ||
-                        txt === 'try again' ||
-                        txt === 'next' ||
-                        txt === 'next question'
-                    ) {
+                if (buttons.length > 0) {
+                    for (let i = 0; i < buttons.length; i++) {
+                        const btn = buttons[i];
+                        const rawTxt = btn.textContent || btn.innerText || btn.value || '';
+                        if (!rawTxt) continue;
+                        const txt = rawTxt.trim().toLowerCase();
+                        if (!QUIZ_ACTION_LABELS.has(txt)) continue;
+                        if (host && typeof host.contains === 'function' && host.contains(btn)) continue;
+                        if (isElementVisible(btn)) {
+                            return true;
+                        }
+                    }
+                } else {
+                    const submitBtn = findSubmitButton();
+                    if (submitBtn && (!host || !host.contains || !host.contains(submitBtn)) && isElementVisible(submitBtn)) {
                         return true;
                     }
                 }
@@ -1284,23 +1314,27 @@
                 const inputs = document.querySelectorAll('input[type="radio"], input[type="checkbox"]');
                 for (let i = 0; i < inputs.length; i++) {
                     const inp = inputs[i];
-                    if (!isElementVisible(inp)) continue;
                     if (host && typeof host.contains === 'function' && host.contains(inp)) continue;
-                    return true;
+                    if (isElementVisible(inp)) return true;
                 }
 
                 // Check question modals / overlays
                 const modals = document.querySelectorAll('[role="dialog"], .quiz-content, [data-testid*="question"]');
                 for (let i = 0; i < modals.length; i++) {
                     const m = modals[i];
-                    if (!isElementVisible(m)) continue;
                     if (host && typeof host.contains === 'function' && host.contains(m)) continue;
+                    if (isElementVisible(m)) return true;
+                }
+            } else {
+                const submitBtn = findSubmitButton();
+                if (submitBtn && (!host || !host.contains || !host.contains(submitBtn)) && isElementVisible(submitBtn)) {
                     return true;
                 }
-            } else if (typeof document.querySelector === 'function') {
-                const activeModal = document.querySelector('[role="dialog"], .quiz-content, [data-testid*="question"]');
-                if (activeModal && isElementVisible(activeModal)) {
-                    return true;
+                if (typeof document.querySelector === 'function') {
+                    const activeModal = document.querySelector('[role="dialog"], .quiz-content, [data-testid*="question"]');
+                    if (activeModal && isElementVisible(activeModal)) {
+                        return true;
+                    }
                 }
             }
         } catch {}
@@ -1316,7 +1350,6 @@
 
         if (video !== lastActiveVideoElement) {
             lastActiveVideoElement = video;
-            videoDetectedTimestamp = Date.now();
             lastSkippedTarget = null;
         }
 
@@ -1369,10 +1402,9 @@
 
         // 1. Check for unanswered in-video questions (NEVER auto-mark questions answered by playback time!)
         if (currentVideoLesson && Array.isArray(currentVideoLesson.questions) && currentVideoLesson.questions.length > 0) {
-            const unansweredQuestions = currentVideoLesson.questions.filter((q) => !isQuestionAnswered(q));
+            const nextQ = currentVideoLesson.questions.find((q) => !isQuestionAnswered(q));
 
-            if (unansweredQuestions.length > 0) {
-                const nextQ = unansweredQuestions[0];
+            if (nextQ) {
                 if (nextQ.triggerTime == null || !isFinite(nextQ.triggerTime)) {
                     // Question exists with unknown triggerTime -> never skip to end while unanswered
                     return;
@@ -1387,8 +1419,7 @@
                     const target = Math.max(0, nextQ.triggerTime - leadOffset);
                     if (Math.abs(currentTime - target) > 0.3 && (lastSkippedTarget !== nextQ.triggerTime || dist > 4.0)) {
                         lastSkippedTarget = nextQ.triggerTime;
-                        autoSkipThrottled = true;
-                        setTimeout(() => { autoSkipThrottled = false; }, 1500);
+                        throttleAutoSkip();
 
                         LOG(`[autoSkip] Skipping video to question at ${formatSeconds(nextQ.triggerTime)}`);
                         nativeConsole.log(`[UpLearn Video] Auto-skipping video from ${formatSeconds(currentTime)} to question at ${formatSeconds(nextQ.triggerTime)}`);
@@ -1428,8 +1459,7 @@
                     const target = Math.max(0, nextQ.triggerTime - leadOffset);
                     if (lastSkippedTarget !== `rewind-${nextQ.triggerTime}`) {
                         lastSkippedTarget = `rewind-${nextQ.triggerTime}`;
-                        autoSkipThrottled = true;
-                        setTimeout(() => { autoSkipThrottled = false; }, 1500);
+                        throttleAutoSkip();
 
                         LOG(`[autoSkip] Rewinding video to unanswered question at ${formatSeconds(nextQ.triggerTime)}`);
                         try {
@@ -1467,8 +1497,7 @@
             const target = Math.max(0, duration - 0.3);
             if (lastSkippedTarget !== 'end' && Math.abs(currentTime - target) > 0.5) {
                 lastSkippedTarget = 'end';
-                autoSkipThrottled = true;
-                setTimeout(() => { autoSkipThrottled = false; }, 1500);
+                throttleAutoSkip();
 
                 LOG(`[autoSkip] No remaining questions; skipping to video completion (${formatSeconds(duration)})`);
                 nativeConsole.log(`[UpLearn Video] Auto-skipping video from ${formatSeconds(currentTime)} to completion (${formatSeconds(duration)})`);
@@ -1579,17 +1608,20 @@
 
     function findSubmitButton() {
         const buttons = document.querySelectorAll('button[type="submit"]');
-        for (const b of buttons) {
-            const t = (b.textContent || '').trim().toLowerCase();
-            if (t === MANUAL_TRIGGER_LABEL) return b;
+        for (let i = 0; i < buttons.length; i++) {
+            const b = buttons[i];
+            if ((b.textContent || '').trim().toLowerCase() === MANUAL_TRIGGER_LABEL) return b;
         }
         const allButtons = document.querySelectorAll('button');
-        for (const b of allButtons) {
-            const t = (b.textContent || '').trim().toLowerCase();
-            if (t === MANUAL_TRIGGER_LABEL) return b;
+        for (let i = 0; i < allButtons.length; i++) {
+            const b = allButtons[i];
+            if ((b.textContent || '').trim().toLowerCase() === MANUAL_TRIGGER_LABEL) return b;
         }
         return null;
     }
+
+    let pulseTimer = null;
+    const stopPropagation = (e) => e.stopPropagation();
 
     function updateLabel(btn, pulse) {
         if (editing) return;          // never clobber the input
@@ -1614,10 +1646,14 @@
         }
 
         if (pulse) {
+            if (pulseTimer) clearTimeout(pulseTimer);
             btn.classList.remove('us-reset');
             void btn.offsetWidth;
             btn.classList.add('us-reset');
-            setTimeout(() => btn.classList.remove('us-reset'), 500);
+            pulseTimer = setTimeout(() => {
+                pulseTimer = null;
+                btn.classList.remove('us-reset');
+            }, 500);
         }
     }
 
@@ -1638,11 +1674,11 @@
         input.placeholder  = 'seconds';
         input.value        = queuedSeconds !== null ? String(round3(queuedSeconds)) : '';
 
-        ['click', 'mousedown', 'mouseup'].forEach((ev) =>
-            input.addEventListener(ev, (e) => e.stopPropagation())
-        );
-        input.addEventListener('keydown', onInputKeyDown);
-        input.addEventListener('blur',    onInputBlur);
+        input.addEventListener('click',     stopPropagation);
+        input.addEventListener('mousedown', stopPropagation);
+        input.addEventListener('mouseup',   stopPropagation);
+        input.addEventListener('keydown',   onInputKeyDown);
+        input.addEventListener('blur',      onInputBlur);
 
         btn.appendChild(input);
         input.focus();
@@ -1795,19 +1831,28 @@
 
     let manualBtnScheduled = false;
     function scheduleEnsureButton(mutations) {
-        if (!settings.manualTimeButtonEnabled) return;
+        if (!settings.manualTimeButtonEnabled || manualBtnScheduled) return;
         if (mutations && Array.isArray(mutations)) {
-            let onlyOurHost = true;
+            let onlyOurElements = true;
             for (let i = 0; i < mutations.length; i++) {
                 const target = mutations[i].target;
-                if (!target || (!target.id?.includes('__ul-') && (!target.closest || !target.closest('#__ul-heroui-host')))) {
-                    onlyOurHost = false;
+                if (!target) {
+                    onlyOurElements = false;
+                    break;
+                }
+                const tid = target.id;
+                const isOurs = target === uiHostEl ||
+                    tid === MANUAL_BUTTON_ID ||
+                    (typeof tid === 'string' && tid.includes('__ul-')) ||
+                    (target.parentElement && target.parentElement.id === MANUAL_BUTTON_ID) ||
+                    (uiHostEl && typeof uiHostEl.contains === 'function' && uiHostEl.contains(target));
+                if (!isOurs) {
+                    onlyOurElements = false;
                     break;
                 }
             }
-            if (onlyOurHost) return;
+            if (onlyOurElements) return;
         }
-        if (manualBtnScheduled) return;
         manualBtnScheduled = true;
         setTimeout(() => {
             manualBtnScheduled = false;
@@ -1833,20 +1878,23 @@
      * ------------------------------------------------------------ */
     function maybeBumpTimeSpent(body, source) {
         if (typeof body !== 'string') return { body, changed: false };
-        inspectOutgoingGraphQL(body);
+        const inspectedJson = inspectOutgoingGraphQL(body);
+        if (inspectedJson === null) return { body, changed: false };
 
         const boostActive = settings.timeBoostEnabled || queuedSeconds !== null;
         const videoActive = settings.fullVideoWatchedEnabled || settings.addVideoDurationToTimeSpent;
         if (!boostActive && !videoActive) return { body, changed: false };
 
-        const hasQuiz  = boostActive && (body.includes(QUIZ_OP) || body.includes('AnswerInVideoQuestion') || body.includes('AnswerPreVideoQuestion'));
+        const hasQuiz  = boostActive && (inspectedJson !== undefined || body.includes(QUIZ_OP) || body.includes('AnswerInVideoQuestion') || body.includes('AnswerPreVideoQuestion'));
         const hasGroup = boostActive && body.includes(GROUP_OP);
         const hasVideo = (videoActive || boostActive) && body.includes(VIDEO_OP);
         if (!hasQuiz && !hasGroup && !hasVideo) return { body, changed: false };
 
-        let json;
-        try { json = JSON.parse(body); }
-        catch { return { body, changed: false }; }
+        let json = inspectedJson;
+        if (json === undefined) {
+            try { json = JSON.parse(body); }
+            catch { return { body, changed: false }; }
+        }
 
         let changed = false;
         let manualResetNeeded = false;
@@ -2026,134 +2074,140 @@
     // FETCH INTERCEPTOR
     // ============================================================
     const origFetch = window.fetch;
+    function attachFetchResponseInspector(fetchPromise) {
+        fetchPromise.then((res) => {
+            try {
+                if (res && res.ok && typeof res.clone === 'function') {
+                    const cloned = res.clone();
+                    if (typeof cloned.text === 'function') {
+                        cloned.text().then((rt) => {
+                            if (rt && (rt.includes('videoLesson') || rt.includes('VideoQuestion'))) {
+                                handleApiResponse(JSON.parse(rt));
+                            }
+                        }).catch(() => {});
+                    } else if (typeof cloned.json === 'function') {
+                        cloned.json().then(handleApiResponse).catch(() => {});
+                    }
+                }
+            } catch {}
+        }).catch(() => {});
+    }
+
     if (origFetch) {
         window.fetch = function (input, init) {
             const self = this;
             let url = '';
             let method = 'GET';
+            let targetApi = false;
             try {
                 url = typeof input === 'string' ? input
                           : (input && input.url) ? input.url
                           : String(input || '');
                 method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
 
-                // ---- Telemetry block ----
-                if (isTelemetryUrl(url)) {
-                    stats.blocked++;
-                    const m = matchTelemetryService(url);
-                    const isJitsu = m && m.key === 'jitsu';
-
-                    const doBlock = (capturedBody) => {
-                        if (isJitsu) {
-                            stats.jitsuPackets++;
-                            reportJitsuPacket('fetch · BLOCKED', url, capturedBody);
-                        } else {
-                            reportBlock('fetch', url, { method, body: capturedBody });
-                        }
-                        return new Response('{}', {
-                            status: 200, statusText: 'OK',
-                            headers: { 'Content-Type': 'application/json' },
-                        });
-                    };
-
-                    let bodyStr = init && typeof init.body === 'string' ? init.body : null;
-                    if (bodyStr == null && typeof Request !== 'undefined' && input instanceof Request) {
-                        try {
-                            const ct = (input.headers.get('content-type') || '').toLowerCase();
-                            if (ct.includes('application/json') || ct.includes('text/')) {
-                                return input.clone().text().then(doBlock);
-                            }
-                        } catch {}
-                    }
-                    return Promise.resolve(doBlock(bodyStr));
-                }
-
-                // ---- Jitsu allowed: log the packet, then pass through ----
-                if (isJitsuUrl(url)) {
-                    stats.jitsuPackets++;
-                    const doLogAndPass = (capturedBody) => {
-                        reportJitsuPacket('fetch', url, capturedBody);
-                        return origFetch.call(self, input, init);
-                    };
-                    let bodyStr = init && typeof init.body === 'string' ? init.body : null;
-                    if (bodyStr == null && typeof Request !== 'undefined' && input instanceof Request) {
-                        try {
-                            const ct = (input.headers.get('content-type') || '').toLowerCase();
-                            if (ct.includes('application/json') || ct.includes('text/')) {
-                                return input.clone().text().then(doLogAndPass);
-                            }
-                        } catch {}
-                    }
-                    return doLogAndPass(bodyStr);
-                }
-
-                if (settings.logLevel === 'verbose') {
-                    const m = matchAnyTelemetryService(url);
-                    if (m && !settings.telemetryServices[m.key]) {
-                        reportAllow('fetch', url, `service "${m.label}" disabled in settings`);
-                    }
-                }
-
-                if (method === 'POST' && isTargetApi(url)) {
-                    stats.apiPosts++;
-                    let body = init && typeof init.body === 'string' ? init.body : null;
-
-                    if (body == null && typeof Request !== 'undefined' && input instanceof Request) {
-                        const ct = (input.headers.get('content-type') || '').toLowerCase();
-                        if (ct.includes('application/json')) {
-                            const passInit = init;
-                            return input.clone().text().then((text) => {
-                                if (settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(text)) {
-                                    reportLogImproperUse('fetch · Request body', url, text);
-                                    stats.blocked++;
-                                    return logImproperUseSyntheticResponse();
-                                }
-                                const { body: newBody, changed } = maybeBumpTimeSpent(text, 'fetch-Req');
-                                const newReq = new Request(input, {
-                                    body: changed ? newBody : text,
-                                    method: input.method
-                                });
-                                const fetchPromise = origFetch.call(self, newReq, passInit);
-                                if (isTargetApi(url)) {
-                                    fetchPromise.then((res) => {
-                                        try {
-                                            if (res && res.ok && typeof res.clone === 'function') {
-                                                res.clone().json().then(handleApiResponse).catch(() => {});
-                                            }
-                                        } catch {}
-                                    }).catch(() => {});
-                                }
-                                return fetchPromise;
-                            });
-                        }
-                    }
-
-                    if (body != null && settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(body)) {
-                        reportLogImproperUse('fetch', url, body);
+                const anyMatch = matchAnyTelemetryService(url);
+                if (anyMatch) {
+                    // ---- Telemetry block ----
+                    if (isServiceMatchBlocked(anyMatch)) {
                         stats.blocked++;
-                        return Promise.resolve(logImproperUseSyntheticResponse());
+                        const isJitsu = anyMatch.key === 'jitsu';
+
+                        const doBlock = (capturedBody) => {
+                            if (isJitsu) {
+                                stats.jitsuPackets++;
+                                reportJitsuPacket('fetch · BLOCKED', url, capturedBody);
+                            } else {
+                                reportBlock('fetch', url, { method, body: capturedBody });
+                            }
+                            return new Response('{}', {
+                                status: 200, statusText: 'OK',
+                                headers: { 'Content-Type': 'application/json' },
+                            });
+                        };
+
+                        let bodyStr = init && typeof init.body === 'string' ? init.body : null;
+                        if (bodyStr == null && typeof Request !== 'undefined' && input instanceof Request) {
+                            try {
+                                const ct = (input.headers.get('content-type') || '').toLowerCase();
+                                if (ct.includes('application/json') || ct.includes('text/')) {
+                                    return input.clone().text().then(doBlock);
+                                }
+                            } catch {}
+                        }
+                        return Promise.resolve(doBlock(bodyStr));
                     }
 
-                    if (body != null) {
-                        const { body: newBody, changed } = maybeBumpTimeSpent(body, 'fetch');
-                        if (changed) init = Object.assign({}, init || {}, { body: newBody });
+                    // ---- Jitsu allowed: log the packet, then pass through ----
+                    if (anyMatch.key === 'jitsu') {
+                        stats.jitsuPackets++;
+                        const doLogAndPass = (capturedBody) => {
+                            reportJitsuPacket('fetch', url, capturedBody);
+                            return origFetch.call(self, input, init);
+                        };
+                        let bodyStr = init && typeof init.body === 'string' ? init.body : null;
+                        if (bodyStr == null && typeof Request !== 'undefined' && input instanceof Request) {
+                            try {
+                                const ct = (input.headers.get('content-type') || '').toLowerCase();
+                                if (ct.includes('application/json') || ct.includes('text/')) {
+                                    return input.clone().text().then(doLogAndPass);
+                                }
+                            } catch {}
+                        }
+                        return doLogAndPass(bodyStr);
                     }
-                } else if (settings.logLevel === 'verbose' && isTargetApi(url)) {
-                    VLOG('API request (non-POST, passing through):', method, url);
+
+                    if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
+                        reportAllow('fetch', url, `service "${anyMatch.label}" disabled in settings`);
+                    }
+                } else {
+                    targetApi = isTargetApi(url);
+                    if (method === 'POST' && targetApi) {
+                        stats.apiPosts++;
+                        let body = init && typeof init.body === 'string' ? init.body : null;
+
+                        if (body == null && typeof Request !== 'undefined' && input instanceof Request) {
+                            const ct = (input.headers.get('content-type') || '').toLowerCase();
+                            if (ct.includes('application/json')) {
+                                const passInit = init;
+                                return input.clone().text().then((text) => {
+                                    if (settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(text)) {
+                                        reportLogImproperUse('fetch · Request body', url, text);
+                                        stats.blocked++;
+                                        return logImproperUseSyntheticResponse();
+                                    }
+                                    const { body: newBody, changed } = maybeBumpTimeSpent(text, 'fetch-Req');
+                                    const newReq = new Request(input, {
+                                        body: changed ? newBody : text,
+                                        method: input.method
+                                    });
+                                    const fetchPromise = origFetch.call(self, newReq, passInit);
+                                    attachFetchResponseInspector(fetchPromise);
+                                    return fetchPromise;
+                                });
+                            }
+                        }
+
+                        if (body != null && settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(body)) {
+                            reportLogImproperUse('fetch', url, body);
+                            stats.blocked++;
+                            return Promise.resolve(logImproperUseSyntheticResponse());
+                        }
+
+                        if (body != null) {
+                            const { body: newBody, changed } = maybeBumpTimeSpent(body, 'fetch');
+                            if (changed) init = Object.assign({}, init || {}, { body: newBody });
+                        }
+                    } else if (settings.logLevel === 'verbose' && targetApi) {
+                        VLOG('API request (non-POST, passing through):', method, url);
+                    }
                 }
             } catch (e) {
                 WARN('fetch interceptor error:', e);
             }
 
             const fetchPromise = origFetch.call(self, input, init);
-            if (isTargetApi(url)) {
-                fetchPromise.then((res) => {
-                    try {
-                        if (res && res.ok && typeof res.clone === 'function') {
-                            res.clone().json().then(handleApiResponse).catch(() => {});
-                        }
-                    } catch {}
-                }).catch(() => {});
+            if (targetApi) {
+                attachFetchResponseInspector(fetchPromise);
             }
             return fetchPromise;
         };
@@ -2163,6 +2217,24 @@
     // ============================================================
     // XHR INTERCEPTOR
     // ============================================================
+    function mockBlockedXHR(self, responseText, jsonFn) {
+        Object.defineProperty(self, 'readyState',   { value: 4,            configurable: true });
+        Object.defineProperty(self, 'status',       { value: 200,          configurable: true });
+        Object.defineProperty(self, 'statusText',   { value: 'OK',         configurable: true });
+        Object.defineProperty(self, 'responseText', { value: responseText, configurable: true });
+        Object.defineProperty(self, 'response', {
+            get() { return self.responseType === 'json' ? jsonFn() : responseText; },
+            configurable: true,
+        });
+        setTimeout(() => {
+            try {
+                self.dispatchEvent(new Event('readystatechange'));
+                self.dispatchEvent(new ProgressEvent('load'));
+                self.dispatchEvent(new ProgressEvent('loadend'));
+            } catch {}
+        }, 0);
+    }
+
     const OrigXHR = window.XMLHttpRequest;
     if (OrigXHR) {
         const origOpen = OrigXHR.prototype.open;
@@ -2177,91 +2249,52 @@
         OrigXHR.prototype.send = function (body) {
             try {
                 const method = (this.__ul_method || '').toUpperCase();
+                const url = this.__ul_url;
 
-                // ---- Telemetry block ----
-                if (isTelemetryUrl(this.__ul_url)) {
-                    let bodyStr = null;
-                    try {
-                        if (typeof body === 'string') bodyStr = body;
-                        else if (body instanceof Document || body instanceof Blob || body instanceof FormData) {
-                            bodyStr = `(${body.constructor ? body.constructor.name : 'non-string'} body)`;
-                        } else if (body != null) {
-                            bodyStr = `(${typeof body} body)`;
-                        }
-                    } catch {}
-                    const m = matchTelemetryService(this.__ul_url);
-                    const isJitsu = m && m.key === 'jitsu';
-                    if (isJitsu) {
-                        stats.jitsuPackets++;
-                        reportJitsuPacket('XHR · BLOCKED', this.__ul_url, bodyStr);
-                    } else {
-                        reportBlock('XHR', this.__ul_url, { method, body: bodyStr });
-                    }
-                    stats.blocked++;
-                    const self = this;
-                    Object.defineProperty(self, 'readyState',   { value: 4, configurable: true });
-                    Object.defineProperty(self, 'status',       { value: 200, configurable: true });
-                    Object.defineProperty(self, 'statusText',   { value: 'OK', configurable: true });
-                    Object.defineProperty(self, 'responseText', { value: '{}', configurable: true });
-                    Object.defineProperty(self, 'response', {
-                        get() { return self.responseType === 'json' ? {} : '{}'; },
-                        configurable: true
-                    });
-                    setTimeout(() => {
+                const anyMatch = matchAnyTelemetryService(url);
+                if (anyMatch) {
+                    // ---- Telemetry block ----
+                    if (isServiceMatchBlocked(anyMatch)) {
+                        let bodyStr = null;
                         try {
-                            self.dispatchEvent(new Event('readystatechange'));
-                            self.dispatchEvent(new ProgressEvent('load'));
-                            self.dispatchEvent(new ProgressEvent('loadend'));
+                            if (typeof body === 'string') bodyStr = body;
+                            else if (body instanceof Document || body instanceof Blob || body instanceof FormData) {
+                                bodyStr = `(${body.constructor ? body.constructor.name : 'non-string'} body)`;
+                            } else if (body != null) {
+                                bodyStr = `(${typeof body} body)`;
+                            }
                         } catch {}
-                    }, 0);
-                    return;
-                }
-
-                // ---- Jitsu allowed: log packet, then pass through ----
-                if (isJitsuUrl(this.__ul_url)) {
-                    stats.jitsuPackets++;
-                    let bodyStr = null;
-                    try {
-                        if (typeof body === 'string') bodyStr = body;
-                        else if (body != null) bodyStr = `(${body.constructor ? body.constructor.name : typeof body} body)`;
-                    } catch {}
-                    reportJitsuPacket('XHR', this.__ul_url, bodyStr);
-                    // fall through to origSend
-                }
-
-                if (settings.logLevel === 'verbose') {
-                    const m = matchAnyTelemetryService(this.__ul_url);
-                    if (m && !settings.telemetryServices[m.key]) {
-                        reportAllow('XHR', this.__ul_url, `service "${m.label}" disabled in settings`);
+                        if (anyMatch.key === 'jitsu') {
+                            stats.jitsuPackets++;
+                            reportJitsuPacket('XHR · BLOCKED', url, bodyStr);
+                        } else {
+                            reportBlock('XHR', url, { method, body: bodyStr });
+                        }
+                        stats.blocked++;
+                        mockBlockedXHR(this, '{}', () => ({}));
+                        return;
                     }
-                }
 
-                if (method === 'POST' && isTargetApi(this.__ul_url)) {
+                    // ---- Jitsu allowed: log packet, then pass through ----
+                    if (anyMatch.key === 'jitsu') {
+                        stats.jitsuPackets++;
+                        let bodyStr = null;
+                        try {
+                            if (typeof body === 'string') bodyStr = body;
+                            else if (body != null) bodyStr = `(${body.constructor ? body.constructor.name : typeof body} body)`;
+                        } catch {}
+                        reportJitsuPacket('XHR', url, bodyStr);
+                    } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
+                        reportAllow('XHR', url, `service "${anyMatch.label}" disabled in settings`);
+                    }
+                } else if (method === 'POST' && isTargetApi(url)) {
                     stats.apiPosts++;
 
                     if (settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(body)) {
-                        reportLogImproperUse('XHR', this.__ul_url,
+                        reportLogImproperUse('XHR', url,
                             typeof body === 'string' ? body : '(non-string body)');
                         stats.blocked++;
-                        const self = this;
-                        const payload = JSON.stringify({ data: { logImproperUse: true } });
-                        Object.defineProperty(self, 'readyState',   { value: 4,       configurable: true });
-                        Object.defineProperty(self, 'status',       { value: 200,     configurable: true });
-                        Object.defineProperty(self, 'statusText',   { value: 'OK',    configurable: true });
-                        Object.defineProperty(self, 'responseText', { value: payload, configurable: true });
-                        Object.defineProperty(self, 'response', {
-                            get() {
-                                if (self.responseType === 'json') return { data: { logImproperUse: true } };
-                                return payload;
-                            }, configurable: true
-                        });
-                        setTimeout(() => {
-                            try {
-                                self.dispatchEvent(new Event('readystatechange'));
-                                self.dispatchEvent(new ProgressEvent('load'));
-                                self.dispatchEvent(new ProgressEvent('loadend'));
-                            } catch {}
-                        }, 0);
+                        mockBlockedXHR(this, LOG_IMPROPER_PAYLOAD, () => ({ data: { logImproperUse: true } }));
                         return;
                     }
 
@@ -2272,11 +2305,12 @@
 
                     this.addEventListener('load', function () {
                         try {
-                            if (this.responseText) {
-                                handleApiResponse(JSON.parse(this.responseText));
+                            const rt = this.responseText;
+                            if (rt && (rt.includes('videoLesson') || rt.includes('VideoQuestion'))) {
+                                handleApiResponse(JSON.parse(rt));
                             }
                         } catch {}
-                    });
+                    }, { once: true });
                 }
             } catch (e) {
                 WARN('xhr interceptor error:', e);
@@ -2293,43 +2327,38 @@
         const origBeacon = navigator.sendBeacon.bind(navigator);
         navigator.sendBeacon = function (url, data) {
             try {
-                if (settings.blockSendBeacon && isTelemetryUrl(url)) {
-                    let bodyStr = null;
-                    try {
-                        if (typeof data === 'string') bodyStr = data;
-                        else if (data instanceof Blob) bodyStr = `(Blob · ${data.size} bytes)`;
-                        else if (data instanceof ArrayBuffer) bodyStr = `(ArrayBuffer · ${data.byteLength} bytes)`;
-                        else if (data != null) bodyStr = `(${typeof data} body)`;
-                    } catch {}
-                    const m = matchTelemetryService(url);
-                    const isJitsu = m && m.key === 'jitsu';
-                    if (isJitsu) {
-                        stats.jitsuPackets++;
-                        reportJitsuPacket('sendBeacon · BLOCKED', String(url), bodyStr);
-                    } else {
-                        reportBlock('sendBeacon', String(url), { body: bodyStr });
+                const anyMatch = matchAnyTelemetryService(url);
+                if (anyMatch) {
+                    if (settings.blockSendBeacon && isServiceMatchBlocked(anyMatch)) {
+                        let bodyStr = null;
+                        try {
+                            if (typeof data === 'string') bodyStr = data;
+                            else if (data instanceof Blob) bodyStr = `(Blob · ${data.size} bytes)`;
+                            else if (data instanceof ArrayBuffer) bodyStr = `(ArrayBuffer · ${data.byteLength} bytes)`;
+                            else if (data != null) bodyStr = `(${typeof data} body)`;
+                        } catch {}
+                        if (anyMatch.key === 'jitsu') {
+                            stats.jitsuPackets++;
+                            reportJitsuPacket('sendBeacon · BLOCKED', String(url), bodyStr);
+                        } else {
+                            reportBlock('sendBeacon', String(url), { body: bodyStr });
+                        }
+                        stats.blocked++;
+                        return true;
                     }
-                    stats.blocked++;
-                    return true;
-                }
 
-                if (isJitsuUrl(url)) {
-                    stats.jitsuPackets++;
-                    let bodyStr = null;
-                    try {
-                        if (typeof data === 'string') bodyStr = data;
-                        else if (data instanceof Blob) bodyStr = `(Blob · ${data.size} bytes)`;
-                        else if (data instanceof ArrayBuffer) bodyStr = `(ArrayBuffer · ${data.byteLength} bytes)`;
-                        else if (data != null) bodyStr = `(${typeof data} body)`;
-                    } catch {}
-                    reportJitsuPacket('sendBeacon', String(url), bodyStr);
-                    // fall through
-                }
-
-                if (settings.logLevel === 'verbose') {
-                    const m = matchAnyTelemetryService(url);
-                    if (m && !settings.telemetryServices[m.key]) {
-                        reportAllow('sendBeacon', url, `service "${m.label}" disabled in settings`);
+                    if (anyMatch.key === 'jitsu') {
+                        stats.jitsuPackets++;
+                        let bodyStr = null;
+                        try {
+                            if (typeof data === 'string') bodyStr = data;
+                            else if (data instanceof Blob) bodyStr = `(Blob · ${data.size} bytes)`;
+                            else if (data instanceof ArrayBuffer) bodyStr = `(ArrayBuffer · ${data.byteLength} bytes)`;
+                            else if (data != null) bodyStr = `(${typeof data} body)`;
+                        } catch {}
+                        reportJitsuPacket('sendBeacon', String(url), bodyStr);
+                    } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
+                        reportAllow('sendBeacon', url, `service "${anyMatch.label}" disabled in settings`);
                     }
                 }
             } catch {}
@@ -2357,46 +2386,53 @@
     })();
     const ORIG_HAS_FOCUS = document.hasFocus ? document.hasFocus.bind(document) : (() => true);
 
+    const VISIBILITY_PROPS = ['visibilityState', 'webkitVisibilityState', 'mozVisibilityState', 'msVisibilityState'];
+    const HIDDEN_PROPS     = ['hidden', 'webkitHidden', 'mozHidden', 'msHidden'];
+    const VIS_DESC = {
+        get: () => settings.spoofVisibility ? 'visible' : (ORIG_VIS ? ORIG_VIS.call(document) : 'visible'),
+        configurable: true,
+    };
+    const HIDDEN_DESC = {
+        get: () => settings.spoofVisibility ? false : (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : false),
+        configurable: true,
+    };
+    const SPOOFED_HAS_FOCUS = function () {
+        return settings.spoofVisibility ? true : ORIG_HAS_FOCUS();
+    };
+
     function patchVisibilityProps() {
         try {
-            const visDesc = {
-                get: () => settings.spoofVisibility ? 'visible'
-                                                    : (ORIG_VIS ? ORIG_VIS.call(document) : 'visible'),
-                configurable: true
-            };
-            const hiddenDesc = {
-                get: () => settings.spoofVisibility ? false
-                                                    : (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : false),
-                configurable: true
-            };
-            ['visibilityState', 'webkitVisibilityState', 'mozVisibilityState', 'msVisibilityState'].forEach((prop) => {
-                try { Object.defineProperty(document, prop, visDesc); } catch {}
-                try {
-                    if (typeof Document !== 'undefined' && Document.prototype) {
-                        Object.defineProperty(Document.prototype, prop, visDesc);
-                    }
-                } catch {}
-            });
-            ['hidden', 'webkitHidden', 'mozHidden', 'msHidden'].forEach((prop) => {
-                try { Object.defineProperty(document, prop, hiddenDesc); } catch {}
-                try {
-                    if (typeof Document !== 'undefined' && Document.prototype) {
-                        Object.defineProperty(Document.prototype, prop, hiddenDesc);
-                    }
-                } catch {}
-            });
+            const curDocVis = Object.getOwnPropertyDescriptor(document, 'visibilityState');
+            const docProto = (typeof Document !== 'undefined' && Document.prototype) ? Document.prototype : null;
+            const curProtoVis = docProto ? Object.getOwnPropertyDescriptor(docProto, 'visibilityState') : null;
+            if (curDocVis && curDocVis.get === VIS_DESC.get && (!docProto || (curProtoVis && curProtoVis.get === VIS_DESC.get))) {
+                return;
+            }
+            for (let i = 0; i < VISIBILITY_PROPS.length; i++) {
+                const prop = VISIBILITY_PROPS[i];
+                try { Object.defineProperty(document, prop, VIS_DESC); } catch {}
+                if (docProto) {
+                    try { Object.defineProperty(docProto, prop, VIS_DESC); } catch {}
+                }
+            }
+            for (let i = 0; i < HIDDEN_PROPS.length; i++) {
+                const prop = HIDDEN_PROPS[i];
+                try { Object.defineProperty(document, prop, HIDDEN_DESC); } catch {}
+                if (docProto) {
+                    try { Object.defineProperty(docProto, prop, HIDDEN_DESC); } catch {}
+                }
+            }
         } catch (e) { WARN('visibility patch failed', e); }
     }
     patchVisibilityProps();
 
     function installHasFocusPatch() {
         try {
-            const focusFn = function () {
-                return settings.spoofVisibility ? true : ORIG_HAS_FOCUS();
-            };
-            document.hasFocus = focusFn;
-            if (typeof Document !== 'undefined' && Document.prototype) {
-                Document.prototype.hasFocus = focusFn;
+            if (document.hasFocus !== SPOOFED_HAS_FOCUS) {
+                document.hasFocus = SPOOFED_HAS_FOCUS;
+            }
+            if (typeof Document !== 'undefined' && Document.prototype && Document.prototype.hasFocus !== SPOOFED_HAS_FOCUS) {
+                Document.prototype.hasFocus = SPOOFED_HAS_FOCUS;
             }
         } catch {}
     }
@@ -4669,13 +4705,17 @@
         React.useEffect(() => {
             if (!isOpen) return;
             const handleDocClick = (e) => {
-                const target = (e.composedPath && e.composedPath()[0]) || e.target;
-                if (dropdownRef.current && !dropdownRef.current.contains(target)) {
+                if (!dropdownRef.current) return;
+                const path = typeof e.composedPath === 'function' ? e.composedPath() : null;
+                const clickedInside = path
+                    ? path.includes(dropdownRef.current)
+                    : dropdownRef.current.contains(e.target);
+                if (!clickedInside) {
                     setIsOpen(false);
                 }
             };
-            window.addEventListener('click', handleDocClick);
-            return () => window.removeEventListener('click', handleDocClick);
+            window.addEventListener('click', handleDocClick, true);
+            return () => window.removeEventListener('click', handleDocClick, true);
         }, [isOpen]);
 
         const contextValue = React.useMemo(() => ({
@@ -4849,6 +4889,11 @@
         const trackRef = React.useRef(null);
         const isDraggingRef = React.useRef(false);
         const latestValRef = React.useRef(internalValue);
+        const dragCleanupRef = React.useRef(null);
+
+        React.useEffect(() => () => {
+            if (dragCleanupRef.current) dragCleanupRef.current();
+        }, []);
 
         // Keep internal value in sync with external value when not dragging
         React.useEffect(() => {
@@ -4870,7 +4915,7 @@
             }
         }, [minValue, maxValue, onChange]);
 
-        const handleKeyDown = (e) => {
+        const handleKeyDown = React.useCallback((e) => {
             if (isDisabled) return;
             let next = null;
             if (e.key === 'ArrowRight' || e.key === 'ArrowUp') next = curVal + step;
@@ -4881,11 +4926,12 @@
                 e.preventDefault();
                 triggerChange(next, true);
             }
-        };
+        }, [isDisabled, curVal, step, minValue, maxValue, triggerChange]);
 
-        const handlePointerDown = (e) => {
+        const handlePointerDown = React.useCallback((e) => {
             if (isDisabled || !trackRef.current) return;
             e.preventDefault();
+            if (dragCleanupRef.current) dragCleanupRef.current();
             isDraggingRef.current = true;
             setIsDragging(true);
 
@@ -4926,22 +4972,31 @@
                 });
             };
 
-            const onUp = (ev) => {
+            const cleanupListeners = () => {
                 if (rafId) {
                     cancelAnimationFrame(rafId);
                     rafId = null;
                 }
                 isDraggingRef.current = false;
-                setIsDragging(false);
                 window.removeEventListener('pointermove', onMove);
                 window.removeEventListener('pointerup', onUp);
-                const finalVal = calcValFromClientX(ev.clientX);
+                window.removeEventListener('pointercancel', onUp);
+                dragCleanupRef.current = null;
+            };
+
+            const onUp = (ev) => {
+                cleanupListeners();
+                setIsDragging(false);
+                const finalX = (ev && typeof ev.clientX === 'number') ? ev.clientX : latestClientX;
+                const finalVal = calcValFromClientX(finalX);
                 triggerChange(finalVal, true);
             };
 
+            dragCleanupRef.current = cleanupListeners;
             window.addEventListener('pointermove', onMove, { passive: true });
             window.addEventListener('pointerup', onUp, { passive: true });
-        };
+            window.addEventListener('pointercancel', onUp, { passive: true });
+        }, [isDisabled, minValue, maxValue, step, triggerChange]);
 
         const contextValue = React.useMemo(() => ({
             value: curVal,
@@ -4953,7 +5008,7 @@
             trackRef,
             handlePointerDown,
             handleKeyDown,
-        }), [curVal, minValue, maxValue, percentage, isDragging, isDisabled]);
+        }), [curVal, minValue, maxValue, percentage, isDragging, isDisabled, handlePointerDown, handleKeyDown]);
 
         return html`
             <div 
@@ -5150,10 +5205,10 @@
                 total++;
                 const svc = TELEMETRY_SERVICES[key];
                 const checked = key === 'jitsu'
-                    ? (!!currentSettings.suppressJitsu || !!(currentSettings.telemetryServices && currentSettings.telemetryServices.jitsu))
+                    ? !!(currentSettings.suppressJitsu && (!currentSettings.telemetryServices || currentSettings.telemetryServices.jitsu !== false))
                     : !!(currentSettings.telemetryServices && currentSettings.telemetryServices[key]);
                 if (checked) active++;
-                if (!q || svc.label.toLowerCase().includes(q) || svc.hosts.some(h => h.toLowerCase().includes(q))) {
+                if (!q || svc.label.toLowerCase().includes(q) || svc.hosts.some(h => h.includes(q))) {
                     list.push({ key, svc, checked });
                 }
             }
@@ -5163,16 +5218,10 @@
         const handleToggleService = useCallback((key) => {
             const current = currentSettings.telemetryServices || {};
             const curVal = key === 'jitsu'
-                ? (!!currentSettings.suppressJitsu || !!current[key])
+                ? !!(currentSettings.suppressJitsu && current[key] !== false)
                 : !!current[key];
             const next = !curVal;
             const updated = Object.assign({}, current, { [key]: next });
-            settings.telemetryServices = updated;
-            if (key === 'jitsu') {
-                settings.suppressJitsu = next;
-            }
-            settings.telemetryPreset = 'custom';
-            saveSettings();
             LOG(`service "${TELEMETRY_SERVICES[key].label}" ${next ? 'ENABLED' : 'DISABLED'}`);
             onUpdateSetting('telemetryServices', updated);
         }, [currentSettings.telemetryServices, currentSettings.suppressJitsu, onUpdateSetting]);
@@ -5182,10 +5231,6 @@
             for (const k in TELEMETRY_SERVICES) {
                 updated[k] = true;
             }
-            settings.telemetryServices = updated;
-            settings.suppressJitsu = true;
-            settings.telemetryPreset = 'custom';
-            saveSettings();
             onUpdateSetting('telemetryServices', updated);
         }, [onUpdateSetting]);
 
@@ -5194,10 +5239,6 @@
             for (const k in TELEMETRY_SERVICES) {
                 updated[k] = false;
             }
-            settings.telemetryServices = updated;
-            settings.suppressJitsu = false;
-            settings.telemetryPreset = 'custom';
-            saveSettings();
             onUpdateSetting('telemetryServices', updated);
         }, [onUpdateSetting]);
 
@@ -5414,7 +5455,7 @@
         accumulatedBonus,
         onUpdateSetting,
     }) => {
-        const { useState, useEffect, useCallback } = React;
+        const { useState, useEffect, useCallback, useMemo } = React;
         const [minStr, setMinStr] = useState(() => String(currentSettings.extraSecondsMin));
         const [maxStr, setMaxStr] = useState(() => String(currentSettings.extraSecondsMax));
 
@@ -5444,6 +5485,21 @@
         const updateFullVideo = useCallback((v) => onUpdateSetting('fullVideoWatchedEnabled', v), [onUpdateSetting]);
         const updateAutoSkipVideo = useCallback((v) => onUpdateSetting('autoSkipVideoEnabled', v), [onUpdateSetting]);
         const updateAddVideoDuration = useCallback((v) => onUpdateSetting('addVideoDurationToTimeSpent', v), [onUpdateSetting]);
+
+        const selectedRangeKeys = useMemo(() => {
+            const match = QUICK_RANGE_PRESETS.find(
+                p => p.min === currentSettings.extraSecondsMin && p.max === currentSettings.extraSecondsMax
+            );
+            return match ? [match.label] : [];
+        }, [currentSettings.extraSecondsMin, currentSettings.extraSecondsMax]);
+
+        const handleRangePresetChange = useCallback((label) => {
+            const p = QUICK_RANGE_PRESETS.find(item => item.label === label);
+            if (p) {
+                onUpdateSetting('extraSecondsMin', p.min);
+                onUpdateSetting('extraSecondsMax', p.max);
+            }
+        }, [onUpdateSetting]);
 
         const rangeHint = (currentSettings.extraSecondsMin === currentSettings.extraSecondsMax)
             ? `Every question receives +${currentSettings.extraSecondsMin}s.`
@@ -5517,16 +5573,8 @@
                             <div style=${{ marginTop: '8px' }}>
                                 <${TagGroup} 
                                     ariaLabel="Quick Range Presets" 
-                                    selectedKeys=${[
-                                        QUICK_RANGE_PRESETS.find(p => p.min === currentSettings.extraSecondsMin && p.max === currentSettings.extraSecondsMax)?.label
-                                    ].filter(Boolean)}
-                                    onSelectionChange=${(label) => {
-                                        const p = QUICK_RANGE_PRESETS.find(item => item.label === label);
-                                        if (p) {
-                                            onUpdateSetting('extraSecondsMin', p.min);
-                                            onUpdateSetting('extraSecondsMax', p.max);
-                                        }
-                                    }}
+                                    selectedKeys=${selectedRangeKeys}
+                                    onSelectionChange=${handleRangePresetChange}
                                 >
                                     <${TagGroup.Label}>Quick Range Presets<//>
                                     <${TagGroup.List}>
@@ -5960,7 +6008,7 @@
         isActive,
     }) => {
         const { useState, useEffect, useCallback } = React;
-        const [tabStats, setTabStats] = useState(Object.assign({}, stats));
+        const [tabStats, setTabStats] = useState(() => Object.assign({}, stats));
 
         useEffect(() => {
             if (!isActive) return;
@@ -6077,6 +6125,8 @@
         `;
     });
 
+    const TAB_KEYS = ['telemetry', 'timeboost', 'preferences', 'stats'];
+
     const SettingsModal = React.memo(({
         isOpen,
         isClosing,
@@ -6090,28 +6140,30 @@
         onResetAllSettings,
         onResetStats,
     }) => {
-        if (!isOpen && !isClosing) return null;
-
-        const { useState } = React;
+        const { useState, useMemo, useCallback } = React;
         const [activeTab, setActiveTab] = useState('telemetry');
         const [tabDirection, setTabDirection] = useState('forward');
         const [visitedTabs, setVisitedTabs] = useState(() => new Set(['telemetry']));
 
-        const TAB_KEYS = ['telemetry', 'timeboost', 'preferences', 'stats'];
+        const selectedTabKeys = useMemo(() => [activeTab], [activeTab]);
 
-        const handleTabClick = (targetTab) => {
-            if (targetTab === activeTab) return;
-            const curIdx = TAB_KEYS.indexOf(activeTab);
-            const targetIdx = TAB_KEYS.indexOf(targetTab);
-            setTabDirection(targetIdx > curIdx ? 'forward' : 'backward');
-            setActiveTab(targetTab);
-            setVisitedTabs(prev => {
-                if (prev.has(targetTab)) return prev;
-                const next = new Set(prev);
-                next.add(targetTab);
-                return next;
+        const handleTabClick = useCallback((targetTab) => {
+            setActiveTab((prevTab) => {
+                if (targetTab === prevTab) return prevTab;
+                const curIdx = TAB_KEYS.indexOf(prevTab);
+                const targetIdx = TAB_KEYS.indexOf(targetTab);
+                setTabDirection(targetIdx > curIdx ? 'forward' : 'backward');
+                setVisitedTabs((prev) => {
+                    if (prev.has(targetTab)) return prev;
+                    const next = new Set(prev);
+                    next.add(targetTab);
+                    return next;
+                });
+                return targetTab;
             });
-        };
+        }, []);
+
+        if (!isOpen && !isClosing) return null;
 
         return html`
             <${Modal} isOpen=${isOpen} isClosing=${isClosing} onClose=${onClose}>
@@ -6138,7 +6190,7 @@
                                 <${TagGroup} 
                                     ariaLabel="Panel Navigation"
                                     selectionMode="single"
-                                    selectedKeys=${[activeTab]}
+                                    selectedKeys=${selectedTabKeys}
                                     onSelectionChange=${handleTabClick}
                                     className="modal__tab-group"
                                 >
@@ -6214,15 +6266,64 @@
         `;
     });
 
+    function resetAllStats() {
+        stats.apiPosts = 0; stats.seen = 0; stats.boosted = 0;
+        stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
+        stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
+        stats.jitsuPackets = 0; stats.manualBoosted = 0; stats.videosMaxed = 0;
+        stats.videosSkipped = 0; stats.videoTimeAdded = 0;
+        accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
+        if (reactSetStats) {
+            reactSetStats(Object.assign({}, stats, { accumulated: 0 }));
+        }
+    }
+
     // --- Root App Component ---
     const App = () => {
-        const { useState, useEffect, useCallback } = React;
-        const [appSettings, setAppSettings] = useState(Object.assign({}, settings));
-        const [appStats, setAppStats] = useState(Object.assign({}, stats));
+        const { useState, useEffect, useCallback, useRef } = React;
+        const [appSettings, setAppSettings] = useState(() => cloneSettings(settings));
+        const [appStats, setAppStats] = useState(() => Object.assign({}, stats));
         const [accumulatedBonus, setAccumulatedBonus] = useState(accumulatedExtraSeconds);
         const [isModalOpen, setIsModalOpen] = useState(false);
         const [isClosing, setIsClosing] = useState(false);
         const [isCapturing, setIsCapturing] = useState(false);
+        const closeTimerRef = useRef(null);
+        const modalStateRef = useRef({ open: false, closing: false });
+
+        const setModalOpenState = useCallback((open) => {
+            if (open) {
+                if (closeTimerRef.current) {
+                    clearTimeout(closeTimerRef.current);
+                    closeTimerRef.current = null;
+                }
+                modalStateRef.current.open = true;
+                modalStateRef.current.closing = false;
+                isModalOpenGlobal = true;
+                setIsClosing(false);
+                setIsModalOpen(true);
+            } else {
+                if (capturingKeybind) {
+                    capturingKeybind = false;
+                    setIsCapturing(false);
+                }
+                if ((!modalStateRef.current.open && !isModalOpenGlobal) || modalStateRef.current.closing) {
+                    return;
+                }
+                if (closeTimerRef.current) {
+                    clearTimeout(closeTimerRef.current);
+                }
+                modalStateRef.current.closing = true;
+                setIsClosing(true);
+                closeTimerRef.current = setTimeout(() => {
+                    closeTimerRef.current = null;
+                    modalStateRef.current.open = false;
+                    modalStateRef.current.closing = false;
+                    isModalOpenGlobal = false;
+                    setIsModalOpen(false);
+                    setIsClosing(false);
+                }, 190);
+            }
+        }, []);
 
         // Register bridges for global callbacks
         useEffect(() => {
@@ -6231,45 +6332,28 @@
                 setAppStats(Object.assign({}, st));
                 if (typeof st.accumulated !== 'undefined') setAccumulatedBonus(st.accumulated);
             };
-            reactSetModalOpen = (open) => {
-                if (open) {
-                    setIsClosing(false);
-                    setIsModalOpen(true);
-                    isModalOpenGlobal = true;
-                } else {
-                    setIsClosing(true);
-                    setTimeout(() => {
-                        setIsModalOpen(false);
-                        setIsClosing(false);
-                        isModalOpenGlobal = false;
-                    }, 190);
-                }
-            };
+            reactSetModalOpen = setModalOpenState;
             reactSetCapturingKeybind = setIsCapturing;
 
             return () => {
+                if (closeTimerRef.current) {
+                    clearTimeout(closeTimerRef.current);
+                    closeTimerRef.current = null;
+                }
                 reactSetSettings = null;
                 reactSetStats = null;
                 reactSetModalOpen = null;
                 reactSetCapturingKeybind = null;
             };
-        }, []);
+        }, [setModalOpenState]);
 
-        // Real-time live stats update interval with equality bail-out
+        // Real-time live stats update interval for StatusPill (only re-renders when blocked or boosted changes; StatsTab manages its own tabStats)
         useEffect(() => {
             const interval = setInterval(() => {
                 setAppStats((prev) => {
                     if (
-                        prev.apiPosts === stats.apiPosts &&
-                        prev.seen === stats.seen &&
-                        prev.boosted === stats.boosted &&
                         prev.blocked === stats.blocked &&
-                        prev.groupExtra === stats.groupExtra &&
-                        prev.fullscreenBlocked === stats.fullscreenBlocked &&
-                        prev.consoleSuppressed === stats.consoleSuppressed &&
-                        prev.logImproperUseBlocked === stats.logImproperUseBlocked &&
-                        prev.jitsuPackets === stats.jitsuPackets &&
-                        prev.manualBoosted === (stats.manualBoosted || 0)
+                        prev.boosted === stats.boosted
                     ) {
                         return prev; // exact same reference => React bails out of re-rendering!
                     }
@@ -6281,18 +6365,12 @@
         }, []);
 
         const handleCloseModal = useCallback(() => {
-            if (isClosing) return;
-            setIsClosing(true);
-            setTimeout(() => {
-                setIsModalOpen(false);
-                setIsClosing(false);
-                isModalOpenGlobal = false;
-            }, 190);
-        }, [isClosing]);
+            setModalOpenState(false);
+        }, [setModalOpenState]);
 
         const handleOpenSettings = useCallback(() => {
-            if (reactSetModalOpen) reactSetModalOpen(true);
-        }, []);
+            setModalOpenState(true);
+        }, [setModalOpenState]);
 
         const handleToggleBoost = useCallback(() => {
             const next = !settings.timeBoostEnabled;
@@ -6330,24 +6408,29 @@
         }, []);
 
         const handleResetStats = useCallback(() => {
-            stats.apiPosts = 0; stats.seen = 0; stats.boosted = 0;
-            stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
-            stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
-            stats.jitsuPackets = 0; stats.manualBoosted = 0;
-            accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
-            setAppStats(Object.assign({}, stats));
-            setAccumulatedBonus(0);
+            resetAllStats();
             LOG('stats reset');
         }, []);
 
         // Sync theme attribute & accent CSS variable on root container
-        const effectiveTheme = getEffectiveTheme(appSettings.theme);
         useEffect(() => {
-            if (uiContainerEl) {
-                uiContainerEl.setAttribute('data-theme', effectiveTheme);
-                uiContainerEl.style.setProperty('--accent', appSettings.accentColor);
+            const syncThemeAndAccent = () => {
+                if (uiContainerEl) {
+                    uiContainerEl.setAttribute('data-theme', getEffectiveTheme(appSettings.theme));
+                    uiContainerEl.style.setProperty('--accent', appSettings.accentColor);
+                }
+            };
+            syncThemeAndAccent();
+            if (appSettings.theme === 'auto' && typeof window.matchMedia === 'function') {
+                try {
+                    const mql = window.matchMedia('(prefers-color-scheme: light)');
+                    if (typeof mql.addEventListener === 'function') {
+                        mql.addEventListener('change', syncThemeAndAccent);
+                        return () => mql.removeEventListener('change', syncThemeAndAccent);
+                    }
+                } catch {}
             }
-        }, [effectiveTheme, appSettings.accentColor]);
+        }, [appSettings.theme, appSettings.accentColor]);
 
         return html`
             <div className="heroui-react-wrapper">
@@ -6474,14 +6557,7 @@
         removeManualTimeButton: removeButton,
         rewriteBodyText,
         telemetryServices: TELEMETRY_SERVICES,
-        resetStats: () => {
-            stats.apiPosts = 0; stats.seen = 0; stats.boosted = 0;
-            stats.blocked = 0; stats.groupExtra = 0; stats.fullscreenBlocked = 0;
-            stats.consoleSuppressed = 0; stats.logImproperUseBlocked = 0;
-            stats.jitsuPackets = 0; stats.manualBoosted = 0; stats.videosMaxed = 0;
-            stats.videosSkipped = 0; stats.videoTimeAdded = 0;
-            accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
-        },
+        resetStats: resetAllStats,
         getAccumulated: () => accumulatedExtraSeconds,
         getAccumulatedCount: () => accumulatedQuestionCount,
         pickExtraSeconds,
