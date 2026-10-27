@@ -2,13 +2,34 @@
 // @name         UpLearn Telemetry Blocker & TimeSpent Booster
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
 // @version      3.9.0
-// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; unified GraphQL data stream, windowed multitasking feature flag transformer, local LogEvent & private search handlers, native PostHog opt-out; random-range time boost; inline manual "Add time" question button for all question types; full video watch completion toggle; auto-skip video to 1 second before completion; add full video duration to timeSpent; dark mode; full control panel UI
+// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; unified GraphQL data stream, windowed multitasking feature flag transformer, local LogEvent & private search handlers, native stealth cloaking; random-range time boost; inline manual "Add time" question button for all question types; full video watch completion toggle; auto-skip video to 1 second before completion; add full video duration to timeSpent; dark mode; full control panel UI
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
 // @grant        none
 // @inject-into  page
 // @noframes
+//
+// @webRequest   [{"selector":{"include":"://jitsu.uplearn.co.uk/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://jitsu.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://openreplay.uplearn.co.uk/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://.ingest.us.sentry.io/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://static.cloudflareinsights.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://api-iam.intercom.io/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://widget.intercom.io/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://js.intercomcdn.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://nexus-websocket-.intercom.io/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://www.googletagmanager.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://google-analytics.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://analytics.google.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://googleadservices.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://doubleclick.net/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://connect.facebook.net/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://sc-static.net/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://bat.bing.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://bzrcdn.openai.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":{"include":"://*.posthog.com/"},"action":"cancel"}]
+//
 // @require      https://unpkg.com/react@18.3.1/umd/react.production.min.js
 // @require      https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js
 // @require      https://unpkg.com/htm@3.1.1/dist/htm.umd.js
@@ -18,19 +39,22 @@
     'use strict';
 
     // ============================================================
-    // NATIVE ANALYTICS OPT-OUT INTEGRATION (PostHog opt-out)
+    // STEALTH & CLOAKING INFRASTRUCTURE
     // ============================================================
-    try {
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => true,
-            configurable: true,
-            enumerable: true,
-        });
-    } catch (e) {
-        try {
-            navigator.webdriver = true;
-        } catch {}
+    const origToString = Function.prototype.toString;
+    const cloakedFns = new WeakMap();
+
+    function cloak(fn, name) {
+        if (typeof fn === 'function') {
+            cloakedFns.set(fn, `function ${name || fn.name || ''}() { [native code] }`);
+        }
+        return fn;
     }
+
+    Function.prototype.toString = function () {
+        return (typeof this === 'function' && cloakedFns.get(this)) || origToString.call(this);
+    };
+    cloak(Function.prototype.toString, 'toString');
 
     // ============================================================
     // NATIVE CONSOLE PRESERVED (before any patching)
@@ -535,8 +559,8 @@
         return false;
     }
 
-    function argsAreNoise(args) {
-        for (let i = 0; i < args.length; i++) {
+    function argsAreNoise(args, startIndex = 0) {
+        for (let i = startIndex; i < args.length; i++) {
             const a = args[i];
             if (typeof a === 'string') {
                 if (textMatchesNoise(a)) return true;
@@ -564,16 +588,21 @@
                 const len = arguments.length;
                 if (len === 0) return orig.apply(console, arguments);
                 const first = arguments[0];
-                if (typeof first === 'string' && textMatchesNoise(first)) {
+                const firstIsString = typeof first === 'string';
+                if (firstIsString && textMatchesNoise(first)) {
                     bumpStat('consoleSuppressed');
                     return;
                 }
-                if (argsAreNoise(arguments)) {
+                if (len === 1 && firstIsString) {
+                    return orig.apply(console, arguments);
+                }
+                if (argsAreNoise(arguments, firstIsString ? 1 : 0)) {
                     bumpStat('consoleSuppressed');
                     return;
                 }
                 return orig.apply(console, arguments);
             };
+            cloak(console[method], method);
         }
         VLOG('console noise filter installed (Jitsu / Apollo / Sentry / host matches)');
     }
@@ -816,24 +845,24 @@
     }
 
     // ============================================================
-    // DOM / SCRIPT/IFRAME INJECTION BLOCKER
+    // DOM / SCRIPT/IFRAME/IMG/LINK INJECTION BLOCKER
     // ============================================================
-    function hookSrcProperty(proto, tag) {
-        const desc = Object.getOwnPropertyDescriptor(proto, 'src');
+    function hookElementProperty(proto, prop, tag) {
+        const desc = Object.getOwnPropertyDescriptor(proto, prop);
         if (desc && desc.set) {
-            Object.defineProperty(proto, 'src', {
+            Object.defineProperty(proto, prop, {
                 get: desc.get,
                 set(val) {
                     if (settings.blockDomElements && isTelemetryUrl(val)) {
-                        reportBlock(`<${tag}>.src assignment`, val, { element: tag });
+                        reportBlock(`<${tag}>.${prop} assignment`, val, { element: tag });
                         return '';
                     }
                     if (settings.logLevel === 'verbose' && val) {
                         const m = matchAnyTelemetryService(val);
                         if (m && !settings.telemetryServices[m.key]) {
-                            reportAllow(`<${tag}>.src`, val, `service "${m.label}" disabled`);
+                            reportAllow(`<${tag}>.${prop}`, val, `service "${m.label}" disabled`);
                         } else if (m && m.key === 'jitsu' && !settings.suppressJitsu) {
-                            reportAllow(`<${tag}>.src`, val, `service "${m.label}" not suppressed`);
+                            reportAllow(`<${tag}>.${prop}`, val, `service "${m.label}" not suppressed`);
                         }
                     }
                     return desc.set.call(this, val);
@@ -842,22 +871,46 @@
             });
         }
     }
-    try { hookSrcProperty(HTMLScriptElement.prototype, 'script'); } catch {}
-    try { hookSrcProperty(HTMLIFrameElement.prototype, 'iframe'); } catch {}
+    try { if (typeof HTMLScriptElement !== 'undefined') hookElementProperty(HTMLScriptElement.prototype, 'src',  'script'); } catch {}
+    try { if (typeof HTMLIFrameElement !== 'undefined') hookElementProperty(HTMLIFrameElement.prototype, 'src',  'iframe'); } catch {}
+    try { if (typeof HTMLImageElement  !== 'undefined') hookElementProperty(HTMLImageElement.prototype,  'src',  'img'); } catch {}
+    try { if (typeof HTMLLinkElement   !== 'undefined') hookElementProperty(HTMLLinkElement.prototype,   'href', 'link'); } catch {}
+    try {
+        const OrigImage = window.Image;
+        if (OrigImage && OrigImage.prototype && (typeof HTMLImageElement === 'undefined' || OrigImage.prototype !== HTMLImageElement.prototype)) {
+            hookElementProperty(OrigImage.prototype, 'src', 'img');
+        }
+    } catch {}
+
+    function isSrcOrHref(name) {
+        if (typeof name !== 'string') return false;
+        const len = name.length;
+        if (len === 3) {
+            return (name.charCodeAt(0) | 32) === 115 &&
+                   (name.charCodeAt(1) | 32) === 114 &&
+                   (name.charCodeAt(2) | 32) === 99; // 'src'
+        }
+        if (len === 4) {
+            return (name.charCodeAt(0) | 32) === 104 &&
+                   (name.charCodeAt(1) | 32) === 114 &&
+                   (name.charCodeAt(2) | 32) === 101 &&
+                   (name.charCodeAt(3) | 32) === 102; // 'href'
+        }
+        return false;
+    }
 
     try {
         const origSetAttribute = Element.prototype.setAttribute;
         Element.prototype.setAttribute = function (name, value) {
-            if (settings.blockDomElements &&
-                (name === 'src' || (typeof name === 'string' && name.length === 3 && name.toLowerCase() === 'src')) &&
-                isTelemetryUrl(value)) {
-                reportBlock('setAttribute("src")', value, {
+            if (settings.blockDomElements && isSrcOrHref(name) && isTelemetryUrl(value)) {
+                reportBlock(`setAttribute("${name}")`, value, {
                     element: this.tagName ? this.tagName.toLowerCase() : 'unknown',
                 });
                 return;
             }
             return origSetAttribute.apply(this, arguments);
         };
+        cloak(Element.prototype.setAttribute, 'setAttribute');
     } catch (e) { WARN('setAttribute patch failed', e); }
 
     try {
@@ -929,9 +982,96 @@
                 }
             }
             window.WebSocket = PatchedWebSocket;
+            cloak(PatchedWebSocket, 'WebSocket');
             VLOG('WebSocket hook installed');
         }
     } catch (e) { WARN('websocket patch failed', e); }
+
+    // ============================================================
+    // WEB WORKER & BLOB TARGETED NEUTER
+    // ============================================================
+    const TELEMETRY_CODE_RE = /openreplay|sentry|sessionReplay|replayUploader/i;
+    const telemetryBlobUrls = new Set();
+    const telemetryBlobs = new WeakSet();
+    try {
+        const origCreateObjectURL = (typeof URL !== 'undefined' && URL.createObjectURL) ? URL.createObjectURL : null;
+        if (origCreateObjectURL) {
+            URL.createObjectURL = function (blob) {
+                const url = origCreateObjectURL.apply(this, arguments);
+                if (blob && telemetryBlobs.has(blob)) {
+                    telemetryBlobUrls.add(url);
+                } else if (blob instanceof Blob) {
+                    try {
+                        if (typeof blob.text === 'function') {
+                            blob.text().then((code) => {
+                                if (TELEMETRY_CODE_RE.test(code)) {
+                                    telemetryBlobUrls.add(url);
+                                }
+                            }).catch(() => {});
+                        }
+                    } catch {}
+                }
+                return url;
+            };
+            cloak(URL.createObjectURL, 'createObjectURL');
+        }
+
+        const OrigBlob = window.Blob;
+        if (OrigBlob) {
+            const PatchedBlob = function (blobParts, options) {
+                if (!new.target) {
+                    throw new TypeError("Failed to construct 'Blob': Please use the 'new' operator");
+                }
+                const blob = Reflect.construct(OrigBlob, arguments, new.target);
+                try {
+                    if (blobParts && (Array.isArray(blobParts) || typeof blobParts[Symbol.iterator] === 'function')) {
+                        for (const part of blobParts) {
+                            if (typeof part === 'string' && TELEMETRY_CODE_RE.test(part)) {
+                                telemetryBlobs.add(blob);
+                                break;
+                            }
+                        }
+                    }
+                } catch {}
+                return blob;
+            };
+            PatchedBlob.prototype = OrigBlob.prototype;
+            Object.setPrototypeOf(PatchedBlob, OrigBlob);
+            window.Blob = PatchedBlob;
+            cloak(PatchedBlob, 'Blob');
+        }
+
+        const OrigWorker = window.Worker;
+        if (OrigWorker) {
+            const dummyNoop = () => {};
+            const WORKER_DUMMY_DESCS = {
+                postMessage:    { value: dummyNoop, writable: true, configurable: true },
+                terminate:      { value: dummyNoop, writable: true, configurable: true },
+                onerror:        { value: null, writable: true, configurable: true },
+                onmessage:      { value: null, writable: true, configurable: true },
+                onmessageerror: { value: null, writable: true, configurable: true },
+            };
+
+            const PatchedWorker = function (scriptURL, options) {
+                if (!new.target) {
+                    throw new TypeError("Failed to construct 'Worker': Please use the 'new' operator");
+                }
+                const urlStr = typeof scriptURL === 'string' ? scriptURL : String(scriptURL || '');
+                if (telemetryBlobUrls.has(urlStr) || isTelemetryUrl(scriptURL)) {
+                    reportBlock('WebWorker', urlStr);
+                    const dummy = new EventTarget();
+                    Object.setPrototypeOf(dummy, (new.target && new.target.prototype) || OrigWorker.prototype);
+                    Object.defineProperties(dummy, WORKER_DUMMY_DESCS);
+                    return dummy;
+                }
+                return Reflect.construct(OrigWorker, arguments, new.target);
+            };
+            PatchedWorker.prototype = OrigWorker.prototype;
+            Object.setPrototypeOf(PatchedWorker, OrigWorker);
+            window.Worker = PatchedWorker;
+            cloak(PatchedWorker, 'Worker');
+        }
+    } catch (e) { WARN('worker/blob patch failed', e); }
 
     // ============================================================
     // DARK MODE
@@ -1003,20 +1143,46 @@
     } catch {}
 
     // ============================================================
-    // LOGIMPROPERUSE DETECTION
+    // REQUEST BODY CLASSIFICATION & MUTATION INTERCEPTION
     // ============================================================
-    const LOG_IMPROPER_RE = /logimproperuse/i;
-    const LOG_IMPROPER_PAYLOAD = JSON.stringify({ data: { logImproperUse: true } });
+    const MAX_SCAN = 65536;
+    const BLOCKED_OPS_RE = /\b(logImproperUse|logEvent|logLessonSearch|logVideoSearchRequest)\b/i;
 
-    function bodyLooksLikeLogImproperUse(body) {
-        if (body == null) return false;
+    function getBlockedMutationKind(body) {
+        if (!body) return null;
         if (typeof body !== 'string') {
             try {
                 if (body instanceof URLSearchParams) body = body.toString();
-                else return false;
-            } catch { return false; }
+                else return null;
+            } catch { return null; }
         }
-        return LOG_IMPROPER_RE.test(body);
+        if (body.length > MAX_SCAN) return null;
+        const m = BLOCKED_OPS_RE.exec(body);
+        if (!m) return null;
+        const op = m[1].toLowerCase();
+        if (op === 'logimproperuse') return 'improper';
+        if (op === 'logevent') return 'event';
+        if (op === 'loglessonsearch' || op === 'logvideosearchrequest') return 'search';
+        return null;
+    }
+
+    const REQ_TRANSFORM_RE = /\b(?:GetFeatureFlags|GetFeatureFlagsEnabledGlobally|currentUser)\b/i;
+    const REQ_INGEST_RE = /\b(?:GetVideoLesson|GetExamPaper|GetExamQuestion|GetExamPracticeSession|AnswerInVideoQuestion|AnswerPreVideoQuestion|SaveExamAnswer|CompleteExamPracticeSession|SubmitQuestionAttempt|videoLesson|examPaper)\b/i;
+
+    function classifyApiRequest(body) {
+        if (!body || typeof body !== 'string' || body.length > MAX_SCAN) return 'none';
+        if (REQ_TRANSFORM_RE.test(body)) return 'transform';
+        if (REQ_INGEST_RE.test(body)) return 'ingest';
+        return 'none';
+    }
+
+    // ============================================================
+    // LOGIMPROPERUSE DETECTION
+    // ============================================================
+    const LOG_IMPROPER_PAYLOAD = JSON.stringify({ data: { logImproperUse: true } });
+
+    function bodyLooksLikeLogImproperUse(body) {
+        return getBlockedMutationKind(body) === 'improper';
     }
 
     function logImproperUseSyntheticResponse() {
@@ -1029,18 +1195,10 @@
     // ============================================================
     // LOGEVENT DETECTION (Local Interaction Logging)
     // ============================================================
-    const LOG_EVENT_RE = /\b(logevent)\b/i;
     const LOG_EVENT_PAYLOAD = JSON.stringify({ data: { logEvent: { id: "mock" } } });
 
     function bodyLooksLikeLogEvent(body) {
-        if (body == null) return false;
-        if (typeof body !== 'string') {
-            try {
-                if (body instanceof URLSearchParams) body = body.toString();
-                else return false;
-            } catch { return false; }
-        }
-        return LOG_EVENT_RE.test(body);
+        return getBlockedMutationKind(body) === 'event';
     }
 
     function logEventSyntheticResponse() {
@@ -1053,7 +1211,6 @@
     // ============================================================
     // LOGLESSONSEARCH DETECTION (Private Search Mode)
     // ============================================================
-    const LOG_LESSON_SEARCH_RE = /\b(loglessonsearch|logvideosearchrequest)\b/i;
     const LOG_LESSON_SEARCH_PAYLOAD = JSON.stringify({
         data: {
             logVideoSearchRequest: { id: "mock" },
@@ -1062,14 +1219,7 @@
     });
 
     function bodyLooksLikeLogLessonSearch(body) {
-        if (body == null) return false;
-        if (typeof body !== 'string') {
-            try {
-                if (body instanceof URLSearchParams) body = body.toString();
-                else return false;
-            } catch { return false; }
-        }
-        return LOG_LESSON_SEARCH_RE.test(body);
+        return getBlockedMutationKind(body) === 'search';
     }
 
     function logLessonSearchSyntheticResponse() {
@@ -1088,55 +1238,51 @@
         'course_activity_record_improper_use',
     ]);
 
+    const FEATURE_FLAGS_RE = /course_activity_(?:fullscreen_mode|fullscreen_exit_modal|record_improper_use)|(?:featureFlags.*currentUser|currentUser.*featureFlags)/s;
+
     function shouldTransformFeatureFlags(text) {
         if (!text || typeof text !== 'string') return false;
-        return (
-            text.includes('course_activity_fullscreen_mode') ||
-            text.includes('course_activity_fullscreen_exit_modal') ||
-            text.includes('course_activity_record_improper_use') ||
-            (text.includes('featureFlags') && text.includes('currentUser'))
-        );
+        return FEATURE_FLAGS_RE.test(text);
     }
 
     function stripFullscreenFeatureFlags(obj) {
         if (!obj || typeof obj !== 'object') return obj;
         if (Array.isArray(obj)) {
-            return obj
-                .filter((item) => typeof item !== 'string' || !STRIPPED_FEATURE_FLAGS.has(item))
-                .map(stripFullscreenFeatureFlags);
-        }
-        const result = {};
-        for (const [k, v] of Object.entries(obj)) {
-            if (STRIPPED_FEATURE_FLAGS.has(k)) {
-                continue;
+            let writeIdx = 0;
+            for (let i = 0; i < obj.length; i++) {
+                const item = obj[i];
+                if (typeof item === 'string' && STRIPPED_FEATURE_FLAGS.has(item)) {
+                    continue;
+                }
+                if (item && typeof item === 'object') {
+                    stripFullscreenFeatureFlags(item);
+                }
+                obj[writeIdx++] = item;
             }
-            result[k] = stripFullscreenFeatureFlags(v);
+            obj.length = writeIdx;
+            return obj;
         }
-        return result;
+        for (const k of Object.keys(obj)) {
+            if (STRIPPED_FEATURE_FLAGS.has(k)) {
+                delete obj[k];
+            } else {
+                const v = obj[k];
+                if (v && typeof v === 'object') {
+                    stripFullscreenFeatureFlags(v);
+                }
+            }
+        }
+        return obj;
     }
 
     // ============================================================
     // UNIFIED GRAPHQL DATA STREAM FILTER
     // ============================================================
+    const GRAPHQL_INGEST_RE = /(?:videoLesson|VideoQuestion|answer(?:In|Pre)VideoQuestion|exam(?:Paper|PracticeSession|Question)|featureFlags|GetFeatureFlags|feedback|currentUser|userProfile)/i;
+
     function shouldIngestGraphQLResponse(rt) {
         if (!rt || typeof rt !== 'string') return false;
-        return (
-            rt.includes('videoLesson') ||
-            rt.includes('VideoQuestion') ||
-            rt.includes('answerInVideoQuestion') ||
-            rt.includes('answerPreVideoQuestion') ||
-            rt.includes('examPaper') ||
-            rt.includes('ExamPaper') ||
-            rt.includes('examPracticeSession') ||
-            rt.includes('ExamPracticeSession') ||
-            rt.includes('examQuestion') ||
-            rt.includes('ExamQuestion') ||
-            rt.includes('featureFlags') ||
-            rt.includes('GetFeatureFlags') ||
-            rt.includes('feedback') ||
-            rt.includes('currentUser') ||
-            rt.includes('userProfile')
-        );
+        return GRAPHQL_INGEST_RE.test(rt);
     }
 
     // ============================================================
@@ -1584,47 +1730,48 @@
 
     function isQuestionActiveOnPage() {
         try {
-            if (typeof document.querySelectorAll === 'function') {
-                // Check visible quiz action buttons (Submit, Check, Continue, Resume, Try Again)
-                // Check text label BEFORE layout visibility to avoid synchronous reflows on unrelated buttons
-                const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"]');
-                for (let i = 0; i < buttons.length; i++) {
-                    const btn = buttons[i];
-                    const rawTxt = btn.textContent || btn.innerText || btn.value || '';
-                    if (!rawTxt) continue;
-                    const txt = rawTxt.trim().toLowerCase();
-                    if (!QUIZ_ACTION_LABELS.has(txt)) continue;
-                    if (isElementVisible(btn)) {
-                        return true;
-                    }
-                }
+            // Fast path: Check lastResolvedSubmitBtn first
+            if (lastResolvedSubmitBtn && lastResolvedSubmitBtn.isConnected && isCandidateSubmitButton(lastResolvedSubmitBtn)) {
+                return true;
+            }
 
-                const submitBtn = findSubmitButton();
-                if (submitBtn && isElementVisible(submitBtn)) {
-                    return true;
+            if (typeof document.querySelectorAll === 'function') {
+                // Check question modals / overlays first (very fast, only a few elements)
+                const modals = document.querySelectorAll('[role="dialog"], .quiz-content, [data-testid*="question"]');
+                for (let i = 0; i < modals.length; i++) {
+                    if (isElementVisible(modals[i])) return true;
                 }
 
                 // Check visible quiz option inputs
                 const inputs = document.querySelectorAll('input[type="radio"], input[type="checkbox"]');
                 for (let i = 0; i < inputs.length; i++) {
-                    const inp = inputs[i];
-                    if (isElementVisible(inp)) return true;
+                    if (isElementVisible(inputs[i])) return true;
                 }
 
-                // Check question modals / overlays
-                const modals = document.querySelectorAll('[role="dialog"], .quiz-content, [data-testid*="question"]');
-                for (let i = 0; i < modals.length; i++) {
-                    const m = modals[i];
-                    if (isElementVisible(m)) return true;
+                // Single consolidated button loop checking quiz action labels and candidate submit buttons
+                const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+                for (let i = 0; i < buttons.length; i++) {
+                    const btn = buttons[i];
+                    if (btn.id === MANUAL_BUTTON_ID) continue;
+                    const txt = getCleanElementText(btn);
+                    if (!txt) continue;
+                    if (QUIZ_ACTION_LABELS.has(txt) || QUESTION_SUBMIT_LABELS.has(txt) || QUESTION_SUBMIT_RE.test(txt)) {
+                        if (isElementVisible(btn)) {
+                            lastResolvedSubmitBtn = btn;
+                            return true;
+                        }
+                    }
                 }
             }
         } catch {}
         return false;
     }
 
+    const boundVideoElements = new WeakSet();
+
     function bindVideoEvents(video) {
-        if (!video || video.__ul_skip_bound) return;
-        video.__ul_skip_bound = true;
+        if (!video || boundVideoElements.has(video)) return;
+        boundVideoElements.add(video);
         const triggerSkip = () => {
             if (settings.autoSkipVideoEnabled) checkAndAutoSkipVideo(false);
         };
@@ -1727,32 +1874,36 @@
         }
     }
 
-    let videoAutoSkipInterval = null;
-    function startVideoAutoSkipController() {
-        if (videoAutoSkipInterval !== null) return;
-        try {
-            videoAutoSkipInterval = setInterval(() => {
-                if (settings.autoSkipVideoEnabled && (!lastActiveVideoElement || !lastActiveVideoElement.isConnected || lastSkippedTarget !== 'end-1s')) {
-                    checkAndAutoSkipVideo();
-                }
-            }, 800);
-        } catch (e) {
-            WARN('initVideoAutoSkipController failed', e);
+    function onVideoMediaEvent(e) {
+        if (!settings.autoSkipVideoEnabled) return;
+        const target = e.target;
+        if (target && target.tagName === 'VIDEO') {
+            checkAndAutoSkipVideo(false);
         }
+    }
+
+    let mediaListenersInstalled = false;
+    function installVideoMediaListeners() {
+        if (mediaListenersInstalled) return;
+        mediaListenersInstalled = true;
+        document.addEventListener('loadedmetadata', onVideoMediaEvent, true);
+        document.addEventListener('play', onVideoMediaEvent, true);
+        document.addEventListener('playing', onVideoMediaEvent, true);
+    }
+
+    function startVideoAutoSkipController() {
+        installVideoMediaListeners();
+        checkAndAutoSkipVideo(false);
     }
 
     function stopVideoAutoSkipController() {
-        if (videoAutoSkipInterval !== null) {
-            clearInterval(videoAutoSkipInterval);
-            videoAutoSkipInterval = null;
-        }
+        // Media listeners are zero-overhead no-ops when settings.autoSkipVideoEnabled === false
     }
 
     function initVideoAutoSkipController() {
+        installVideoMediaListeners();
         if (settings.autoSkipVideoEnabled) {
-            startVideoAutoSkipController();
-        } else {
-            stopVideoAutoSkipController();
+            checkAndAutoSkipVideo(false);
         }
     }
 
@@ -1883,10 +2034,16 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
     const QUESTION_SUBMIT_RE = /^(submit|check|save|confirm|mark)(\s+(answer|answers|marks|response|part))?$/i;
 
+    const cleanedTextCache = new WeakMap();
+
     function getCleanElementText(el) {
         if (!el) return '';
-        const raw = el.textContent || el.value || el.getAttribute('aria-label') || '';
-        return raw.trim().toLowerCase().replace(/\s+/g, ' ');
+        const cached = cleanedTextCache.get(el);
+        if (cached !== undefined) return cached;
+        const raw = el.textContent || el.value || (typeof el.getAttribute === 'function' ? el.getAttribute('aria-label') : '') || '';
+        const cleaned = raw.trim().toLowerCase().replace(/\s+/g, ' ');
+        cleanedTextCache.set(el, cleaned);
+        return cleaned;
     }
 
     let lastResolvedSubmitBtn = null;
@@ -2162,25 +2319,45 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     function scheduleEnsureButton(mutations) {
         if (!settings.manualTimeButtonEnabled || manualBtnScheduled) return;
         if (mutations && Array.isArray(mutations)) {
-            let onlyOurElements = true;
+            let hasRelevantElementChange = false;
             for (let i = 0; i < mutations.length; i++) {
-                const target = mutations[i].target;
-                if (!target) {
-                    onlyOurElements = false;
-                    break;
-                }
-                const tid = target.id;
-                const isOurs = target === uiHostEl ||
-                    tid === MANUAL_BUTTON_ID ||
-                    (typeof tid === 'string' && tid.includes('__ul-')) ||
-                    (target.parentElement && target.parentElement.id === MANUAL_BUTTON_ID) ||
-                    (uiHostEl && typeof uiHostEl.contains === 'function' && uiHostEl.contains(target));
-                if (!isOurs) {
-                    onlyOurElements = false;
-                    break;
+                const m = mutations[i];
+                if (m.type === 'childList') {
+                    const added = m.addedNodes;
+                    for (let j = 0; j < added.length; j++) {
+                        if (added[j].nodeType === 1) {
+                            const node = added[j];
+                            const tid = node.id;
+                            const isOurs = node === uiHostEl ||
+                                tid === MANUAL_BUTTON_ID ||
+                                (typeof tid === 'string' && tid.includes('__ul-')) ||
+                                (uiHostEl && typeof uiHostEl.contains === 'function' && uiHostEl.contains(node));
+                            if (!isOurs) {
+                                hasRelevantElementChange = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (hasRelevantElementChange) break;
+                    const removed = m.removedNodes;
+                    for (let j = 0; j < removed.length; j++) {
+                        if (removed[j].nodeType === 1) {
+                            const node = removed[j];
+                            const tid = node.id;
+                            const isOurs = node === uiHostEl ||
+                                tid === MANUAL_BUTTON_ID ||
+                                (typeof tid === 'string' && tid.includes('__ul-')) ||
+                                (uiHostEl && typeof uiHostEl.contains === 'function' && uiHostEl.contains(node));
+                            if (!isOurs) {
+                                hasRelevantElementChange = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (hasRelevantElementChange) break;
                 }
             }
-            if (onlyOurElements) return;
+            if (!hasRelevantElementChange) return;
         }
         manualBtnScheduled = true;
         setTimeout(() => {
@@ -2196,17 +2373,16 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     /* ------------------------------------------------------------
      * Body Rewriting & Network Injection
      * ------------------------------------------------------------ */
+    const TIME_SPENT_RE = /timeSpent(?:Answering|Marking)?|completeVideoLesson|updateVideoLessonWatchPercent|Answer|SaveExam|Complete/i;
+
     function maybeBumpTimeSpent(body, source) {
-        if (typeof body !== 'string') return { body, changed: false };
+        if (typeof body !== 'string' || body.length > MAX_SCAN) return { body, changed: false };
 
         const boostActive = settings.timeBoostEnabled || queuedSeconds !== null || accumulatedExtraSeconds > 0;
         const videoActive = settings.fullVideoWatchedEnabled || settings.addVideoDurationToTimeSpent;
         if (!boostActive && !videoActive) return { body, changed: false };
 
-        const hasTimeSpent = body.includes('timeSpent') || body.includes('timeSpentAnswering') || body.includes('timeSpentMarking');
-        const hasVideo = body.includes(VIDEO_OP) || body.includes('completeVideoLesson');
-        const hasQuestion = body.includes('Answer') || body.includes('SaveExam') || body.includes('Complete');
-        if (!hasTimeSpent && !hasVideo && !hasQuestion) return { body, changed: false };
+        if (!TIME_SPENT_RE.test(body)) return { body, changed: false };
 
         let json;
         try { json = JSON.parse(body); }
@@ -2451,47 +2627,54 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     // FETCH INTERCEPTOR
     // ============================================================
     const origFetch = window.fetch;
-    function processFetchResponse(fetchPromise, url) {
+    function processFetchResponse(fetchPromise, url, reqKind = 'none') {
+        if (reqKind === 'ingest') {
+            // Passive ingestion: zero added latency, handle in background asynchronously
+            fetchPromise.then((res) => {
+                if (res && res.ok && typeof res.clone === 'function') {
+                    res.clone().json().then(handleApiResponse).catch(() => {});
+                }
+            }).catch(() => {});
+            return fetchPromise;
+        }
+
+        if (reqKind !== 'transform') {
+            // Unrelated operations: do not clone or delay response
+            return fetchPromise;
+        }
+
+        // Only await cloned.text() for feature flags transformation
         return fetchPromise.then((res) => {
             try {
                 if (res && res.ok && typeof res.clone === 'function') {
                     const cloned = res.clone();
                     if (typeof cloned.text === 'function') {
                         return cloned.text().then((rt) => {
-                            const ingest = shouldIngestGraphQLResponse(rt);
-                            const transform = shouldTransformFeatureFlags(rt);
-                            if (ingest || transform) {
+                            if (shouldTransformFeatureFlags(rt)) {
                                 try {
                                     const parsed = JSON.parse(rt);
-                                    if (ingest) handleApiResponse(parsed);
-                                    if (transform) {
-                                        try {
-                                            const transformed = stripFullscreenFeatureFlags(parsed);
-                                            const transformedText = JSON.stringify(transformed);
-                                            reportFeatureFlagsTransformed('fetch', url || 'API');
-                                            const newHeaders = new Headers();
-                                            res.headers.forEach((v, k) => {
-                                                const lk = k.toLowerCase();
-                                                if (lk !== 'content-encoding' && lk !== 'content-length') {
-                                                    newHeaders.set(k, v);
-                                                }
-                                            });
-                                            newHeaders.set('content-type', 'application/json');
-                                            return new Response(transformedText, {
-                                                status: res.status,
-                                                statusText: res.statusText,
-                                                headers: newHeaders,
-                                            });
-                                        } catch (e) {
-                                            WARN('Failed to transform feature flags response:', e);
+                                    const transformed = stripFullscreenFeatureFlags(parsed);
+                                    const transformedText = JSON.stringify(transformed);
+                                    reportFeatureFlagsTransformed('fetch', url || 'API');
+                                    const newHeaders = new Headers();
+                                    res.headers.forEach((v, k) => {
+                                        const lk = k.toLowerCase();
+                                        if (lk !== 'content-encoding' && lk !== 'content-length') {
+                                            newHeaders.set(k, v);
                                         }
-                                    }
-                                } catch {}
+                                    });
+                                    newHeaders.set('content-type', 'application/json');
+                                    return new Response(transformedText, {
+                                        status: res.status,
+                                        statusText: res.statusText,
+                                        headers: newHeaders,
+                                    });
+                                } catch (e) {
+                                    WARN('Failed to transform feature flags response:', e);
+                                }
                             }
                             return res;
                         }).catch(() => res);
-                    } else if (typeof cloned.json === 'function') {
-                        cloned.json().then(handleApiResponse).catch(() => {});
                     }
                 }
             } catch (e) {
@@ -2507,6 +2690,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             let url = '';
             let method = 'GET';
             let targetApi = false;
+            let reqKind = 'none';
             try {
                 url = typeof input === 'string' ? input
                           : (input && input.url) ? input.url
@@ -2538,7 +2722,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                             try {
                                 const ct = (input.headers.get('content-type') || '').toLowerCase();
                                 if (ct.includes('application/json') || ct.includes('text/')) {
-                                    return input.clone().text().then(doBlock);
+                                    return input.clone().text().then(doBlock, () => doBlock(null));
                                 }
                             } catch {}
                         }
@@ -2557,7 +2741,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                             try {
                                 const ct = (input.headers.get('content-type') || '').toLowerCase();
                                 if (ct.includes('application/json') || ct.includes('text/')) {
-                                    return input.clone().text().then(doLogAndPass);
+                                    return input.clone().text().then(doLogAndPass, () => origFetch.call(self, input, init));
                                 }
                             } catch {}
                         }
@@ -2578,46 +2762,51 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                             if (ct.includes('application/json')) {
                                 const passInit = init;
                                 return input.clone().text().then((text) => {
-                                    if (settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(text)) {
+                                    const blockedKind = getBlockedMutationKind(text);
+                                    if (blockedKind === 'improper' && settings.blockLogImproperUse) {
                                         reportLogImproperUse('fetch · Request body', url, text);
                                         bumpStat('blocked');
                                         return logImproperUseSyntheticResponse();
                                     }
-                                    if (settings.blockLogEvent !== false && bodyLooksLikeLogEvent(text)) {
+                                    if (blockedKind === 'event' && settings.blockLogEvent !== false) {
                                         reportLogEvent('fetch · Request body', url, text);
                                         return logEventSyntheticResponse();
                                     }
-                                    if (settings.privateSearchMode !== false && bodyLooksLikeLogLessonSearch(text)) {
+                                    if (blockedKind === 'search' && settings.privateSearchMode !== false) {
                                         reportLogLessonSearch('fetch · Request body', url, text);
                                         return logLessonSearchSyntheticResponse();
                                     }
+                                    const reqK = classifyApiRequest(text);
                                     const { body: newBody, changed } = maybeBumpTimeSpent(text, 'fetch-Req');
                                     const reqToFetch = changed
                                         ? new Request(input, { body: newBody, method: input.method })
                                         : input;
                                     const fetchPromise = origFetch.call(self, reqToFetch, passInit);
-                                    return processFetchResponse(fetchPromise, url);
+                                    return processFetchResponse(fetchPromise, url, reqK);
+                                }, () => {
+                                    // Rejection handler fallback if input stream was disturbed/locked
+                                    return origFetch.call(self, input, passInit);
                                 });
                             }
                         }
 
-                        if (body != null && settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(body)) {
-                            reportLogImproperUse('fetch', url, body);
-                            bumpStat('blocked');
-                            return Promise.resolve(logImproperUseSyntheticResponse());
-                        }
-
-                        if (body != null && settings.blockLogEvent !== false && bodyLooksLikeLogEvent(body)) {
-                            reportLogEvent('fetch', url, body);
-                            return Promise.resolve(logEventSyntheticResponse());
-                        }
-
-                        if (body != null && settings.privateSearchMode !== false && bodyLooksLikeLogLessonSearch(body)) {
-                            reportLogLessonSearch('fetch', url, body);
-                            return Promise.resolve(logLessonSearchSyntheticResponse());
-                        }
-
                         if (body != null) {
+                            const blockedKind = getBlockedMutationKind(body);
+                            if (blockedKind === 'improper' && settings.blockLogImproperUse) {
+                                reportLogImproperUse('fetch', url, body);
+                                bumpStat('blocked');
+                                return Promise.resolve(logImproperUseSyntheticResponse());
+                            }
+                            if (blockedKind === 'event' && settings.blockLogEvent !== false) {
+                                reportLogEvent('fetch', url, body);
+                                return Promise.resolve(logEventSyntheticResponse());
+                            }
+                            if (blockedKind === 'search' && settings.privateSearchMode !== false) {
+                                reportLogLessonSearch('fetch', url, body);
+                                return Promise.resolve(logLessonSearchSyntheticResponse());
+                            }
+
+                            reqKind = classifyApiRequest(body);
                             const { body: newBody, changed } = maybeBumpTimeSpent(body, 'fetch');
                             if (changed) init = Object.assign({}, init || {}, { body: newBody });
                         }
@@ -2631,10 +2820,11 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
             const fetchPromise = origFetch.call(self, input, init);
             if (targetApi) {
-                return processFetchResponse(fetchPromise, url);
+                return processFetchResponse(fetchPromise, url, reqKind);
             }
             return fetchPromise;
         };
+        cloak(window.fetch, 'fetch');
         VLOG('fetch hook installed');
     }
 
@@ -2660,20 +2850,23 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     }
 
     const OrigXHR = window.XMLHttpRequest;
+    const xhrInfoMap = new WeakMap();
+
     if (OrigXHR) {
         const origOpen = OrigXHR.prototype.open;
         const origSend = OrigXHR.prototype.send;
 
         OrigXHR.prototype.open = function (method, url) {
-            this.__ul_method = method;
-            this.__ul_url    = url;
+            xhrInfoMap.set(this, { method, url });
             return origOpen.apply(this, arguments);
         };
+        cloak(OrigXHR.prototype.open, 'open');
 
         OrigXHR.prototype.send = function (body) {
             try {
-                const method = (this.__ul_method || '').toUpperCase();
-                const url = this.__ul_url;
+                const info = xhrInfoMap.get(this);
+                const method = (info?.method || '').toUpperCase();
+                const url = info?.url || '';
 
                 const anyMatch = matchAnyTelemetryService(url);
                 if (anyMatch) {
@@ -2714,7 +2907,8 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 } else if (isTargetApi(url)) {
                     if (method === 'POST') bumpStat('apiPosts');
 
-                    if (settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(body)) {
+                    const blockedKind = getBlockedMutationKind(body);
+                    if (blockedKind === 'improper' && settings.blockLogImproperUse) {
                         reportLogImproperUse('XHR', url,
                             typeof body === 'string' ? body : '(non-string body)');
                         bumpStat('blocked');
@@ -2722,14 +2916,14 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                         return;
                     }
 
-                    if (settings.blockLogEvent !== false && bodyLooksLikeLogEvent(body)) {
+                    if (blockedKind === 'event' && settings.blockLogEvent !== false) {
                         reportLogEvent('XHR', url,
                             typeof body === 'string' ? body : '(non-string body)');
                         mockBlockedXHR(this, LOG_EVENT_PAYLOAD, () => ({ data: { logEvent: { id: "mock" } } }));
                         return;
                     }
 
-                    if (settings.privateSearchMode !== false && bodyLooksLikeLogLessonSearch(body)) {
+                    if (blockedKind === 'search' && settings.privateSearchMode !== false) {
                         reportLogLessonSearch('XHR', url,
                             typeof body === 'string' ? body : '(non-string body)');
                         mockBlockedXHR(this, LOG_LESSON_SEARCH_PAYLOAD, () => ({ data: { logVideoSearchRequest: { id: "mock" }, logLessonSearch: { id: "mock" } } }));
@@ -2743,46 +2937,58 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
                     const selfXhr = this;
                     let xhrHandled = false;
+                    const cleanupXhrListeners = function () {
+                        try {
+                            selfXhr.removeEventListener('readystatechange', handleXhrResponse, true);
+                            selfXhr.removeEventListener('loadend', handleXhrResponse, true);
+                        } catch {}
+                    };
                     const handleXhrResponse = function () {
                         if (xhrHandled) return;
                         try {
-                            if (selfXhr.readyState === 4 && selfXhr.status === 200) {
+                            if (selfXhr.readyState === 4) {
                                 xhrHandled = true;
-                                const rt = selfXhr.responseText;
-                                const ingest = shouldIngestGraphQLResponse(rt);
-                                const transform = shouldTransformFeatureFlags(rt);
-                                if (ingest || transform) {
-                                    try {
-                                        const parsed = JSON.parse(rt);
-                                        if (ingest) handleApiResponse(parsed);
-                                        if (transform) {
-                                            const modifiedJson = stripFullscreenFeatureFlags(parsed);
-                                            const modifiedText = JSON.stringify(modifiedJson);
-                                            reportFeatureFlagsTransformed('XHR', url || 'API');
-                                            Object.defineProperty(selfXhr, 'responseText', {
-                                                get() { return modifiedText; },
-                                                configurable: true,
-                                            });
-                                            Object.defineProperty(selfXhr, 'response', {
-                                                get() {
-                                                    return selfXhr.responseType === 'json' ? modifiedJson : modifiedText;
-                                                },
-                                                configurable: true,
-                                            });
-                                        }
-                                    } catch {}
+                                cleanupXhrListeners();
+                                if (selfXhr.status === 200) {
+                                    const rt = selfXhr.responseText;
+                                    const ingest = shouldIngestGraphQLResponse(rt);
+                                    const transform = shouldTransformFeatureFlags(rt);
+                                    if (ingest || transform) {
+                                        try {
+                                            const parsed = JSON.parse(rt);
+                                            if (ingest) handleApiResponse(parsed);
+                                            if (transform) {
+                                                const modifiedJson = stripFullscreenFeatureFlags(parsed);
+                                                const modifiedText = JSON.stringify(modifiedJson);
+                                                reportFeatureFlagsTransformed('XHR', url || 'API');
+                                                Object.defineProperty(selfXhr, 'responseText', {
+                                                    get() { return modifiedText; },
+                                                    configurable: true,
+                                                });
+                                                Object.defineProperty(selfXhr, 'response', {
+                                                    get() {
+                                                        return selfXhr.responseType === 'json' ? modifiedJson : modifiedText;
+                                                    },
+                                                    configurable: true,
+                                                });
+                                            }
+                                        } catch {}
+                                    }
                                 }
                             }
-                        } catch {}
+                        } catch {
+                            cleanupXhrListeners();
+                        }
                     };
                     this.addEventListener('readystatechange', handleXhrResponse, true);
-                    this.addEventListener('load', handleXhrResponse, true);
+                    this.addEventListener('loadend', handleXhrResponse, { once: true, capture: true });
                 }
             } catch (e) {
                 WARN('xhr interceptor error:', e);
             }
             return origSend.call(this, body);
         };
+        cloak(OrigXHR.prototype.send, 'send');
         VLOG('XHR hook installed');
     }
 
@@ -2855,37 +3061,44 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     const VISIBILITY_PROPS = ['visibilityState', 'webkitVisibilityState', 'mozVisibilityState', 'msVisibilityState'];
     const HIDDEN_PROPS     = ['hidden', 'webkitHidden', 'mozHidden', 'msHidden'];
     const VIS_DESC = {
-        get: () => settings.spoofVisibility ? 'visible' : (ORIG_VIS ? ORIG_VIS.call(document) : 'visible'),
+        get: function () {
+            return settings.spoofVisibility ? 'visible' : (ORIG_VIS ? ORIG_VIS.call(document) : 'visible');
+        },
         configurable: true,
     };
+    cloak(VIS_DESC.get, 'get');
+
     const HIDDEN_DESC = {
-        get: () => settings.spoofVisibility ? false : (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : false),
+        get: function () {
+            return settings.spoofVisibility ? false : (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : false);
+        },
         configurable: true,
     };
+    cloak(HIDDEN_DESC.get, 'get');
+
     const SPOOFED_HAS_FOCUS = function () {
         return settings.spoofVisibility ? true : ORIG_HAS_FOCUS();
     };
+    cloak(SPOOFED_HAS_FOCUS, 'hasFocus');
 
     function patchVisibilityProps() {
         try {
-            const curDocVis = Object.getOwnPropertyDescriptor(document, 'visibilityState');
             const docProto = (typeof Document !== 'undefined' && Document.prototype) ? Document.prototype : null;
-            const curProtoVis = docProto ? Object.getOwnPropertyDescriptor(docProto, 'visibilityState') : null;
-            if (curDocVis && curDocVis.get === VIS_DESC.get && (!docProto || (curProtoVis && curProtoVis.get === VIS_DESC.get))) {
-                return;
-            }
+            const htmlDocProto = (typeof HTMLDocument !== 'undefined' && HTMLDocument.prototype) ? HTMLDocument.prototype : null;
+            const targets = [docProto, htmlDocProto].filter(Boolean);
+
             for (let i = 0; i < VISIBILITY_PROPS.length; i++) {
                 const prop = VISIBILITY_PROPS[i];
-                try { Object.defineProperty(document, prop, VIS_DESC); } catch {}
-                if (docProto) {
-                    try { Object.defineProperty(docProto, prop, VIS_DESC); } catch {}
+                try { delete document[prop]; } catch {}
+                for (let t = 0; t < targets.length; t++) {
+                    try { Object.defineProperty(targets[t], prop, VIS_DESC); } catch {}
                 }
             }
             for (let i = 0; i < HIDDEN_PROPS.length; i++) {
                 const prop = HIDDEN_PROPS[i];
-                try { Object.defineProperty(document, prop, HIDDEN_DESC); } catch {}
-                if (docProto) {
-                    try { Object.defineProperty(docProto, prop, HIDDEN_DESC); } catch {}
+                try { delete document[prop]; } catch {}
+                for (let t = 0; t < targets.length; t++) {
+                    try { Object.defineProperty(targets[t], prop, HIDDEN_DESC); } catch {}
                 }
             }
         } catch (e) { WARN('visibility patch failed', e); }
@@ -2894,9 +3107,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
     function installHasFocusPatch() {
         try {
-            if (document.hasFocus !== SPOOFED_HAS_FOCUS) {
-                document.hasFocus = SPOOFED_HAS_FOCUS;
-            }
+            try { delete document.hasFocus; } catch {}
             if (typeof Document !== 'undefined' && Document.prototype && Document.prototype.hasFocus !== SPOOFED_HAS_FOCUS) {
                 Document.prototype.hasFocus = SPOOFED_HAS_FOCUS;
             }
@@ -3024,11 +3235,13 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         'requestFullscreen', 'webkitRequestFullscreen', 'webkitRequestFullScreen',
         'mozRequestFullScreen', 'msRequestFullscreen',
     ];
+    const patchedFullscreenFns = new WeakSet();
+    const origFullscreenFns = new WeakMap();
 
     function installFullscreenBlocker() {
         FULLSCREEN_METHODS.forEach((name) => {
             const proto = Element.prototype;
-            if (!proto[name] || proto[name].__ul_patched) return;
+            if (!proto[name] || patchedFullscreenFns.has(proto[name])) return;
             const orig = proto[name];
             const wrapped = function () {
                 if (settings.disableAutoFullscreen) {
@@ -3049,8 +3262,9 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 }
                 return orig.apply(this, arguments);
             };
-            wrapped.__ul_patched = true;
-            wrapped.__ul_orig    = orig;
+            patchedFullscreenFns.add(wrapped);
+            origFullscreenFns.set(wrapped, orig);
+            cloak(wrapped, name);
             try {
                 Object.defineProperty(proto, name, {
                     value: wrapped, writable: true, configurable: true,
@@ -3183,9 +3397,9 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         if (!styleEl) {
             styleEl = document.createElement('style');
             styleEl.id = '__ul-heroui-styles';
+            styleEl.textContent = getHeroUIStyles();
             uiShadowRoot.appendChild(styleEl);
         }
-        styleEl.textContent = getHeroUIStyles();
 
         let container = uiShadowRoot.getElementById('__ul-root');
         if (!container) {
@@ -5640,7 +5854,7 @@ var Glisse = (() => {
     };
   }
   function maps(width, height, radius, selection, shape) {
-    const density = Math.min(devicePixelRatio || 1, 2);
+    const density = 1;
     const bezel = shape.bezel ?? clamp$2(Math.min(width, height) * 0.12, 4, 10);
     const { samples, maximum } = profile(bezel, shape.thickness ?? clamp$2(Math.min(width, height) * 0.2, 8, 24));
     const canvas = document.createElement("canvas");
@@ -5687,14 +5901,18 @@ var Glisse = (() => {
       shine.data[i] = shine.data[i + 1] = shine.data[i + 2] = 255;
       let alpha = 0;
       if (distance >= 0 && selection) {
-        const bands = [
-          0.18,
-          0.42,
-          0.66
-        ].map((centre) => Math.exp(-(((distance - centre) / 0.22) ** 2)));
-        const peak = Math.max(...bands);
+        const d0 = (distance - 0.18) / 0.22;
+        const d1 = (distance - 0.42) / 0.22;
+        const d2 = (distance - 0.66) / 0.22;
+        const b0 = Math.exp(-(d0 * d0));
+        const b1 = Math.exp(-(d1 * d1));
+        const b2 = Math.exp(-(d2 * d2));
+        const peak = Math.max(b0, b1, b2);
         alpha = peak * (0.06 + 0.8 * glint + 0.35 * reflected) * 0.85;
-        for (let channel = 0; channel < 3; channel++) shine.data[i + channel] = Math.round(255 * (0.65 + 0.35 * (peak ? bands[channel] / peak : 0)));
+        const invPeak = peak ? 0.35 / peak : 0;
+        shine.data[i] = Math.round(255 * (0.65 + b0 * invPeak));
+        shine.data[i + 1] = Math.round(255 * (0.65 + b1 * invPeak));
+        shine.data[i + 2] = Math.round(255 * (0.65 + b2 * invPeak));
       } else if (distance >= 0) {
         const rim = Math.exp(-(((distance - 0.4) / 0.38) ** 2));
         const bloom = Math.exp(-((distance / (bezel * 0.22)) ** 2));
@@ -5905,16 +6123,33 @@ var Glisse = (() => {
     return () => clearTimeout(handle);
   }
   var refractsBackdrop = () => /Chrom(?:e|ium)\//.test(navigator.userAgent);
+  const refractCallbacks = new WeakMap();
+  let sharedRefractObserver = null;
+  function getSharedRefractObserver() {
+    if (!sharedRefractObserver && typeof ResizeObserver !== "undefined") {
+      sharedRefractObserver = new ResizeObserver((entries) => {
+        for (let i = 0; i < entries.length; i++) {
+          const cb = refractCallbacks.get(entries[i].target);
+          if (cb) cb();
+        }
+      });
+    }
+    return sharedRefractObserver;
+  }
+
   function refract(element, selection, filtered) {
     let cancel;
-    const observer = new ResizeObserver(() => {
+    const onResize = () => {
       cancel?.();
       cancel = whenIdle(() => fit(element, selection, filtered));
-    });
-    observer.observe(element);
+    };
+    refractCallbacks.set(element, onResize);
+    const observer = getSharedRefractObserver();
+    if (observer) observer.observe(element);
     return () => {
       cancel?.();
-      observer.disconnect();
+      if (observer) observer.unobserve(element);
+      refractCallbacks.delete(element);
       element.style.removeProperty("--lg-filter");
       element.style.removeProperty("--lg-rim");
     };
@@ -8825,7 +9060,7 @@ var Glisse = (() => {
         nativeConsole.log('%cLogImproperUse:         ', CSS.muted, settings.blockLogImproperUse ? 'ON' : 'OFF');
         nativeConsole.log('%cLogEvent handler:       ', CSS.muted, settings.blockLogEvent !== false ? 'ON' : 'OFF');
         nativeConsole.log('%cPrivate search mode:    ', CSS.muted, settings.privateSearchMode !== false ? 'ON' : 'OFF');
-        nativeConsole.log('%cNative Opt-Out (PostHog):', CSS.muted, navigator.webdriver ? 'ON' : 'OFF');
+        nativeConsole.log('%cFunction cloaking:       ', CSS.muted, 'ON');
         nativeConsole.log('%cManual time button:     ', CSS.muted, settings.manualTimeButtonEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cFull video watch:       ', CSS.muted, settings.fullVideoWatchedEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cAuto-skip video:        ', CSS.muted, settings.autoSkipVideoEnabled ? 'ON' : 'OFF');
