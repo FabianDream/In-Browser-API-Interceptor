@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UpLearn Telemetry Blocker & TimeSpent Booster
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
-// @version      3.8.5
-// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; inline manual "Add time" question button for all question types; full video watch completion toggle; auto-skip video to 1 second before completion; add full video duration to timeSpent; dark mode; full control panel UI
+// @version      3.9.0
+// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; unified GraphQL data stream, windowed multitasking feature flag transformer, local LogEvent & private search handlers, native PostHog opt-out; random-range time boost; inline manual "Add time" question button for all question types; full video watch completion toggle; auto-skip video to 1 second before completion; add full video duration to timeSpent; dark mode; full control panel UI
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
@@ -16,6 +16,21 @@
 
 (function () {
     'use strict';
+
+    // ============================================================
+    // NATIVE ANALYTICS OPT-OUT INTEGRATION (PostHog opt-out)
+    // ============================================================
+    try {
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => true,
+            configurable: true,
+            enumerable: true,
+        });
+    } catch (e) {
+        try {
+            navigator.webdriver = true;
+        } catch {}
+    }
 
     // ============================================================
     // NATIVE CONSOLE PRESERVED (before any patching)
@@ -81,6 +96,8 @@
         telemetryServices:         buildDefaultTelemetryServices(),
         suppressJitsu:             true,   // true = block Jitsu, false = allow + log
         blockLogImproperUse:       true,
+        blockLogEvent:             true,
+        privateSearchMode:         true,
         spoofVisibility:           true,
         blockWebSockets:           true,
         blockSendBeacon:           true,
@@ -111,7 +128,7 @@
     const INDIVIDUAL_TELEMETRY_SETTINGS = new Set([
         'telemetryServices',
         'suppressJitsu',
-        'blockLogImproperUse', 'spoofVisibility', 'blockWebSockets',
+        'blockLogImproperUse', 'blockLogEvent', 'privateSearchMode', 'spoofVisibility', 'blockWebSockets',
         'blockSendBeacon', 'blockDomElements', 'suppressConsoleNoise',
     ]);
 
@@ -261,6 +278,8 @@
             for (const k in nextServices) nextServices[k] = false;
             settings.suppressJitsu        = false;
             settings.blockLogImproperUse  = false;
+            settings.blockLogEvent        = false;
+            settings.privateSearchMode    = false;
             settings.spoofVisibility      = false;
             settings.blockWebSockets      = false;
             settings.blockSendBeacon      = false;
@@ -270,6 +289,8 @@
             for (const k in nextServices) nextServices[k] = false;
             settings.suppressJitsu        = false;
             settings.blockLogImproperUse  = true;
+            settings.blockLogEvent        = true;
+            settings.privateSearchMode    = true;
             settings.spoofVisibility      = false;
             settings.blockWebSockets      = false;
             settings.blockSendBeacon      = false;
@@ -279,6 +300,8 @@
             for (const k in nextServices) nextServices[k] = true;
             settings.suppressJitsu        = true;
             settings.blockLogImproperUse  = true;
+            settings.blockLogEvent        = true;
+            settings.privateSearchMode    = true;
             settings.spoofVisibility      = true;
             settings.blockWebSockets      = true;
             settings.blockSendBeacon      = true;
@@ -696,6 +719,65 @@
         }
     }
 
+    function reportLogEvent(source, url, body) {
+        bumpStat('blocked');
+        if (settings.logLevel === 'silent') return;
+        if (settings.logLevel === 'verbose') {
+            nativeConsole.groupCollapsed(
+                `%c🚫 LOGEVENT MOCKED%c · ${source}%c · LogEvent`,
+                CSS.improper, CSS.url, CSS.service
+            );
+            nativeConsole.log('%cURL:       ', CSS.muted, url);
+            nativeConsole.log('%cResponse:  ', CSS.muted, '→ synthetic 200 OK  { data: { logEvent: { id: "mock" } } }');
+            nativeConsole.log('%cBody:      ', CSS.body, truncateBody(body, 2400));
+            nativeConsole.groupEnd();
+        } else {
+            nativeConsole.log(
+                `%c[UL] 🚫 LOGEVENT MOCKED%c · ${source}%c · LogEvent`,
+                CSS.improper, CSS.url, CSS.service
+            );
+        }
+    }
+
+    function reportLogLessonSearch(source, url, body) {
+        bumpStat('blocked');
+        if (settings.logLevel === 'silent') return;
+        if (settings.logLevel === 'verbose') {
+            nativeConsole.groupCollapsed(
+                `%c🔒 PRIVATE SEARCH MOCKED%c · ${source}%c · LogLessonSearch`,
+                CSS.improper, CSS.url, CSS.service
+            );
+            nativeConsole.log('%cURL:       ', CSS.muted, url);
+            nativeConsole.log('%cResponse:  ', CSS.muted, '→ synthetic 200 OK  { data: { logVideoSearchRequest: { id: "mock" } } }');
+            nativeConsole.log('%cBody:      ', CSS.body, truncateBody(body, 2400));
+            nativeConsole.groupEnd();
+        } else {
+            nativeConsole.log(
+                `%c[UL] 🔒 PRIVATE SEARCH MOCKED%c · ${source}%c · LogLessonSearch`,
+                CSS.improper, CSS.url, CSS.service
+            );
+        }
+    }
+
+    function reportFeatureFlagsTransformed(source, url) {
+        if (settings.logLevel === 'silent') return;
+        if (settings.logLevel === 'verbose') {
+            nativeConsole.groupCollapsed(
+                `%c🪟 WINDOWED MODE%c · Feature flags stripped%c · ${source}`,
+                CSS.improper, CSS.url, CSS.service
+            );
+            nativeConsole.log('%cURL:       ', CSS.muted, url);
+            nativeConsole.log('%cStripped:  ', CSS.muted, 'course_activity_fullscreen_mode, course_activity_fullscreen_exit_modal, course_activity_record_improper_use');
+            nativeConsole.log('%cResult:    ', CSS.muted, 'Activity session initializes in standard windowed mode without fullscreen prompts or improper use listeners');
+            nativeConsole.groupEnd();
+        } else {
+            nativeConsole.log(
+                `%c[UL] 🪟 WINDOWED MODE%c · Feature flags stripped (${source})`,
+                CSS.improper, CSS.url
+            );
+        }
+    }
+
     function reportAllow(kind, url, reason) {
         if (settings.logLevel !== 'verbose') return;
         nativeConsole.log(
@@ -780,30 +862,32 @@
 
     try {
         const domObserver = new MutationObserver((mutations) => {
-            if (!settings.blockDomElements) return;
-            for (let i = 0; i < mutations.length; i++) {
-                const added = mutations[i].addedNodes;
-                for (let j = 0; j < added.length; j++) {
-                    const node = added[j];
-                    if (node.nodeType !== 1) continue;
-                    const rawTag = node.tagName;
-                    if (
-                        rawTag === 'SCRIPT' ||
-                        rawTag === 'IFRAME' ||
-                        (typeof rawTag === 'string' && rawTag.length === 6 && (rawTag.toLowerCase() === 'script' || rawTag.toLowerCase() === 'iframe'))
-                    ) {
-                        const tag = rawTag.toLowerCase();
-                        const src = node.src || (typeof node.getAttribute === 'function' ? node.getAttribute('src') : '');
-                        if (isTelemetryUrl(src)) {
-                            reportBlock(`DOM injection (<${tag}>)`, src, {
-                                element: tag,
-                                nodeId: node.id || '(none)',
-                            });
-                            node.remove();
+            if (settings.blockDomElements) {
+                for (let i = 0; i < mutations.length; i++) {
+                    const added = mutations[i].addedNodes;
+                    for (let j = 0; j < added.length; j++) {
+                        const node = added[j];
+                        if (node.nodeType !== 1) continue;
+                        const rawTag = node.tagName;
+                        if (
+                            rawTag === 'SCRIPT' ||
+                            rawTag === 'IFRAME' ||
+                            (typeof rawTag === 'string' && rawTag.length === 6 && (rawTag.toLowerCase() === 'script' || rawTag.toLowerCase() === 'iframe'))
+                        ) {
+                            const tag = rawTag.toLowerCase();
+                            const src = node.src || (typeof node.getAttribute === 'function' ? node.getAttribute('src') : '');
+                            if (isTelemetryUrl(src)) {
+                                reportBlock(`DOM injection (<${tag}>)`, src, {
+                                    element: tag,
+                                    nodeId: node.id || '(none)',
+                                });
+                                node.remove();
+                            }
                         }
                     }
                 }
             }
+            scheduleEnsureButton(mutations);
         });
         domObserver.observe(document.documentElement || document, { childList: true, subtree: true });
         VLOG('DOM observer installed');
@@ -940,6 +1024,119 @@
             status: 200, statusText: 'OK',
             headers: { 'Content-Type': 'application/json' }
         });
+    }
+
+    // ============================================================
+    // LOGEVENT DETECTION (Local Interaction Logging)
+    // ============================================================
+    const LOG_EVENT_RE = /\b(logevent)\b/i;
+    const LOG_EVENT_PAYLOAD = JSON.stringify({ data: { logEvent: { id: "mock" } } });
+
+    function bodyLooksLikeLogEvent(body) {
+        if (body == null) return false;
+        if (typeof body !== 'string') {
+            try {
+                if (body instanceof URLSearchParams) body = body.toString();
+                else return false;
+            } catch { return false; }
+        }
+        return LOG_EVENT_RE.test(body);
+    }
+
+    function logEventSyntheticResponse() {
+        return new Response(LOG_EVENT_PAYLOAD, {
+            status: 200, statusText: 'OK',
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+
+    // ============================================================
+    // LOGLESSONSEARCH DETECTION (Private Search Mode)
+    // ============================================================
+    const LOG_LESSON_SEARCH_RE = /\b(loglessonsearch|logvideosearchrequest)\b/i;
+    const LOG_LESSON_SEARCH_PAYLOAD = JSON.stringify({
+        data: {
+            logVideoSearchRequest: { id: "mock" },
+            logLessonSearch: { id: "mock" }
+        }
+    });
+
+    function bodyLooksLikeLogLessonSearch(body) {
+        if (body == null) return false;
+        if (typeof body !== 'string') {
+            try {
+                if (body instanceof URLSearchParams) body = body.toString();
+                else return false;
+            } catch { return false; }
+        }
+        return LOG_LESSON_SEARCH_RE.test(body);
+    }
+
+    function logLessonSearchSyntheticResponse() {
+        return new Response(LOG_LESSON_SEARCH_PAYLOAD, {
+            status: 200, statusText: 'OK',
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+
+    // ============================================================
+    // FEATURE FLAGS RESPONSE TRANSFORMER (Windowed Multitasking)
+    // ============================================================
+    const STRIPPED_FEATURE_FLAGS = new Set([
+        'course_activity_fullscreen_mode',
+        'course_activity_fullscreen_exit_modal',
+        'course_activity_record_improper_use',
+    ]);
+
+    function shouldTransformFeatureFlags(text) {
+        if (!text || typeof text !== 'string') return false;
+        return (
+            text.includes('course_activity_fullscreen_mode') ||
+            text.includes('course_activity_fullscreen_exit_modal') ||
+            text.includes('course_activity_record_improper_use') ||
+            (text.includes('featureFlags') && text.includes('currentUser'))
+        );
+    }
+
+    function stripFullscreenFeatureFlags(obj) {
+        if (!obj || typeof obj !== 'object') return obj;
+        if (Array.isArray(obj)) {
+            return obj
+                .filter((item) => typeof item !== 'string' || !STRIPPED_FEATURE_FLAGS.has(item))
+                .map(stripFullscreenFeatureFlags);
+        }
+        const result = {};
+        for (const [k, v] of Object.entries(obj)) {
+            if (STRIPPED_FEATURE_FLAGS.has(k)) {
+                continue;
+            }
+            result[k] = stripFullscreenFeatureFlags(v);
+        }
+        return result;
+    }
+
+    // ============================================================
+    // UNIFIED GRAPHQL DATA STREAM FILTER
+    // ============================================================
+    function shouldIngestGraphQLResponse(rt) {
+        if (!rt || typeof rt !== 'string') return false;
+        return (
+            rt.includes('videoLesson') ||
+            rt.includes('VideoQuestion') ||
+            rt.includes('answerInVideoQuestion') ||
+            rt.includes('answerPreVideoQuestion') ||
+            rt.includes('examPaper') ||
+            rt.includes('ExamPaper') ||
+            rt.includes('examPracticeSession') ||
+            rt.includes('ExamPracticeSession') ||
+            rt.includes('examQuestion') ||
+            rt.includes('ExamQuestion') ||
+            rt.includes('featureFlags') ||
+            rt.includes('GetFeatureFlags') ||
+            rt.includes('feedback') ||
+            rt.includes('currentUser') ||
+            rt.includes('userProfile')
+        );
     }
 
     // ============================================================
@@ -1097,11 +1294,18 @@
     let lastSkippedTarget                  = null;
     let autoSkipThrottled                  = false;
     let autoSkipThrottleTimer              = null;
-    let lastSubmittedInVideoQuestionId     = null;
-    let lastSubmittedPreVideoQuestionId    = null;
     let lastActiveVideoElement             = null;
     let lastQuestionAnsweredAt             = 0;
     let waitingForPostAnswerResume         = false;
+
+    /* ------------------------------------------------------------
+     * Unified GraphQL State Storage (In-flight Ingestion)
+     * ------------------------------------------------------------ */
+    let latestExamPaperData                = null;
+    let latestUserProfile                  = null;
+    let latestFeatureFlags                 = null;
+    let latestGlobalFeatureFlags           = null;
+    let latestQuizFeedback                 = null;
 
     function throttleAutoSkip() {
         autoSkipThrottled = true;
@@ -1110,50 +1314,6 @@
             autoSkipThrottleTimer = null;
             autoSkipThrottled = false;
         }, 1500);
-    }
-
-    function isQuestionAnswered(q) {
-        if (!q || !currentVideoLesson || !currentVideoLesson.answeredQuestionIds) return false;
-        const answered = currentVideoLesson.answeredQuestionIds;
-        if (q.id && answered.has(String(q.id))) return true;
-        if (q.quizContentId && answered.has(String(q.quizContentId))) return true;
-        return false;
-    }
-
-    function inspectOutgoingGraphQL(body) {
-        if (!body || typeof body !== 'string') return undefined;
-        if (!body.includes('AnswerInVideoQuestion') && !body.includes('answerInVideoQuestion') &&
-            !body.includes('AnswerPreVideoQuestion') && !body.includes('answerPreVideoQuestion')) {
-            return undefined;
-        }
-        try {
-            const json = JSON.parse(body);
-            const checkOp = (obj) => {
-                if (!obj || !obj.variables) return;
-                const opName = obj.operationName || '';
-                const qStr = typeof obj.query === 'string'
-                    ? obj.query
-                    : (typeof obj.mutation === 'string' ? obj.mutation : '');
-
-                if (opName === 'AnswerInVideoQuestion' || qStr.includes('answerInVideoQuestion')) {
-                    if (obj.variables.questionId != null) {
-                        lastSubmittedInVideoQuestionId = String(obj.variables.questionId);
-                        VLOG('captured outgoing AnswerInVideoQuestion questionId', lastSubmittedInVideoQuestionId);
-                    }
-                }
-                if (opName === 'AnswerPreVideoQuestion' || qStr.includes('answerPreVideoQuestion')) {
-                    if (obj.variables.questionId != null) {
-                        lastSubmittedPreVideoQuestionId = String(obj.variables.questionId);
-                        VLOG('captured outgoing AnswerPreVideoQuestion questionId', lastSubmittedPreVideoQuestionId);
-                    }
-                }
-            };
-            if (Array.isArray(json)) json.forEach(checkOp);
-            else checkOp(json);
-            return json;
-        } catch {
-            return null;
-        }
     }
 
     function handleApiResponse(data) {
@@ -1276,8 +1436,6 @@
                     targetId = String(q.id);
                 } else if (q && q.quizContent && q.quizContent.id) {
                     targetId = String(q.quizContent.id);
-                } else if (lastSubmittedInVideoQuestionId) {
-                    targetId = lastSubmittedInVideoQuestionId;
                 }
 
                 if (targetId) {
@@ -1294,9 +1452,10 @@
                     // Fallback: mark the earliest unanswered question near current playback time
                     const video = findActiveVideoElement();
                     const curT = video ? (video.currentTime || 0) : 0;
+                    const answered = currentVideoLesson.answeredQuestionIds;
                     const candidate = currentVideoLesson.questions.find(
-                        (item) => !isQuestionAnswered(item) && item.triggerTime != null && item.triggerTime <= curT + 2.5
-                    ) || currentVideoLesson.questions.find((item) => !isQuestionAnswered(item));
+                        (item) => !answered.has(String(item.id)) && item.triggerTime != null && item.triggerTime <= curT + 2.5
+                    ) || currentVideoLesson.questions.find((item) => !answered.has(String(item.id)));
                     if (candidate) {
                         if (candidate.id) currentVideoLesson.answeredQuestionIds.add(candidate.id);
                         if (candidate.quizContentId) currentVideoLesson.answeredQuestionIds.add(candidate.quizContentId);
@@ -1305,7 +1464,6 @@
                 }
                 lastQuestionAnsweredAt = Date.now();
                 waitingForPostAnswerResume = true;
-                lastSubmittedInVideoQuestionId = null;
             }
         }
 
@@ -1313,7 +1471,7 @@
         if (d.answerPreVideoQuestion) {
             const ap = d.answerPreVideoQuestion;
             const pq = ap.question;
-            let preId = (pq && pq.id) ? String(pq.id) : lastSubmittedPreVideoQuestionId;
+            const preId = (pq && pq.id) ? String(pq.id) : null;
             if (currentVideoLesson) {
                 if (preId) {
                     currentVideoLesson.answeredPreQuestionIds.add(preId);
@@ -1322,7 +1480,38 @@
                     if (nextPre) currentVideoLesson.answeredPreQuestionIds.add(nextPre);
                 }
             }
-            lastSubmittedPreVideoQuestionId = null;
+        }
+
+        // 4. Exam paper & practice session payloads
+        if (d.examPaper || d.examPracticeSession || (d.module && (d.module.examPapers || d.module.currentUserEnrolment))) {
+            const ep = d.examPaper || d.examPracticeSession || d.module;
+            latestExamPaperData = ep;
+            VLOG('exam paper / practice session intercepted', ep);
+        }
+
+        // 5. Feature flags & user profile payloads
+        if (d.currentUser) {
+            latestUserProfile = d.currentUser;
+            if (d.currentUser.featureFlags) {
+                latestFeatureFlags = d.currentUser.featureFlags;
+            }
+            VLOG('currentUser / featureFlags intercepted', d.currentUser);
+        }
+        if (d.featureFlagsEnabledGlobally) {
+            latestGlobalFeatureFlags = d.featureFlagsEnabledGlobally;
+            VLOG('featureFlagsEnabledGlobally intercepted', d.featureFlagsEnabledGlobally);
+        }
+
+        // 6. Quiz feedback payloads
+        const feedbackObj = d.feedback || d.feedbackMessages || d.feedbacks || d.quizFeedback ||
+            (d.answerProgressQuizQuestion && (d.answerProgressQuizQuestion.feedback || d.answerProgressQuizQuestion.responses)) ||
+            (d.answerSpacedPracticeQuizQuestion && (d.answerSpacedPracticeQuizQuestion.feedback || d.answerSpacedPracticeQuizQuestion.responses)) ||
+            (d.answerDiagnosticQuestion && (d.answerDiagnosticQuestion.feedback || d.answerDiagnosticQuestion.responses)) ||
+            (d.answerExamQuestion && (d.answerExamQuestion.feedback || d.answerExamQuestion.responses)) ||
+            (d.answerStrengthenQuizQuestion && (d.answerStrengthenQuizQuestion.feedback || d.answerStrengthenQuizQuestion.responses));
+        if (feedbackObj) {
+            latestQuizFeedback = feedbackObj;
+            VLOG('quiz feedback intercepted', latestQuizFeedback);
         }
     }
 
@@ -1395,38 +1584,30 @@
 
     function isQuestionActiveOnPage() {
         try {
-            const host = (uiHostEl && uiHostEl.isConnected)
-                ? uiHostEl
-                : (typeof document.getElementById === 'function' ? document.getElementById('__ul-heroui-host') : null);
-
             if (typeof document.querySelectorAll === 'function') {
                 // Check visible quiz action buttons (Submit, Check, Continue, Resume, Try Again)
                 // Check text label BEFORE layout visibility to avoid synchronous reflows on unrelated buttons
                 const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"]');
-                if (buttons.length > 0) {
-                    for (let i = 0; i < buttons.length; i++) {
-                        const btn = buttons[i];
-                        const rawTxt = btn.textContent || btn.innerText || btn.value || '';
-                        if (!rawTxt) continue;
-                        const txt = rawTxt.trim().toLowerCase();
-                        if (!QUIZ_ACTION_LABELS.has(txt)) continue;
-                        if (host && typeof host.contains === 'function' && host.contains(btn)) continue;
-                        if (isElementVisible(btn)) {
-                            return true;
-                        }
-                    }
-                } else {
-                    const submitBtn = findSubmitButton();
-                    if (submitBtn && (!host || !host.contains || !host.contains(submitBtn)) && isElementVisible(submitBtn)) {
+                for (let i = 0; i < buttons.length; i++) {
+                    const btn = buttons[i];
+                    const rawTxt = btn.textContent || btn.innerText || btn.value || '';
+                    if (!rawTxt) continue;
+                    const txt = rawTxt.trim().toLowerCase();
+                    if (!QUIZ_ACTION_LABELS.has(txt)) continue;
+                    if (isElementVisible(btn)) {
                         return true;
                     }
+                }
+
+                const submitBtn = findSubmitButton();
+                if (submitBtn && isElementVisible(submitBtn)) {
+                    return true;
                 }
 
                 // Check visible quiz option inputs
                 const inputs = document.querySelectorAll('input[type="radio"], input[type="checkbox"]');
                 for (let i = 0; i < inputs.length; i++) {
                     const inp = inputs[i];
-                    if (host && typeof host.contains === 'function' && host.contains(inp)) continue;
                     if (isElementVisible(inp)) return true;
                 }
 
@@ -1434,19 +1615,7 @@
                 const modals = document.querySelectorAll('[role="dialog"], .quiz-content, [data-testid*="question"]');
                 for (let i = 0; i < modals.length; i++) {
                     const m = modals[i];
-                    if (host && typeof host.contains === 'function' && host.contains(m)) continue;
                     if (isElementVisible(m)) return true;
-                }
-            } else {
-                const submitBtn = findSubmitButton();
-                if (submitBtn && (!host || !host.contains || !host.contains(submitBtn)) && isElementVisible(submitBtn)) {
-                    return true;
-                }
-                if (typeof document.querySelector === 'function') {
-                    const activeModal = document.querySelector('[role="dialog"], .quiz-content, [data-testid*="question"]');
-                    if (activeModal && isElementVisible(activeModal)) {
-                        return true;
-                    }
                 }
             }
         } catch {}
@@ -1558,15 +1727,32 @@
         }
     }
 
-    function initVideoAutoSkipController() {
+    let videoAutoSkipInterval = null;
+    function startVideoAutoSkipController() {
+        if (videoAutoSkipInterval !== null) return;
         try {
-            setInterval(() => {
+            videoAutoSkipInterval = setInterval(() => {
                 if (settings.autoSkipVideoEnabled && (!lastActiveVideoElement || !lastActiveVideoElement.isConnected || lastSkippedTarget !== 'end-1s')) {
                     checkAndAutoSkipVideo();
                 }
             }, 800);
         } catch (e) {
             WARN('initVideoAutoSkipController failed', e);
+        }
+    }
+
+    function stopVideoAutoSkipController() {
+        if (videoAutoSkipInterval !== null) {
+            clearInterval(videoAutoSkipInterval);
+            videoAutoSkipInterval = null;
+        }
+    }
+
+    function initVideoAutoSkipController() {
+        if (settings.autoSkipVideoEnabled) {
+            startVideoAutoSkipController();
+        } else {
+            stopVideoAutoSkipController();
         }
     }
 
@@ -1705,10 +1891,9 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
     let lastResolvedSubmitBtn = null;
 
-    function isCandidateSubmitButton(btn, host) {
+    function isCandidateSubmitButton(btn) {
         if (!btn || !btn.isConnected) return false;
         if (btn.id === MANUAL_BUTTON_ID) return false;
-        if (host && typeof host.contains === 'function' && host.contains(btn)) return false;
 
         const txt = getCleanElementText(btn);
         let matches = QUESTION_SUBMIT_LABELS.has(txt) || QUESTION_SUBMIT_RE.test(txt);
@@ -1724,40 +1909,23 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     }
 
     function findSubmitButton() {
-        const host = (uiHostEl && uiHostEl.isConnected)
-            ? uiHostEl
-            : (typeof document.getElementById === 'function' ? document.getElementById('__ul-heroui-host') : null);
-
         // Fast-path: Check previously resolved button if still connected and valid
-        if (lastResolvedSubmitBtn && lastResolvedSubmitBtn.isConnected && isCandidateSubmitButton(lastResolvedSubmitBtn, host)) {
+        if (lastResolvedSubmitBtn && lastResolvedSubmitBtn.isConnected && isCandidateSubmitButton(lastResolvedSubmitBtn)) {
             return lastResolvedSubmitBtn;
         }
 
         // 1. Search inside active question/quiz containers first
-        const containerSelectors = [
-            '[role="dialog"]',
-            '.quiz-content',
-            '[data-testid*="question"]',
-            '[data-testid*="quiz"]',
-            '.question',
-            'form',
-            'main'
-        ];
+        const containers = document.querySelectorAll('[role="dialog"], .quiz-content, [data-testid*="question"], [data-testid*="quiz"], .question');
+        for (let c = 0; c < containers.length; c++) {
+            const container = containers[c];
+            if (!isElementVisible(container)) continue;
 
-        for (let s = 0; s < containerSelectors.length; s++) {
-            const containers = document.querySelectorAll(containerSelectors[s]);
-            for (let c = 0; c < containers.length; c++) {
-                const container = containers[c];
-                if (host && host.contains(container)) continue;
-                if (!isElementVisible(container)) continue;
-
-                const btns = container.querySelectorAll('button, input[type="submit"], [role="button"]');
-                for (let i = 0; i < btns.length; i++) {
-                    const b = btns[i];
-                    if (isCandidateSubmitButton(b, host)) {
-                        lastResolvedSubmitBtn = b;
-                        return b;
-                    }
+            const btns = container.querySelectorAll('button, input[type="submit"], [role="button"]');
+            for (let i = 0; i < btns.length; i++) {
+                const b = btns[i];
+                if (isCandidateSubmitButton(b)) {
+                    lastResolvedSubmitBtn = b;
+                    return b;
                 }
             }
         }
@@ -1766,7 +1934,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         const allButtons = document.querySelectorAll('button, input[type="submit"], [role="button"]');
         for (let i = 0; i < allButtons.length; i++) {
             const b = allButtons[i];
-            if (isCandidateSubmitButton(b, host)) {
+            if (isCandidateSubmitButton(b)) {
                 lastResolvedSubmitBtn = b;
                 return b;
             }
@@ -2022,15 +2190,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     }
 
     function initManualButtonObserver() {
-        try {
-            const observer = new MutationObserver(scheduleEnsureButton);
-            observer.observe(document.documentElement || document, {
-                childList: true,
-                subtree: true,
-            });
-        } catch (e) {
-            WARN('mutation observer for manual button failed', e);
-        }
+        // Merged into root domObserver to prevent redundant document subtree observers
     }
 
     /* ------------------------------------------------------------
@@ -2038,8 +2198,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
      * ------------------------------------------------------------ */
     function maybeBumpTimeSpent(body, source) {
         if (typeof body !== 'string') return { body, changed: false };
-        const inspectedJson = inspectOutgoingGraphQL(body);
-        if (inspectedJson === null) return { body, changed: false };
 
         const boostActive = settings.timeBoostEnabled || queuedSeconds !== null || accumulatedExtraSeconds > 0;
         const videoActive = settings.fullVideoWatchedEnabled || settings.addVideoDurationToTimeSpent;
@@ -2050,11 +2208,9 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         const hasQuestion = body.includes('Answer') || body.includes('SaveExam') || body.includes('Complete');
         if (!hasTimeSpent && !hasVideo && !hasQuestion) return { body, changed: false };
 
-        let json = inspectedJson;
-        if (json === undefined) {
-            try { json = JSON.parse(body); }
-            catch { return { body, changed: false }; }
-        }
+        let json;
+        try { json = JSON.parse(body); }
+        catch { return { body, changed: false }; }
 
         let changed = false;
         let manualResetNeeded = false;
@@ -2295,23 +2451,54 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     // FETCH INTERCEPTOR
     // ============================================================
     const origFetch = window.fetch;
-    function attachFetchResponseInspector(fetchPromise) {
-        fetchPromise.then((res) => {
+    function processFetchResponse(fetchPromise, url) {
+        return fetchPromise.then((res) => {
             try {
                 if (res && res.ok && typeof res.clone === 'function') {
                     const cloned = res.clone();
                     if (typeof cloned.text === 'function') {
-                        cloned.text().then((rt) => {
-                            if (rt && (rt.includes('videoLesson') || rt.includes('VideoQuestion'))) {
-                                handleApiResponse(JSON.parse(rt));
+                        return cloned.text().then((rt) => {
+                            const ingest = shouldIngestGraphQLResponse(rt);
+                            const transform = shouldTransformFeatureFlags(rt);
+                            if (ingest || transform) {
+                                try {
+                                    const parsed = JSON.parse(rt);
+                                    if (ingest) handleApiResponse(parsed);
+                                    if (transform) {
+                                        try {
+                                            const transformed = stripFullscreenFeatureFlags(parsed);
+                                            const transformedText = JSON.stringify(transformed);
+                                            reportFeatureFlagsTransformed('fetch', url || 'API');
+                                            const newHeaders = new Headers();
+                                            res.headers.forEach((v, k) => {
+                                                const lk = k.toLowerCase();
+                                                if (lk !== 'content-encoding' && lk !== 'content-length') {
+                                                    newHeaders.set(k, v);
+                                                }
+                                            });
+                                            newHeaders.set('content-type', 'application/json');
+                                            return new Response(transformedText, {
+                                                status: res.status,
+                                                statusText: res.statusText,
+                                                headers: newHeaders,
+                                            });
+                                        } catch (e) {
+                                            WARN('Failed to transform feature flags response:', e);
+                                        }
+                                    }
+                                } catch {}
                             }
-                        }).catch(() => {});
+                            return res;
+                        }).catch(() => res);
                     } else if (typeof cloned.json === 'function') {
                         cloned.json().then(handleApiResponse).catch(() => {});
                     }
                 }
-            } catch {}
-        }).catch(() => {});
+            } catch (e) {
+                WARN('fetch response processing error:', e);
+            }
+            return res;
+        });
     }
 
     if (origFetch) {
@@ -2396,14 +2583,20 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                                         bumpStat('blocked');
                                         return logImproperUseSyntheticResponse();
                                     }
+                                    if (settings.blockLogEvent !== false && bodyLooksLikeLogEvent(text)) {
+                                        reportLogEvent('fetch · Request body', url, text);
+                                        return logEventSyntheticResponse();
+                                    }
+                                    if (settings.privateSearchMode !== false && bodyLooksLikeLogLessonSearch(text)) {
+                                        reportLogLessonSearch('fetch · Request body', url, text);
+                                        return logLessonSearchSyntheticResponse();
+                                    }
                                     const { body: newBody, changed } = maybeBumpTimeSpent(text, 'fetch-Req');
-                                    const newReq = new Request(input, {
-                                        body: changed ? newBody : text,
-                                        method: input.method
-                                    });
-                                    const fetchPromise = origFetch.call(self, newReq, passInit);
-                                    attachFetchResponseInspector(fetchPromise);
-                                    return fetchPromise;
+                                    const reqToFetch = changed
+                                        ? new Request(input, { body: newBody, method: input.method })
+                                        : input;
+                                    const fetchPromise = origFetch.call(self, reqToFetch, passInit);
+                                    return processFetchResponse(fetchPromise, url);
                                 });
                             }
                         }
@@ -2412,6 +2605,16 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                             reportLogImproperUse('fetch', url, body);
                             bumpStat('blocked');
                             return Promise.resolve(logImproperUseSyntheticResponse());
+                        }
+
+                        if (body != null && settings.blockLogEvent !== false && bodyLooksLikeLogEvent(body)) {
+                            reportLogEvent('fetch', url, body);
+                            return Promise.resolve(logEventSyntheticResponse());
+                        }
+
+                        if (body != null && settings.privateSearchMode !== false && bodyLooksLikeLogLessonSearch(body)) {
+                            reportLogLessonSearch('fetch', url, body);
+                            return Promise.resolve(logLessonSearchSyntheticResponse());
                         }
 
                         if (body != null) {
@@ -2428,7 +2631,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
             const fetchPromise = origFetch.call(self, input, init);
             if (targetApi) {
-                attachFetchResponseInspector(fetchPromise);
+                return processFetchResponse(fetchPromise, url);
             }
             return fetchPromise;
         };
@@ -2508,8 +2711,8 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                     } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
                         reportAllow('XHR', url, `service "${anyMatch.label}" disabled in settings`);
                     }
-                } else if (method === 'POST' && isTargetApi(url)) {
-                    bumpStat('apiPosts');
+                } else if (isTargetApi(url)) {
+                    if (method === 'POST') bumpStat('apiPosts');
 
                     if (settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(body)) {
                         reportLogImproperUse('XHR', url,
@@ -2519,19 +2722,61 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                         return;
                     }
 
+                    if (settings.blockLogEvent !== false && bodyLooksLikeLogEvent(body)) {
+                        reportLogEvent('XHR', url,
+                            typeof body === 'string' ? body : '(non-string body)');
+                        mockBlockedXHR(this, LOG_EVENT_PAYLOAD, () => ({ data: { logEvent: { id: "mock" } } }));
+                        return;
+                    }
+
+                    if (settings.privateSearchMode !== false && bodyLooksLikeLogLessonSearch(body)) {
+                        reportLogLessonSearch('XHR', url,
+                            typeof body === 'string' ? body : '(non-string body)');
+                        mockBlockedXHR(this, LOG_LESSON_SEARCH_PAYLOAD, () => ({ data: { logVideoSearchRequest: { id: "mock" }, logLessonSearch: { id: "mock" } } }));
+                        return;
+                    }
+
                     if (typeof body === 'string') {
                         const { body: newBody, changed } = maybeBumpTimeSpent(body, 'xhr');
                         if (changed) body = newBody;
                     }
 
-                    this.addEventListener('load', function () {
+                    const selfXhr = this;
+                    let xhrHandled = false;
+                    const handleXhrResponse = function () {
+                        if (xhrHandled) return;
                         try {
-                            const rt = this.responseText;
-                            if (rt && (rt.includes('videoLesson') || rt.includes('VideoQuestion'))) {
-                                handleApiResponse(JSON.parse(rt));
+                            if (selfXhr.readyState === 4 && selfXhr.status === 200) {
+                                xhrHandled = true;
+                                const rt = selfXhr.responseText;
+                                const ingest = shouldIngestGraphQLResponse(rt);
+                                const transform = shouldTransformFeatureFlags(rt);
+                                if (ingest || transform) {
+                                    try {
+                                        const parsed = JSON.parse(rt);
+                                        if (ingest) handleApiResponse(parsed);
+                                        if (transform) {
+                                            const modifiedJson = stripFullscreenFeatureFlags(parsed);
+                                            const modifiedText = JSON.stringify(modifiedJson);
+                                            reportFeatureFlagsTransformed('XHR', url || 'API');
+                                            Object.defineProperty(selfXhr, 'responseText', {
+                                                get() { return modifiedText; },
+                                                configurable: true,
+                                            });
+                                            Object.defineProperty(selfXhr, 'response', {
+                                                get() {
+                                                    return selfXhr.responseType === 'json' ? modifiedJson : modifiedText;
+                                                },
+                                                configurable: true,
+                                            });
+                                        }
+                                    } catch {}
+                                }
                             }
                         } catch {}
-                    }, { once: true });
+                    };
+                    this.addEventListener('readystatechange', handleXhrResponse, true);
+                    this.addEventListener('load', handleXhrResponse, true);
                 }
             } catch (e) {
                 WARN('xhr interceptor error:', e);
@@ -2916,23 +3161,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     function ensureUIHost() {
         if (uiShadowRoot && document.getElementById('__ul-heroui-host')) {
             return uiShadowRoot;
-        }
-
-        try {
-            if (document.documentElement) document.documentElement.setAttribute('data-glisse-backdrop', '');
-            if (document.body) document.body.setAttribute('data-glisse-backdrop', '');
-        } catch {}
-
-        let pageBackdrop = document.getElementById('__ul-page-backdrop');
-        if (!pageBackdrop) {
-            try {
-                pageBackdrop = document.createElement('div');
-                pageBackdrop.id = '__ul-page-backdrop';
-                pageBackdrop.setAttribute('data-glisse-backdrop', '');
-                pageBackdrop.setAttribute('aria-hidden', 'true');
-                pageBackdrop.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:0;opacity:0.001;';
-                (document.body || document.documentElement).appendChild(pageBackdrop);
-            } catch {}
         }
 
         let host = document.getElementById('__ul-heroui-host');
@@ -5044,6 +5272,11 @@ function getEffectiveTheme(thm) {
                 LOG('full video watch toggle (percentWatched=1) ' + (value ? 'ENABLED' : 'DISABLED'));
                 break;
             case 'autoSkipVideoEnabled':
+                if (value) {
+                    startVideoAutoSkipController();
+                } else {
+                    stopVideoAutoSkipController();
+                }
                 LOG('auto-skip video to questions / completion ' + (value ? 'ENABLED' : 'DISABLED'));
                 break;
             case 'addVideoDurationToTimeSpent':
@@ -5051,6 +5284,12 @@ function getEffectiveTheme(thm) {
                 break;
             case 'suppressJitsu':
                 LOG('Jitsu telemetry ' + (value ? 'SUPPRESSED (blocked + logged)' : 'ALLOWED (passed through + logged)'));
+                break;
+            case 'blockLogEvent':
+                LOG('LogEvent local mocking ' + (value ? 'ENABLED' : 'DISABLED'));
+                break;
+            case 'privateSearchMode':
+                LOG('Private search mode ' + (value ? 'ENABLED' : 'DISABLED'));
                 break;
             case 'disableAutoFullscreen':
                 LOG('auto-fullscreen blocking ' + (value ? 'ENABLED' : 'DISABLED'));
@@ -5165,15 +5404,6 @@ var Glisse = (() => {
   }
 
   // ../../../../../../private/tmp/glisse_pkg/package/dist/index.js
-  var id = "glisse-styles";
-  function insertStyles(css) {
-    if (typeof document === "undefined" || document.getElementById(id)) return;
-    const style = document.createElement("style");
-    style.id = id;
-    style.textContent = css;
-    (document.head || document.documentElement).prepend(style);
-  }
-  var styles_default = ':where(:root,[data-theme=light]){--lg-foreground:#000000e0;--lg-muted:#3c3c4399;--lg-glass:#fff9;--lg-glass-active:#ececf0d9;--lg-edge:#00000014;--lg-drop:#0000000f;--lg-selection:#0000001a;--lg-lens:#ffffff4d;--lg-surface:#fafafcdb;--lg-surface-edge:#00000014;--lg-shadow:#1919231f;--lg-highlight:#3c3c4317;--lg-separator:#3c3c4326;--lg-destructive:#ff383c;--lg-track:#3b3b424d;--lg-rail:#0000001a;--lg-on:#34c759;--lg-fill:#08f;--lg-ring:#0006;--lg-ease:cubic-bezier(.25, .1, .25, 1)}:where([data-theme=dark]){--lg-foreground:#fff;--lg-muted:#ebebf599;--lg-glass:#2828289e;--lg-glass-active:#4646469e;--lg-edge:#ffffff14;--lg-drop:transparent;--lg-selection:#ffffff25;--lg-lens:#ffffff0e;--lg-surface:#1c1c1fdb;--lg-surface-edge:#ffffff21;--lg-shadow:#00000061;--lg-highlight:#ebebf521;--lg-separator:#ebebf529;--lg-destructive:#ff4245;--lg-track:#ebebf54d;--lg-rail:#ffffff1a;--lg-on:#30d158;--lg-fill:#0091ff;--lg-ring:#ffffff80}@media (prefers-color-scheme:dark){:where(:root:not([data-theme=light])){--lg-foreground:#fff;--lg-muted:#ebebf599;--lg-glass:#2828289e;--lg-glass-active:#4646469e;--lg-edge:#ffffff14;--lg-drop:transparent;--lg-selection:#ffffff25;--lg-lens:#ffffff0e;--lg-surface:#1c1c1fdb;--lg-surface-edge:#ffffff21;--lg-shadow:#00000061;--lg-highlight:#ebebf521;--lg-separator:#ebebf529;--lg-destructive:#ff4245;--lg-track:#ebebf54d;--lg-rail:#ffffff1a;--lg-on:#30d158;--lg-fill:#0091ff;--lg-ring:#ffffff80}}.lg-glass{background-color:var(--lg-glass);background-image:var(--lg-rim,none);-webkit-backdrop-filter:blur(var(--lg-blur,3px)) var(--lg-filter,saturate(1.5));backdrop-filter:blur(var(--lg-blur,3px)) var(--lg-filter,saturate(1.5));box-shadow:inset 0 0 0 .5px var(--lg-edge), 0 1px 3px var(--lg-drop);background-size:100% 100%;position:relative}.lg-glass:after{content:"";border-radius:inherit;pointer-events:none;background:radial-gradient(circle 240px at var(--lg-x,50%) var(--lg-y,50%), #ffffff09, #ffffff06 50%, transparent);opacity:0;transition:opacity .22s ease-in-out;position:absolute;inset:0}.lg-glass[data-pressed]:after{opacity:1;transition-duration:0s}.lg-glass[data-copy]{-webkit-backdrop-filter:none;backdrop-filter:none}.lg-glass-copy{transform-origin:0 0;pointer-events:none;margin:0;position:absolute;top:0;left:0;overflow:hidden}.lg-glass-copy>div{transform-origin:0 0;position:absolute;top:0;left:0}.lg-button{height:40px;color:var(--lg-foreground);font:inherit;cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;border:0;border-radius:20px;justify-content:center;align-items:center;gap:8px;padding:0 16px;font-size:14px;transition:background-color .2s;display:inline-flex}.lg-button[data-icon]{padding-left:12px}.lg-button[data-icon=only]{width:40px;padding:0}.lg-button>svg{flex:none;width:20px;height:20px}.lg-button:is(:active,[data-pressed]){background-color:var(--lg-glass-active);transition-duration:0s}@media (hover:hover) and (pointer:fine){.lg-button:hover{background-color:var(--lg-glass-active)}}.lg-button:disabled{background-color:var(--lg-glass);opacity:.35;cursor:default}.lg-button[data-destructive]:not([data-tint]){--lg-tint:var(--lg-destructive)}.lg-button:is([data-tint],[data-destructive]){color:var(--lg-tint)}.lg-button[data-variant=filled]{--lg-button-fill:var(--lg-tint,var(--lg-fill));color:#fff}.lg-button[data-variant=filled],.lg-button[data-variant=filled]:disabled{background-color:var(--lg-button-fill)}.lg-button[data-variant=filled]:is(:active,[data-pressed]){background-color:color-mix(in srgb, var(--lg-button-fill) 85%, #000)}@media (hover:hover) and (pointer:fine){.lg-button[data-variant=filled]:hover{background-color:color-mix(in srgb, var(--lg-button-fill) 88%, #fff)}.lg-button[data-variant=filled]:hover:is(:active,[data-pressed]){background-color:color-mix(in srgb, var(--lg-button-fill) 85%, #000)}}.lg-button:focus-visible,.lg-tab:focus-visible,.lg-switch:focus-visible,.lg-menu-item:focus-visible{outline:2px solid var(--lg-ring);outline-offset:2px}.lg-tab-bar{--lg-tab-width:84px;--lg-tab-height:32px;--lg-lens-grow-x:27px;--lg-lens-grow-y:20px;border-radius:calc(var(--lg-tab-height) / 2 + 4px);touch-action:pan-y;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;padding:4px;display:inline-flex;position:relative}.lg-tab-bar-glass{border-radius:inherit;pointer-events:none;position:absolute;inset:0}.lg-tab-bar-glass:before{content:"";border-radius:inherit;background:radial-gradient(circle 260px at var(--lg-x,20%) 50%, #ffffff17, #ffffff0b 60%, transparent);opacity:0;transition:opacity .16s;position:absolute;inset:0}.lg-tab-bar[data-lifted] .lg-tab-bar-glass:before{opacity:1;transition-duration:.12s}.lg-tab,.lg-tab-copy{width:var(--lg-tab-width);height:var(--lg-tab-height);font:inherit;flex:none;justify-content:center;align-items:center;font-size:14px;display:flex}.lg-tab{z-index:1;border-radius:calc(var(--lg-tab-height) / 2);color:var(--lg-muted);cursor:pointer;-webkit-touch-callout:none;background:0 0;border:0;padding:0;text-decoration:none;transition:color .2s;position:relative}.lg-tab:focus-visible{outline-offset:-2px}@media (hover:hover) and (pointer:fine){.lg-tab:hover{color:var(--lg-foreground)}}.lg-tab-lens,.lg-tab-tint{width:var(--lg-tab-width);height:var(--lg-tab-height);border-radius:calc(var(--lg-tab-height) / 2);pointer-events:none;transform:translateX(calc(var(--lg-tab-width) * var(--lg-index,0)));will-change:transform;transition:opacity .14s;position:absolute;top:4px;left:4px}.lg-tab-tint{z-index:1;color:var(--lg-foreground);overflow:hidden}.lg-tab-row{height:100%;transform:translateX(calc(var(--lg-tab-width) * var(--lg-index,0) * -1));transform-origin:0 0;will-change:transform;display:flex}.lg-tab-lens.lg-glass{z-index:2;-webkit-backdrop-filter:none;backdrop-filter:none;box-shadow:none;background-color:#0000;background-image:none;transition:opacity .14s,background-color .14s}.lg-tab-bar[data-lifted] .lg-tab-lens.lg-glass{background-color:var(--lg-lens);transition-duration:.1s}.lg-tab-lens:before{content:"";border-radius:inherit;background:var(--lg-selection);transition:opacity .14s;position:absolute;inset:0}.lg-tab-lens[data-pressed]:after{opacity:.2}.lg-tab-bar[data-lifted] .lg-tab-lens:before{opacity:0;transition-duration:.1s}.lg-tab-bar[data-refracting] .lg-tab-lens.lg-glass{background-image:var(--lg-rim,none);-webkit-backdrop-filter:var(--lg-filter,none);backdrop-filter:var(--lg-filter,none)}:is(.lg-tab-bar[data-hidden] :is(.lg-tab-lens,.lg-tab-tint),.lg-tab-bar:not([data-ready]):not(:has([data-selected])) :is(.lg-tab-lens,.lg-tab-tint)){opacity:0}.lg-input{box-sizing:border-box;width:100%;max-width:360px;height:40px;color:var(--lg-foreground);border-radius:20px;align-items:center;gap:10px;padding:0 14px;transition:background-color .2s;display:flex}.lg-input:focus-within{background-color:var(--lg-glass-active)}.lg-input input{min-width:0;height:100%;color:inherit;font:inherit;background:0 0;border:0;outline:0;flex:1;padding:0;font-size:14px}.lg-input input::placeholder{color:var(--lg-muted)}.lg-input input::-webkit-search-cancel-button{display:none}.lg-input-icon{width:16px;height:16px;color:var(--lg-muted);flex:none;place-items:center;display:grid}.lg-input-icon>svg{width:100%;height:100%}.lg-input-clear{width:32px;height:32px;color:var(--lg-muted);cursor:pointer;background:0 0;border:0;border-radius:50%;flex:none;place-items:center;margin-right:-8px;padding:0;display:grid}.lg-input-clear svg{width:14px;height:14px}.lg-input:has(input:disabled){opacity:.35}.lg-switch-thumb,.lg-slider-thumb{pointer-events:none;-webkit-backdrop-filter:blur(2px)brightness(1.15)saturate(1.5);backdrop-filter:blur(2px)brightness(1.15)saturate(1.5);border-radius:999px;position:absolute;box-shadow:0 6px 24px #0003,inset 0 0 0 1.5px #ffffff80,inset 0 2px 1px #ffffff73,inset 2px 7px 24px #00000017,inset -2px -7px 24px #ffffff29}.lg-thumb-face{border-radius:inherit;background:#fff;position:absolute;inset:0}.lg-switch{--lg-scale:.375;width:calc(160px * var(--lg-scale));height:calc(67px * var(--lg-scale));background:var(--lg-track);cursor:pointer;touch-action:pan-y;-webkit-tap-highlight-color:transparent;border:0;border-radius:999px;flex:none;padding:0;position:relative}.lg-switch:before{content:"";inset:min(0px, calc((67px * var(--lg-scale) - 44px) / 2)) -8px;position:absolute}.lg-switch-fill{border-radius:inherit;background:var(--lg-on);opacity:0;position:absolute;inset:0}.lg-switch-thumb{top:50%;left:calc(-21.95px * var(--lg-scale));width:calc(146px * var(--lg-scale));height:calc(92px * var(--lg-scale));transform:translateY(-50%)scale(.65)}.lg-switch[aria-checked=true] .lg-switch-fill{opacity:1}.lg-switch[aria-checked=true] .lg-switch-thumb{transform:translate(calc(57.9px * var(--lg-scale)), -50%) scale(.65)}.lg-switch:disabled{opacity:.35;cursor:default}.lg-slider{width:100%;height:40px;position:relative}.lg-slider-track{background:var(--lg-rail);pointer-events:none;border-radius:3px;height:6px;position:absolute;inset:17px 0 auto;overflow:hidden}.lg-slider-fill{background:var(--lg-fill);height:100%;transform:scaleX(var(--lg-progress));transform-origin:0;display:block}.lg-slider-thumb{top:0;left:calc((100% - 36px) * var(--lg-progress) - 12px);width:60px;height:40px;scale:.6}.lg-slider input{z-index:1;cursor:pointer;appearance:none;touch-action:pan-y;-webkit-tap-highlight-color:transparent;background:0 0;outline:none;width:100%;height:40px;margin:0;display:block;position:relative}.lg-slider input::-webkit-slider-runnable-track{background:0 0;height:6px}.lg-slider input::-webkit-slider-thumb{width:36px;height:40px;box-shadow:none;opacity:0;touch-action:none;appearance:none;background:0 0;border:0;margin-top:-17px}.lg-slider input::-moz-range-track{background:0 0;height:6px}.lg-slider input::-moz-range-thumb{width:36px;height:40px;box-shadow:none;opacity:0;background:0 0;border:0}.lg-slider:has(input:focus-visible) .lg-slider-thumb{outline:2px solid var(--lg-ring);outline-offset:3px}.lg-slider:has(input:disabled){opacity:.35}.lg-slider input:disabled{cursor:default}.lg-menu{display:inline-flex;position:relative}.lg-menu-card{z-index:10;box-sizing:border-box;width:200px;color:var(--lg-foreground);transform-origin:calc(100% - 20px) 20px;touch-action:none;-webkit-user-select:none;user-select:none;border-radius:20px;font-size:14px;position:absolute;top:0;right:0}.lg-menu-card[data-align=start]{transform-origin:20px 20px;left:0;right:auto}.lg-menu-card[data-phase=leaving]{pointer-events:none}.lg-menu-surface{border-radius:inherit;background:var(--lg-surface);-webkit-backdrop-filter:blur(22px)saturate(1.9);backdrop-filter:blur(22px)saturate(1.9);width:100%;height:100%;box-shadow:inset 0 0 0 .5px var(--lg-surface-edge), 0 12px 40px var(--lg-shadow);pointer-events:none;position:absolute;top:0;right:0}.lg-menu-card[data-align=start] .lg-menu-surface{left:0;right:auto}.lg-menu-glyph{pointer-events:none;place-items:center;width:40px;height:40px;display:grid;position:absolute;top:0;right:0}.lg-menu-card[data-align=start] .lg-menu-glyph{left:0;right:auto}.lg-menu-glyph>svg{width:20px;height:20px}.lg-menu-content{flex-direction:column;padding:6px;display:flex;position:relative}.lg-menu-card:after{content:"";border-radius:inherit;pointer-events:none;opacity:0;background:linear-gradient(135deg,#ffffff1c,#ffffff06);transition:opacity .12s ease-out;position:absolute;inset:0}.lg-menu-card[data-pressed]:after{opacity:1}.lg-menu-plate{background:var(--lg-highlight);opacity:0;pointer-events:none;border-radius:14px;transition:transform .1s cubic-bezier(.2,.8,.2,1),opacity 80ms ease-out;position:absolute;top:0;left:0}.lg-menu-item{z-index:1;min-height:32px;color:inherit;font:inherit;text-align:left;cursor:pointer;background:0 0;border:0;border-radius:14px;align-items:center;gap:10px;padding:6px 12px;display:flex;position:relative}.lg-menu-item>svg{flex:none;width:16px;height:16px}.lg-menu-item:focus-visible{outline-offset:-2px;background:var(--lg-highlight)}@media (hover:hover) and (pointer:fine){.lg-menu-item:hover:not(:disabled){background:var(--lg-highlight)}}.lg-menu-card[data-scrubbing] .lg-menu-item{background:0 0;outline:none}.lg-menu-item[data-destructive]{color:var(--lg-destructive)}.lg-menu-item:disabled{opacity:.38;cursor:default}.lg-menu-separator{border-top:.5px solid var(--lg-separator);flex:none;margin:7px 11px}@media (prefers-reduced-motion:reduce){.lg-menu-plate{transition:opacity 80ms ease-out}.lg-menu-card{animation:.1s ease-out lg-menu-fade}}@keyframes lg-menu-fade{0%{opacity:0}}';
   function cx(...names) {
     return names.filter(Boolean).join(" ");
   }
@@ -5391,11 +5621,6 @@ var Glisse = (() => {
     root.append(defs);
     const target = (typeof uiShadowRoot !== "undefined" && uiShadowRoot) || document.body || document.documentElement;
     if (target) target.append(root);
-    if (document.body && target !== document.body) {
-      try {
-        document.body.append(root.cloneNode(true));
-      } catch {}
-    }
     return defs;
   }
   function profile(bezel, thickness) {
@@ -5633,10 +5858,19 @@ var Glisse = (() => {
         }));
       }
     }
+    if (lenses.size >= 50) {
+      const oldestKey = lenses.keys().next().value;
+      const oldest = lenses.get(oldestKey);
+      if (oldest && oldest.filterNode && oldest.filterNode.parentNode) {
+        oldest.filterNode.remove();
+      }
+      lenses.delete(oldestKey);
+    }
     container().append(filter);
     const result = {
       filter: `url("#${id2}")`,
-      rim: `url("${highlight}")`
+      rim: `url("${highlight}")`,
+      filterNode: filter
     };
     lenses.set(key, result);
     return result;
@@ -5685,302 +5919,11 @@ var Glisse = (() => {
       element.style.removeProperty("--lg-rim");
     };
   }
-  var MARK = "data-glisse-backdrop";
-  function visibleBox(element) {
-    let { left, top, right, bottom } = element.getBoundingClientRect();
-    for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) {
-      const style = getComputedStyle(node);
-      if (!/hidden|clip|auto|scroll/.test(`${style.overflow} ${style.overflowX} ${style.overflowY}`)) continue;
-      const clip = node.getBoundingClientRect();
-      left = Math.max(left, clip.left);
-      top = Math.max(top, clip.top);
-      right = Math.min(right, clip.right);
-      bottom = Math.min(bottom, clip.bottom);
-    }
-    return new DOMRect(left, top, Math.max(0, right - left), Math.max(0, bottom - top));
-  }
-  function findBackdrop(element) {
-    const box = element.getBoundingClientRect();
-    const behind = (candidate) => {
-      if (candidate.contains(element) || element.contains(candidate)) return false;
-      const other = visibleBox(candidate);
-      return other.left < box.right && other.right > box.left && other.top < box.bottom && other.bottom > box.top;
-    };
-    for (let node = element.parentElement || (element.getRootNode && element.getRootNode().host); node && node !== document.body; node = node.parentElement || (node.getRootNode && node.getRootNode().host)) {
-      if (node.querySelectorAll) {
-        const found = [...node.querySelectorAll(`[${MARK}]`)].find(behind);
-        if (found) return found;
-      }
-    }
-    if (typeof document !== "undefined" && document.querySelectorAll) {
-      const globalFound = [...document.querySelectorAll(`[${MARK}]`)].find(behind);
-      if (globalFound) return globalFound;
-    }
-    return null;
-  }
-  var STILL = /^(transition|animation|view-transition)/;
-  var PLACED = {
-    position: "absolute",
-    top: "0px",
-    left: "0px",
-    right: "auto",
-    bottom: "auto",
-    "margin-top": "0px",
-    "margin-right": "0px",
-    "margin-bottom": "0px",
-    "margin-left": "0px",
-    transform: "none",
-    translate: "none",
-    scale: "none",
-    rotate: "none"
-  };
-  var kebab = (name) => name.startsWith("--") ? name : name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
-  function inline(original, copy, root, names) {
-    const computed = getComputedStyle(original);
-    const write = (name) => {
-      if (STILL.test(name) || root && (name in PLACED || name === "width" || name === "height")) return;
-      const value = computed.getPropertyValue(name);
-      if (copy.style.getPropertyValue(name) !== value) copy.style.setProperty(name, value);
-    };
-    if (names) for (const name of names) write(name);
-    else for (let i = 0; i < computed.length; i++) write(computed[i]);
-    if (!root) return;
-    for (const [name, value] of Object.entries(PLACED)) copy.style.setProperty(name, value);
-    copy.style.width = `${original.offsetWidth}px`;
-    copy.style.height = `${original.offsetHeight}px`;
-  }
-  function copyOf(source) {
-    const root = source.cloneNode(true);
-    const originals = [source, ...source.querySelectorAll("*")];
-    const copies = [root, ...root.querySelectorAll("*")];
-    const pairs = /* @__PURE__ */ new Map();
-    originals.forEach((original, index) => {
-      const copy = copies[index];
-      if (!copy) return;
-      pairs.set(original, copy);
-      copy.removeAttribute("id");
-      if (copy instanceof HTMLImageElement) copy.loading = "eager";
-      copy.style.transition = copy.style.animation = "none";
-      copy.style.setProperty("view-transition-name", "none");
-      inline(original, copy, original === source);
-    });
-    root.removeAttribute(MARK);
-    return {
-      root,
-      pairs
-    };
-  }
-  var TIMING = /* @__PURE__ */ new Set([
-    "offset",
-    "computedOffset",
-    "easing",
-    "composite"
-  ]);
-  function animating(source) {
-    const found = /* @__PURE__ */ new Map();
-    if (typeof source.getAnimations !== "function") return found;
-    for (const animation of source.getAnimations({ subtree: true })) {
-      const effect = animation.effect;
-      if (!effect?.target || effect.pseudoElement) continue;
-      const names = found.get(effect.target) ?? /* @__PURE__ */ new Set();
-      if ("transitionProperty" in animation) names.add(String(animation.transitionProperty));
-      else for (const keyframe of effect.getKeyframes()) for (const key of Object.keys(keyframe)) if (!TIMING.has(key)) names.add(kebab(key));
-      found.set(effect.target, names);
-    }
-    return found;
-  }
-  var SOURCE = /* @__PURE__ */ new Set([
-    "src",
-    "srcset",
-    "sizes"
-  ]);
-  function copyBackdrop(element, source) {
-    const layer = document.createElement("div");
-    const frame2 = document.createElement("div");
-    layer.className = "lg-glass-copy";
-    layer.setAttribute("aria-hidden", "true");
-    layer.setAttribute("inert", "");
-    layer.append(frame2);
-    element.before(layer);
-    element.setAttribute("data-copy", "");
-    const style = getComputedStyle(element);
-    let styled = "";
-    const restyle = () => {
-      const next = [
-        `blur(${style.getPropertyValue("--lg-blur").trim() || "3px"}) ${style.getPropertyValue("--lg-filter").trim() || "saturate(1.5)"}`,
-        style.borderRadius,
-        style.opacity,
-        style.visibility
-      ];
-      if (next.join("|") === styled) return;
-      styled = next.join("|");
-      layer.style.filter = next[0];
-      layer.style.borderRadius = next[1];
-      layer.style.clipPath = `inset(0 round ${next[1]})`;
-      layer.style.opacity = next[2];
-      layer.style.visibility = next[3];
-    };
-    let placed = "";
-    let shift = {
-      x: 0,
-      y: 0
-    };
-    const align = () => {
-      const width = element.offsetWidth;
-      const height = element.offsetHeight;
-      if (!width || !height || !source.offsetWidth || !source.offsetHeight) {
-        layer.style.display = "none";
-        return;
-      }
-      layer.style.display = "";
-      const box = element.getBoundingClientRect();
-      const from = source.getBoundingClientRect();
-      const at = layer.getBoundingClientRect();
-      const sx = box.width / width;
-      const sy = box.height / height;
-      const x = box.left - (at.left - shift.x);
-      const y = box.top - (at.top - shift.y);
-      const next = [
-        width,
-        height,
-        `translate(${x}px, ${y}px) scale(${sx}, ${sy})`,
-        `translate(${(from.left - box.left) / sx}px, ${(from.top - box.top) / sy}px) scale(${from.width / source.offsetWidth / sx}, ${from.height / source.offsetHeight / sy})`
-      ].join("|");
-      if (next === placed) return;
-      placed = next;
-      shift = {
-        x,
-        y
-      };
-      layer.style.width = `${width}px`;
-      layer.style.height = `${height}px`;
-      layer.style.transform = `translate(${x}px, ${y}px) scale(${sx}, ${sy})`;
-      frame2.style.transform = next.split("|")[3];
-    };
-    let copy = copyOf(source);
-    frame2.append(copy.root);
-    let stopped = false;
-    const follow = () => {
-      for (const [original, target] of copy.pairs) inline(original, target, original === source);
-      placed = "";
-      align();
-    };
-    let refresh = 0;
-    let version = 0;
-    const recopy = () => {
-      refresh = 0;
-      const next = copyOf(source);
-      const id2 = ++version;
-      const images = [...next.root.querySelectorAll("img")];
-      if (next.root instanceof HTMLImageElement) images.push(next.root);
-      Promise.all(images.map((image) => typeof image.decode === "function" ? image.decode().catch(() => void 0) : void 0)).then(() => {
-        if (stopped || id2 !== version) return;
-        frame2.replaceChildren(next.root);
-        copy = next;
-        placed = "";
-        align();
-      });
-    };
-    const schedule = () => {
-      refresh ||= requestAnimationFrame(recopy);
-    };
-    let moving2 = /* @__PURE__ */ new Map();
-    const animate = () => {
-      const now = animating(source);
-      for (const [original, names] of new Map([...moving2, ...now])) {
-        const target = copy.pairs.get(original);
-        if (target) inline(original, target, original === source, names);
-      }
-      moving2 = now;
-    };
-    const moved = new MutationObserver(() => {
-      restyle();
-      align();
-    });
-    moved.observe(element, {
-      attributes: true,
-      attributeFilter: [
-        "style",
-        "class",
-        "disabled"
-      ]
-    });
-    const changed = new MutationObserver((records) => {
-      let content = false;
-      for (const record of records) {
-        const name = record.attributeName;
-        if (record.type !== "attributes" || SOURCE.has(name)) {
-          content = true;
-          continue;
-        }
-        const target = copy.pairs.get(record.target);
-        if (!target || name === "id" || name === "style" || name === MARK) continue;
-        const value = record.target.getAttribute(name);
-        if (value === null) target.removeAttribute(name);
-        else target.setAttribute(name, value);
-      }
-      if (content) schedule();
-      follow();
-    });
-    changed.observe(source, {
-      attributes: true,
-      childList: true,
-      characterData: true,
-      subtree: true
-    });
-    const context = new MutationObserver(follow);
-    for (let node = source.parentElement; node; node = node.parentElement) context.observe(node, { attributes: true });
-    const scheme = matchMedia("(prefers-color-scheme: dark)");
-    scheme.addEventListener("change", follow);
-    const resized = new ResizeObserver(follow);
-    resized.observe(source);
-    source.addEventListener("load", follow, true);
-    source.addEventListener("transitionend", follow);
-    document.addEventListener("scroll", align, {
-      capture: true,
-      passive: true
-    });
-    window.addEventListener("resize", align);
-    restyle();
-    align();
-    let tick2 = 0;
-    const loop = () => {
-      restyle();
-      animate();
-      align();
-      tick2 = requestAnimationFrame(loop);
-    };
-    tick2 = requestAnimationFrame(loop);
-    return () => {
-      stopped = true;
-      cancelAnimationFrame(tick2);
-      cancelAnimationFrame(refresh);
-      moved.disconnect();
-      changed.disconnect();
-      context.disconnect();
-      resized.disconnect();
-      scheme.removeEventListener("change", follow);
-      source.removeEventListener("load", follow, true);
-      source.removeEventListener("transitionend", follow);
-      document.removeEventListener("scroll", align, { capture: true });
-      window.removeEventListener("resize", align);
-      layer.remove();
-      element.removeAttribute("data-copy");
-    };
-  }
   function useRefraction(ref, selection = false) {
     useEffect(() => {
       const element = ref.current;
       if (!element) return;
-      if (refractsBackdrop()) return refract(element, selection, true);
-      const source = selection ? null : findBackdrop(element);
-      if (!source) return refract(element, selection, false);
-      const stop = copyBackdrop(element, source);
-      const unfit = refract(element, selection, true);
-      return () => {
-        unfit();
-        stop();
-      };
+      return refract(element, selection, refractsBackdrop());
     }, [ref, selection]);
   }
   var Button = /* @__PURE__ */ forwardRef(function Button2({ icon, variant = "glass", destructive, tint, children, className, style, type = "button", ...props }, forwardedRef) {
@@ -6308,7 +6251,7 @@ var Glisse = (() => {
           event.preventDefault();
           if (!gesture) highlight(null);
           const list = rows();
-          const index = list.indexOf(document.activeElement);
+          const index = list.indexOf(((card.getRootNode && card.getRootNode().activeElement) || document.activeElement));
           list[event.key === "Home" ? 0 : event.key === "End" ? list.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + list.length) % list.length]?.focus();
         }
       };
@@ -6397,11 +6340,6 @@ var Glisse = (() => {
               "data-index": index,
               "data-destructive": item.destructive ? "" : void 0,
               disabled: item.disabled,
-              onClick: (e) => {
-                e.stopPropagation();
-                close();
-                item.onSelect?.();
-              },
               children: [item.icon, item.label]
             }, index))]
           })
@@ -6994,7 +6932,6 @@ var Glisse = (() => {
       ]
     });
   }
-  insertStyles(styles_default);
   return __toCommonJS(entry_exports);
 })();
 
@@ -7245,10 +7182,6 @@ var Glisse = (() => {
                     disabled=${effectiveDisabled}
                     onValueChange=${(val) => {
                         if (onChange) onChange(val);
-                        try {
-                            const pillEl = (uiShadowRoot && uiShadowRoot.getElementById('__ul-pill')) || document.getElementById('__ul-pill');
-                            if (pillEl) pillEl.style.opacity = String(val);
-                        } catch {}
                     }}
                 />
                 <span className="slider__output">
@@ -7425,6 +7358,8 @@ var Glisse = (() => {
 
         const updatePreset = useCallback((val) => onUpdateSetting('telemetryPreset', val), [onUpdateSetting]);
         const updateLogImproper = useCallback((v) => onUpdateSetting('blockLogImproperUse', v), [onUpdateSetting]);
+        const updateBlockLogEvent = useCallback((v) => onUpdateSetting('blockLogEvent', v), [onUpdateSetting]);
+        const updatePrivateSearch = useCallback((v) => onUpdateSetting('privateSearchMode', v), [onUpdateSetting]);
         const updateBlockDom = useCallback((v) => onUpdateSetting('blockDomElements', v), [onUpdateSetting]);
         const updateBlockWs = useCallback((v) => onUpdateSetting('blockWebSockets', v), [onUpdateSetting]);
         const updateBlockBeacon = useCallback((v) => onUpdateSetting('blockSendBeacon', v), [onUpdateSetting]);
@@ -7462,6 +7397,22 @@ var Glisse = (() => {
                             >
                                 <${Switch.Label}>Block LogImproperUse requests<//>
                                 <${Switch.Description}>Silently drops UpLearn improper-use telemetry sent to API<//>
+                            <//>
+
+                            <${Switch} 
+                                isSelected=${currentSettings.blockLogEvent !== false}
+                                onChange=${updateBlockLogEvent}
+                            >
+                                <${Switch.Label}>Mock LogEvent mutations<//>
+                                <${Switch.Description}>Resolves UI interaction logging locally to prevent client telemetry<//>
+                            <//>
+
+                            <${Switch} 
+                                isSelected=${currentSettings.privateSearchMode !== false}
+                                onChange=${updatePrivateSearch}
+                            >
+                                <${Switch.Label}>Private Search Mode<//>
+                                <${Switch.Description}>Resolves LogLessonSearch mutations locally so search queries remain private<//>
                             <//>
 
                             <${Switch} 
@@ -7843,7 +7794,13 @@ var Glisse = (() => {
         const { useCallback } = React;
         const updatePillMode = useCallback((val) => onUpdateSetting('pillMode', val), [onUpdateSetting]);
         const updatePillPosition = useCallback((val) => onUpdateSetting('pillPosition', val), [onUpdateSetting]);
-        const updatePillOpacity = useCallback((val) => onUpdateSetting('pillOpacity', val), [onUpdateSetting]);
+        const updatePillOpacity = useCallback((val) => {
+            onUpdateSetting('pillOpacity', val);
+            try {
+                const pillEl = (uiShadowRoot && uiShadowRoot.getElementById('__ul-pill')) || document.getElementById('__ul-pill');
+                if (pillEl) pillEl.style.opacity = String(val);
+            } catch {}
+        }, [onUpdateSetting]);
         const updateDisableAutoFullscreen = useCallback((val) => onUpdateSetting('disableAutoFullscreen', val), [onUpdateSetting]);
         const updateDarkMode = useCallback((val) => onUpdateSetting('darkMode', val), [onUpdateSetting]);
         const updateDraggableUI = useCallback((val) => onUpdateSetting('draggableUI', val), [onUpdateSetting]);
@@ -8262,6 +8219,8 @@ var Glisse = (() => {
         const [isDragging, setIsDragging] = useState(false);
         const dragRef = useRef(null);
         const dialogRef = useRef(null);
+        const posRef = useRef(pos);
+        posRef.current = pos;
 
         // Clamping on viewport resize
         useEffect(() => {
@@ -8301,8 +8260,8 @@ var Glisse = (() => {
             dragRef.current = {
                 startX: e.clientX,
                 startY: e.clientY,
-                initX: pos.x,
-                initY: pos.y,
+                initX: posRef.current.x,
+                initY: posRef.current.y,
                 dialogW: curW,
                 dialogH: curH,
             };
@@ -8316,32 +8275,32 @@ var Glisse = (() => {
                 const maxY = Math.max(10, window.innerHeight - dragRef.current.dialogH - 10);
                 const nextX = Math.min(Math.max(10, Math.round(dragRef.current.initX + dx)), maxX);
                 const nextY = Math.min(Math.max(10, Math.round(dragRef.current.initY + dy)), maxY);
-                setPos({ x: nextX, y: nextY });
+                posRef.current = { x: nextX, y: nextY };
+                if (dialogRef.current) {
+                    dialogRef.current.style.left = nextX + 'px';
+                    dialogRef.current.style.top = nextY + 'px';
+                }
             };
 
-            const onPointerUp = (upEvt) => {
+            const onPointerUp = () => {
                 window.removeEventListener('pointermove', onPointerMove);
                 window.removeEventListener('pointerup', onPointerUp);
                 window.removeEventListener('pointercancel', onPointerUp);
                 setIsDragging(false);
                 if (dragRef.current) {
-                    const dx = upEvt.clientX - dragRef.current.startX;
-                    const dy = upEvt.clientY - dragRef.current.startY;
-                    const maxX = Math.max(10, window.innerWidth - dragRef.current.dialogW - 10);
-                    const maxY = Math.max(10, window.innerHeight - dragRef.current.dialogH - 10);
-                    const finalX = Math.min(Math.max(10, Math.round(dragRef.current.initX + dx)), maxX);
-                    const finalY = Math.min(Math.max(10, Math.round(dragRef.current.initY + dy)), maxY);
-                    try {
-                        localStorage.setItem('__ul_win_pos', JSON.stringify({ x: finalX, y: finalY }));
-                    } catch {}
                     dragRef.current = null;
+                    const finalPos = posRef.current;
+                    setPos(finalPos);
+                    try {
+                        localStorage.setItem('__ul_win_pos', JSON.stringify(finalPos));
+                    } catch {}
                 }
             };
 
             window.addEventListener('pointermove', onPointerMove, { passive: true });
             window.addEventListener('pointerup', onPointerUp);
             window.addEventListener('pointercancel', onPointerUp);
-        }, [isDraggable, pos]);
+        }, [isDraggable]);
 
         const handleTabClick = useCallback((targetTab) => {
             setActiveTab(targetTab);
@@ -8567,11 +8526,27 @@ var Glisse = (() => {
 
         // Real-time reactive live stats subscription for StatusPill (zero polling)
         useEffect(() => {
-            return subscribeStats((st) => {
-                setAppStats(Object.assign({}, st));
+            if (settings.pillMode === 'compact' || settings.pillMode === 'full') {
+                setAppStats(Object.assign({}, stats));
                 setAccumulatedBonus(accumulatedExtraSeconds);
+            }
+            let lastBlocked = stats.blocked;
+            let lastBoosted = stats.boosted;
+            let lastAcc = accumulatedExtraSeconds;
+
+            return subscribeStats((st) => {
+                if (settings.pillMode === 'compact' || settings.pillMode === 'full') {
+                    const acc = accumulatedExtraSeconds;
+                    if (st.blocked !== lastBlocked || st.boosted !== lastBoosted || acc !== lastAcc) {
+                        lastBlocked = st.blocked;
+                        lastBoosted = st.boosted;
+                        lastAcc = acc;
+                        setAppStats(Object.assign({}, st));
+                        setAccumulatedBonus(acc);
+                    }
+                }
             });
-        }, []);
+        }, [appSettings.pillMode]);
 
         const handleCloseModal = useCallback(() => {
             setModalOpenState(false);
@@ -8615,6 +8590,10 @@ var Glisse = (() => {
                 normalizeRange(settings);
                 saveSettings(true);
                 applyDarkMode();
+                ensureButton();
+                patchVisibilityProps();
+                installHasFocusPatch();
+                initVideoAutoSkipController();
                 setAppSettings(cloneSettings(settings));
                 LOG('settings reset to defaults');
             }
@@ -8803,6 +8782,11 @@ var Glisse = (() => {
         getCurrentVideoLesson: () => currentVideoLesson,
         skipVideoNow: (force = true) => checkAndAutoSkipVideo(force),
         handleApiResponse,
+        getLatestExamPaperData: () => latestExamPaperData,
+        getLatestUserProfile: () => latestUserProfile,
+        getLatestFeatureFlags: () => latestFeatureFlags,
+        getLatestGlobalFeatureFlags: () => latestGlobalFeatureFlags,
+        getLatestQuizFeedback: () => latestQuizFeedback,
         getQueuedSeconds: () => queuedSeconds,
         setQueuedSeconds: (secs) => {
             queuedSeconds = secs;
@@ -8839,6 +8823,9 @@ var Glisse = (() => {
         nativeConsole.log('%cThird-party services:   ', CSS.muted, anyServiceOn ? 'ON' : 'OFF');
         nativeConsole.log('%cSuppress Jitsu:         ', CSS.muted, settings.suppressJitsu ? 'YES (blocked + logged)' : 'no (allowed + logged)');
         nativeConsole.log('%cLogImproperUse:         ', CSS.muted, settings.blockLogImproperUse ? 'ON' : 'OFF');
+        nativeConsole.log('%cLogEvent handler:       ', CSS.muted, settings.blockLogEvent !== false ? 'ON' : 'OFF');
+        nativeConsole.log('%cPrivate search mode:    ', CSS.muted, settings.privateSearchMode !== false ? 'ON' : 'OFF');
+        nativeConsole.log('%cNative Opt-Out (PostHog):', CSS.muted, navigator.webdriver ? 'ON' : 'OFF');
         nativeConsole.log('%cManual time button:     ', CSS.muted, settings.manualTimeButtonEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cFull video watch:       ', CSS.muted, settings.fullVideoWatchedEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cAuto-skip video:        ', CSS.muted, settings.autoSkipVideoEnabled ? 'ON' : 'OFF');
