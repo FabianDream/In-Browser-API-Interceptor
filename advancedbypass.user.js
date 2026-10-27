@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UpLearn Telemetry Blocker & TimeSpent Booster
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
-// @version      3.8.4
-// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; inline manual "Add time" question button; full video watch completion toggle; auto-skip video to questions / completion; add full video duration to timeSpent; dark mode; full control panel UI
+// @version      3.8.5
+// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; random-range time boost; inline manual "Add time" question button for all question types; full video watch completion toggle; auto-skip video to 1 second before completion; add full video duration to timeSpent; dark mode; full control panel UI
 // @author       you
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
@@ -99,11 +99,12 @@
         pillVisible:               true,
         pillPosition:              'bottom-right',
         pillOpacity:               1,
-        showStats:                 true,
         pillMode:                  'minimal',
         theme:                     'dark',
-        accentColor:               '#16a34a',
+        accentColor:               '#007aff',
         logLevel:                  'normal',
+        keybindAction:             'toggle-pill',
+        draggableUI:               false,
         uiToggleKeybind:           Object.assign({}, DEFAULT_KEYBIND),
     };
 
@@ -140,6 +141,7 @@
                 delete parsed.suppressVisibilityEvents;
                 delete parsed.boostQuizQuestions;
                 delete parsed.boostGroupCompletion;
+                delete parsed.showStats;
 
                 if (parsed.telemetryServices && typeof parsed.telemetryServices === 'object') {
                     for (const k in TELEMETRY_SERVICES) {
@@ -194,6 +196,15 @@
         s.telemetryServices = Object.assign({}, s.telemetryServices);
         normalizeRange(s);
         s.pillMode = s.pillMode || 'minimal';
+        if (s.keybindAction !== 'toggle-pill' && s.keybindAction !== 'open-modal') {
+            s.keybindAction = 'toggle-pill';
+        }
+        if (s.keybindAction === 'open-modal') {
+            s.pillVisible = false;
+        }
+        if (typeof s.draggableUI !== 'boolean') {
+            s.draggableUI = false;
+        }
         s.uiToggleKeybind = normalizeKeybind(s.uiToggleKeybind);
         return s;
     }
@@ -314,41 +325,56 @@
     // ============================================================
     const API_HOST    = 'web.uplearn.co.uk';
     const API_PATH_RE = /\/api\/?$/;
-    const JITSU_HOSTS = TELEMETRY_SERVICES.jitsu.hosts;
 
     const hostCache = new Map();
     const hostServiceCache = new Map();
 
+    function fastHostOf(url) {
+        if (!url || typeof url !== 'string') return '';
+        const len = url.length;
+        if (len === 0) return '';
+        const c0 = url.charCodeAt(0);
+        if (c0 === 47) {
+            if (len > 1 && url.charCodeAt(1) === 47) {
+                const start = 2;
+                let end = start;
+                while (end < len) {
+                    const c = url.charCodeAt(end);
+                    if (c === 47 || c === 63 || c === 35 || c === 58) break;
+                    end++;
+                }
+                return url.slice(start, end).toLowerCase();
+            }
+            return (typeof location !== 'undefined' && location.hostname) ? location.hostname.toLowerCase() : API_HOST;
+        }
+        const protoIdx = url.indexOf('://');
+        if (protoIdx !== -1) {
+            const start = protoIdx + 3;
+            let end = start;
+            while (end < len) {
+                const c = url.charCodeAt(end);
+                if (c === 47 || c === 63 || c === 35 || c === 58) break;
+                end++;
+            }
+            return url.slice(start, end).toLowerCase();
+        }
+        try { return new URL(url, (typeof location !== 'undefined' && location.href) ? location.href : undefined).hostname.toLowerCase(); }
+        catch { return ''; }
+    }
+
     function hostOf(url) {
         if (!url || typeof url !== 'string') return '';
+        if (url.charCodeAt(0) === 47 && url.charCodeAt(1) !== 47) {
+            return (typeof location !== 'undefined' && location.hostname) ? location.hostname.toLowerCase() : API_HOST;
+        }
         let h = hostCache.get(url);
         if (h !== undefined) return h;
-        if (url.charCodeAt(0) === 47 && url.charCodeAt(1) !== 47) {
-            h = (typeof location !== 'undefined' && location.hostname) ? location.hostname.toLowerCase() : API_HOST;
-        } else {
-            try { h = new URL(url, location.href).hostname.toLowerCase(); }
-            catch { h = ''; }
-        }
+        h = fastHostOf(url);
         if (hostCache.size >= 250) {
             hostCache.delete(hostCache.keys().next().value);
         }
         hostCache.set(url, h);
         return h;
-    }
-
-    function isJitsuHost(h) {
-        if (!h) return false;
-        if (h === API_HOST || (typeof location !== 'undefined' && h === location.hostname)) return false;
-        for (let i = 0; i < JITSU_HOSTS.length; i++) {
-            const t = JITSU_HOSTS[i];
-            if (h === t || h.endsWith('.' + t)) return true;
-        }
-        return false;
-    }
-
-    function isJitsuUrl(url) {
-        if (!url) return false;
-        return isJitsuHost(hostOf(url));
     }
 
     function matchAnyTelemetryService(url) {
@@ -404,15 +430,21 @@
             return true;
         }
         if (!url.includes('/api')) return false;
-        if (!url.includes(API_HOST) && !url.startsWith('/api')) return false;
-        try {
-            const u = new URL(url, location.href);
-            return u.host === API_HOST && API_PATH_RE.test(u.pathname);
-        } catch { return false; }
+        if (url.charCodeAt(0) === 47 && url.charCodeAt(1) !== 47) {
+            return API_PATH_RE.test(url.split('?')[0]);
+        }
+        const h = hostOf(url);
+        if (h !== API_HOST) return false;
+        const apiIdx = url.indexOf('/api');
+        if (apiIdx !== -1) {
+            const cleanPath = url.slice(apiIdx).split('?')[0];
+            return API_PATH_RE.test(cleanPath);
+        }
+        return false;
     }
 
     // ============================================================
-    // STATS
+    // STATS & REACTIVE SUBSCRIBERS
     // ============================================================
     const stats = {
         apiPosts: 0, seen: 0, boosted: 0, blocked: 0,
@@ -420,6 +452,29 @@
         logImproperUseBlocked: 0, jitsuPackets: 0, manualBoosted: 0,
         videosMaxed: 0, videosSkipped: 0, videoTimeAdded: 0,
     };
+
+    const statsListeners = new Set();
+    function subscribeStats(fn) {
+        statsListeners.add(fn);
+        return () => statsListeners.delete(fn);
+    }
+    let statsNotifyScheduled = false;
+    function notifyStatsChange() {
+        if (statsNotifyScheduled || statsListeners.size === 0) return;
+        statsNotifyScheduled = true;
+        const deliver = () => {
+            statsNotifyScheduled = false;
+            for (const fn of statsListeners) {
+                try { fn(stats); } catch {}
+            }
+        };
+        if (typeof queueMicrotask === 'function') queueMicrotask(deliver);
+        else setTimeout(deliver, 0);
+    }
+    function bumpStat(key, delta = 1) {
+        stats[key] = (stats[key] || 0) + delta;
+        notifyStatsChange();
+    }
 
     // ============================================================
     // CONSOLE NOISE FILTER
@@ -475,16 +530,28 @@
     }
 
     function installConsoleNoiseFilter() {
-        ['log', 'warn', 'error', 'info', 'debug'].forEach((method) => {
+        const methods = ['log', 'warn', 'error', 'info', 'debug'];
+        for (let m = 0; m < methods.length; m++) {
+            const method = methods[m];
             const orig = nativeConsole[method];
-            console[method] = function (...args) {
-                if (settings.suppressConsoleNoise && argsAreNoise(args)) {
-                    stats.consoleSuppressed++;
+            console[method] = function () {
+                if (!settings.suppressConsoleNoise) {
+                    return orig.apply(console, arguments);
+                }
+                const len = arguments.length;
+                if (len === 0) return orig.apply(console, arguments);
+                const first = arguments[0];
+                if (typeof first === 'string' && textMatchesNoise(first)) {
+                    bumpStat('consoleSuppressed');
                     return;
                 }
-                return orig.apply(console, args);
+                if (argsAreNoise(arguments)) {
+                    bumpStat('consoleSuppressed');
+                    return;
+                }
+                return orig.apply(console, arguments);
             };
-        });
+        }
         VLOG('console noise filter installed (Jitsu / Apollo / Sentry / host matches)');
     }
     installConsoleNoiseFilter();
@@ -574,7 +641,7 @@
     // Dedicated reporter for LogImproperUse so it stands out from generic
     // telemetry blocks. Bumps its own counter and uses pink styling.
     function reportLogImproperUse(source, url, body) {
-        stats.logImproperUseBlocked++;
+        bumpStat('logImproperUseBlocked');
         if (settings.logLevel === 'silent') return;
 
         let opName = 'LogImproperUse';
@@ -748,11 +815,11 @@
     try {
         const OrigWebSocket = window.WebSocket;
         if (OrigWebSocket) {
-            window.WebSocket = function (url, protocols) {
+            function PatchedWebSocket(url, protocols) {
                 if (settings.blockWebSockets && isTelemetryUrl(url)) {
                     reportBlock('WebSocket', String(url), { protocols: protocols || '(none)' });
                     const dummy = new EventTarget();
-                    dummy.readyState = 3;
+                    dummy.readyState = OrigWebSocket.CLOSED !== undefined ? OrigWebSocket.CLOSED : 3;
                     dummy.send = () => {};
                     dummy.close = () => {};
                     setTimeout(() => {
@@ -764,8 +831,20 @@
                     return dummy;
                 }
                 return new OrigWebSocket(url, protocols);
-            };
-            window.WebSocket.prototype = OrigWebSocket.prototype;
+            }
+            PatchedWebSocket.prototype = OrigWebSocket.prototype;
+            // Preserve all static properties (CONNECTING, OPEN, CLOSING, CLOSED) and descriptors
+            const staticProps = Object.getOwnPropertyNames(OrigWebSocket);
+            for (let i = 0; i < staticProps.length; i++) {
+                const prop = staticProps[i];
+                if (!(prop in PatchedWebSocket)) {
+                    try {
+                        const desc = Object.getOwnPropertyDescriptor(OrigWebSocket, prop);
+                        if (desc) Object.defineProperty(PatchedWebSocket, prop, desc);
+                    } catch {}
+                }
+            }
+            window.WebSocket = PatchedWebSocket;
             VLOG('WebSocket hook installed');
         }
     } catch (e) { WARN('websocket patch failed', e); }
@@ -839,8 +918,6 @@
         obs.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
     } catch {}
 
-    setInterval(applyDarkMode, 3000);
-
     // ============================================================
     // LOGIMPROPERUSE DETECTION
     // ============================================================
@@ -868,11 +945,56 @@
     // ============================================================
     // TIME BOOST & MANUAL "ADD TIME" QUESTION BUTTON
     // ============================================================
-    const QUIZ_OP              = 'AnswerProgressQuizQuestion';
-    const GROUP_OP             = 'CompleteProgressQuizGroup';
     const VIDEO_OP             = 'CompleteVideoLesson';
     const MANUAL_BUTTON_ID     = 'us-timespent-btn';
-    const MANUAL_TRIGGER_LABEL = 'submit';
+
+    const KNOWN_QUESTION_OPS = new Set([
+        'AnswerProgressQuizQuestion',
+        'AnswerInVideoQuestion',
+        'AnswerPreVideoQuestion',
+        'AnswerDiagnosticQuestion',
+        'AnswerSpacedPracticeQuizQuestion',
+        'AnswerStrengthenQuizQuestion',
+        'AnswerExamQuestion',
+        'SaveExamQuestionMarks',
+        'SaveExamPracticeAnswers',
+        'SaveExamPracticeQuestionMarks',
+    ]);
+
+    const KNOWN_GROUP_OPS = new Set([
+        'CompleteProgressQuizGroup',
+        'CompleteSpacedPracticeQuiz',
+        'CompleteStrengthenQuiz',
+        'CompleteDiagnosticQuizSession',
+        'CompleteExamQuestionWalkthrough',
+        'CompleteExamPracticeSession',
+    ]);
+
+    const KNOWN_LESSON_OPS = new Set([
+        'CompleteVideoLesson',
+        'CompleteSubsectionSummary',
+        'CompleteArticleLesson',
+    ]);
+
+    function isQuestionAnswerOp(opName, qStr) {
+        if (KNOWN_QUESTION_OPS.has(opName)) return true;
+        if (/^Answer.*Question$/i.test(opName)) return true;
+        if (/^SaveExam/i.test(opName)) return true;
+        if (qStr) {
+            if (/answer[A-Za-z0-9]*Question/i.test(qStr)) return true;
+            if (/saveExam[A-Za-z0-9]*/i.test(qStr)) return true;
+        }
+        return false;
+    }
+
+    function isQuizGroupOp(opName, qStr) {
+        if (KNOWN_GROUP_OPS.has(opName)) return true;
+        if (/^Complete.*(Quiz|Group|Session|Walkthrough)$/i.test(opName)) return true;
+        if (qStr) {
+            if (/complete[A-Za-z0-9]*(Quiz|Group|Session|Walkthrough)/i.test(qStr)) return true;
+        }
+        return false;
+    }
 
     let accumulatedExtraSeconds  = 0;
     let accumulatedQuestionCount = 0;
@@ -896,7 +1018,6 @@
     function toIso(seconds) {
         return 'PT' + round3(seconds) + 'S';
     }
-    const toISODuration = toIso;
 
     function formatSeconds(seconds) {
         seconds = round3(seconds);
@@ -960,7 +1081,6 @@
 
         return null;
     }
-    const parseISODuration = parseDurationToSeconds;
 
     function pickExtraSeconds() {
         const min = Math.min(settings.extraSecondsMin, settings.extraSecondsMax);
@@ -998,14 +1118,6 @@
         if (q.id && answered.has(String(q.id))) return true;
         if (q.quizContentId && answered.has(String(q.quizContentId))) return true;
         return false;
-    }
-
-    function hasUnansweredPreQuestions() {
-        if (!currentVideoLesson || !Array.isArray(currentVideoLesson.preQuestions) || currentVideoLesson.preQuestions.length === 0) {
-            return false;
-        }
-        const answered = currentVideoLesson.answeredPreQuestionIds || new Set();
-        return currentVideoLesson.preQuestions.some((id) => !answered.has(id));
     }
 
     function inspectOutgoingGraphQL(body) {
@@ -1341,9 +1453,24 @@
         return false;
     }
 
+    function bindVideoEvents(video) {
+        if (!video || video.__ul_skip_bound) return;
+        video.__ul_skip_bound = true;
+        const triggerSkip = () => {
+            if (settings.autoSkipVideoEnabled) checkAndAutoSkipVideo(false);
+        };
+        video.addEventListener('play', triggerSkip);
+        video.addEventListener('loadedmetadata', triggerSkip);
+    }
+
     function checkAndAutoSkipVideo(force = false) {
         if (!settings.autoSkipVideoEnabled && !force) return;
         if (autoSkipThrottled && !force) return;
+
+        // If already skipped to end-1s and on same active video, avoid redundant layout checks
+        if (!force && lastSkippedTarget === 'end-1s' && lastActiveVideoElement && lastActiveVideoElement.isConnected && !lastActiveVideoElement.ended) {
+            return;
+        }
 
         const video = findActiveVideoElement();
         if (!video || !video.isConnected || video.ended) return;
@@ -1351,6 +1478,7 @@
         if (video !== lastActiveVideoElement) {
             lastActiveVideoElement = video;
             lastSkippedTarget = null;
+            bindVideoEvents(video);
         }
 
         // In real browser playback, wait if video is mid-seek or hasn't loaded metadata yet
@@ -1400,121 +1528,29 @@
 
         const currentTime = video.currentTime || 0;
 
-        // 1. Check for unanswered in-video questions (NEVER auto-mark questions answered by playback time!)
-        if (currentVideoLesson && Array.isArray(currentVideoLesson.questions) && currentVideoLesson.questions.length > 0) {
-            const nextQ = currentVideoLesson.questions.find((q) => !isQuestionAnswered(q));
-
-            if (nextQ) {
-                if (nextQ.triggerTime == null || !isFinite(nextQ.triggerTime)) {
-                    // Question exists with unknown triggerTime -> never skip to end while unanswered
-                    return;
-                }
-
-                const dist = nextQ.triggerTime - currentTime;
-                const leadOffset = force ? 0.1 : 1.5;
-                const approachWindow = force ? 0.4 : 2.5;
-
-                if (dist > approachWindow) {
-                    // Video is before the question's approach window -> seek forward to just before triggerTime
-                    const target = Math.max(0, nextQ.triggerTime - leadOffset);
-                    if (Math.abs(currentTime - target) > 0.3 && (lastSkippedTarget !== nextQ.triggerTime || dist > 4.0)) {
-                        lastSkippedTarget = nextQ.triggerTime;
-                        throttleAutoSkip();
-
-                        LOG(`[autoSkip] Skipping video to question at ${formatSeconds(nextQ.triggerTime)}`);
-                        nativeConsole.log(`[UpLearn Video] Auto-skipping video from ${formatSeconds(currentTime)} to question at ${formatSeconds(nextQ.triggerTime)}`);
-                        try {
-                            video.currentTime = target;
-                            video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
-                            stats.videosSkipped = (stats.videosSkipped || 0) + 1;
-                            if (video.paused && typeof video.play === 'function') {
-                                video.play().catch(() => {});
-                            }
-                        } catch (e) {
-                            WARN('autoSkip seek failed', e);
-                        }
-                    }
-                    // NEVER fall through to video completion while unanswered questions remain!
-                    return;
-                } else if (dist > 0) {
-                    // Video is in the approach window [triggerTime - approachWindow, triggerTime):
-                    // Let it play naturally across triggerTime so UpLearn's player triggers the question modal!
-                    if (video.paused && typeof video.play === 'function') {
-                        try { video.play().catch(() => {}); } catch {}
-                    }
-                    // NEVER fall through to video completion while unanswered questions remain!
-                    return;
-                } else if (dist >= -1.5) {
-                    // Video has reached or just crossed triggerTime -> ensure timeupdate fires and pause/wait
-                    if (!video.paused && typeof video.pause === 'function') {
-                        try {
-                            video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
-                            video.pause();
-                        } catch {}
-                    }
-                    // NEVER fall through to video completion while unanswered questions remain!
-                    return;
-                } else {
-                    // Video somehow drifted past an unanswered question -> rewind back so UpLearn triggers it
-                    const target = Math.max(0, nextQ.triggerTime - leadOffset);
-                    if (lastSkippedTarget !== `rewind-${nextQ.triggerTime}`) {
-                        lastSkippedTarget = `rewind-${nextQ.triggerTime}`;
-                        throttleAutoSkip();
-
-                        LOG(`[autoSkip] Rewinding video to unanswered question at ${formatSeconds(nextQ.triggerTime)}`);
-                        try {
-                            video.currentTime = target;
-                            video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
-                            if (force && !video.paused && typeof video.pause === 'function') {
-                                video.pause();
-                            } else if (!force && video.paused && typeof video.play === 'function') {
-                                video.play().catch(() => {});
-                            }
-                        } catch (e) {}
-                    }
-                    // NEVER fall through to video completion while unanswered questions remain!
-                    return;
-                }
-            }
-        }
-
-        // Extra guard: if GetVideoLesson reported questions, never skip to completion until all are answered
-        if (
-            currentVideoLesson &&
-            currentVideoLesson.totalExpectedQuestions > 0 &&
-            currentVideoLesson.answeredQuestionIds.size < currentVideoLesson.totalExpectedQuestions
-        ) {
-            return;
-        }
-
-        // 2. If pre-video questions exist and are unanswered before video start, wait
-        if (hasUnansweredPreQuestions() && currentTime < 1.0) {
-            return;
-        }
-
-        // 3. All questions are answered (or video has 0 questions) -> auto skip to video completion
-        if (duration > 1 && currentTime < duration - 0.8) {
-            const target = Math.max(0, duration - 0.3);
-            if (lastSkippedTarget !== 'end' && Math.abs(currentTime - target) > 0.5) {
-                lastSkippedTarget = 'end';
+        // Skip straight to one second before the video ends (guard duration > 2.0 to avoid seeking 0-duration clips)
+        if (duration > 2.0) {
+            const target = Math.max(0, duration - 1.0);
+            if (force || (currentTime < target - 0.2 && lastSkippedTarget !== 'end-1s')) {
+                lastSkippedTarget = 'end-1s';
                 throttleAutoSkip();
 
-                LOG(`[autoSkip] No remaining questions; skipping to video completion (${formatSeconds(duration)})`);
-                nativeConsole.log(`[UpLearn Video] Auto-skipping video from ${formatSeconds(currentTime)} to completion (${formatSeconds(duration)})`);
+                LOG(`[autoSkip] Skipping straight to 1s before video ends (${formatSeconds(target)} / ${formatSeconds(duration)})`);
+                nativeConsole.log(`[UpLearn Video] Auto-skipping video from ${formatSeconds(currentTime)} to 1 second before end (${formatSeconds(target)} / ${formatSeconds(duration)})`);
                 try {
                     video.currentTime = target;
                     video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
-                    stats.videosSkipped = (stats.videosSkipped || 0) + 1;
+                    bumpStat('videosSkipped');
                     if (video.paused && typeof video.play === 'function') {
                         video.play().catch(() => {});
                     }
                     setTimeout(() => {
                         try {
-                            if (video.currentTime >= duration - 0.5 && !isQuestionActiveOnPage()) {
+                            if (video.currentTime >= duration - 0.5 && !video.ended && !isQuestionActiveOnPage()) {
                                 video.dispatchEvent(new Event('ended', { bubbles: true }));
                             }
                         } catch {}
-                    }, 800);
+                    }, 1200);
                 } catch (e) {
                     WARN('autoSkip completion seek failed', e);
                 }
@@ -1525,10 +1561,10 @@
     function initVideoAutoSkipController() {
         try {
             setInterval(() => {
-                if (settings.autoSkipVideoEnabled) {
+                if (settings.autoSkipVideoEnabled && (!lastActiveVideoElement || !lastActiveVideoElement.isConnected || lastSkippedTarget !== 'end-1s')) {
                     checkAndAutoSkipVideo();
                 }
-            }, 600);
+            }, 800);
         } catch (e) {
             WARN('initVideoAutoSkipController failed', e);
         }
@@ -1542,58 +1578,92 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 6px;
-    margin: 0 0 0 8px !important;
-    padding: 10px 14px;
-    border-radius: 8px;
-    border: 1px solid #cbd5e1;
-    background: #f8fafc;
-    color: #0f172a;
-    font-family: inherit;
+    gap: 8px;
+    margin: 0 0 0 10px !important;
+    padding: 0 16px;
+    height: 40px;
+    border-radius: 20px;
+    border: none;
+    background-color: var(--lg-glass, rgba(255, 255, 255, 0.65));
+    -webkit-backdrop-filter: blur(18px) saturate(1.8);
+    backdrop-filter: blur(18px) saturate(1.8);
+    box-shadow: inset 0 0 0 0.5px var(--lg-edge, rgba(0, 0, 0, 0.08)), 0 1px 3px var(--lg-drop, rgba(0, 0, 0, 0.06));
+    color: var(--lg-foreground, #1d1d1f);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro", "Helvetica Neue", Helvetica, Arial, sans-serif;
     font-size: 14px;
-    font-weight: 600;
+    font-weight: 500;
     line-height: 1;
     cursor: pointer;
     white-space: nowrap;
     vertical-align: middle;
-    transition: background .15s, border-color .15s, color .15s;
-    box-sizing: border-box;
-    min-width: 110px;
     user-select: none;
     outline: none;
+    position: relative;
+    overflow: hidden;
+    transition: background-color 200ms ease, transform 150ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 200ms ease;
+    box-sizing: border-box;
+    min-width: 110px;
 }
-#${MANUAL_BUTTON_ID}:hover { background: #eef2f7; }
+html.ul-dark-mode #${MANUAL_BUTTON_ID} {
+    background-color: var(--lg-glass, rgba(40, 40, 40, 0.65));
+    box-shadow: inset 0 0 0 0.5px var(--lg-edge, rgba(255, 255, 255, 0.08));
+    color: var(--lg-foreground, #ffffff);
+}
+#${MANUAL_BUTTON_ID}::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    background: radial-gradient(circle 200px at var(--lg-x, 50%) var(--lg-y, 50%), rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.02) 60%, transparent);
+    opacity: 0;
+    transition: opacity 200ms ease-in-out;
+}
+#${MANUAL_BUTTON_ID}:hover {
+    background-color: var(--lg-glass-active, rgba(236, 236, 240, 0.85));
+    transform: translateY(-0.5px);
+}
+html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
+    background-color: var(--lg-glass-active, rgba(70, 70, 70, 0.62));
+}
+#${MANUAL_BUTTON_ID}:active {
+    transform: scale(0.97);
+    background-color: var(--lg-glass-active);
+}
+#${MANUAL_BUTTON_ID}:active::after {
+    opacity: 1;
+}
 #${MANUAL_BUTTON_ID}.us-active {
-    border-color: #2563eb;
-    background: #eff6ff;
-    color: #1d4ed8;
+    background-color: var(--lg-fill, #0088ff) !important;
+    color: #ffffff !important;
+    box-shadow: 0 2px 10px rgba(0, 136, 255, 0.35), inset 0 0 0 0.5px rgba(255, 255, 255, 0.25) !important;
 }
 #${MANUAL_BUTTON_ID}.us-editing {
     padding: 0;
-    background: #ffffff;
-    border-color: #2563eb;
-    box-shadow: 0 0 0 3px rgba(37,99,235,0.15);
+    background-color: var(--lg-surface, rgba(255, 255, 255, 0.95));
+    box-shadow: 0 0 0 2px var(--lg-fill, #0088ff);
     cursor: text;
 }
-#${MANUAL_BUTTON_ID}.us-editing:hover { background: #ffffff; }
 #${MANUAL_BUTTON_ID} input.us-input {
     border: none;
     outline: none;
     background: transparent;
     font: inherit;
+    font-size: 14px;
+    font-weight: 500;
     color: inherit;
-    padding: 10px 14px;
+    padding: 0 16px;
+    height: 40px;
     width: 110px;
     text-align: center;
     box-sizing: border-box;
-    letter-spacing: 0.3px;
 }
 #${MANUAL_BUTTON_ID}.us-reset {
-    animation: us-pop .4s ease;
+    animation: us-pop .35s ease;
 }
 @keyframes us-pop {
     0%   { transform: scale(1);    }
-    40%  { transform: scale(1.08); }
+    40%  { transform: scale(1.06); }
     100% { transform: scale(1);    }
 }
 `;
@@ -1606,17 +1676,103 @@
         (document.head || document.documentElement).appendChild(style);
     }
 
-    function findSubmitButton() {
-        const buttons = document.querySelectorAll('button[type="submit"]');
-        for (let i = 0; i < buttons.length; i++) {
-            const b = buttons[i];
-            if ((b.textContent || '').trim().toLowerCase() === MANUAL_TRIGGER_LABEL) return b;
+    const QUESTION_SUBMIT_LABELS = new Set([
+        'submit',
+        'submit answer',
+        'submit answers',
+        'submit response',
+        'check',
+        'check answer',
+        'check answers',
+        'save',
+        'save answer',
+        'save answers',
+        'save marks',
+        'submit marks',
+        'mark',
+        'confirm',
+        'confirm answer',
+        'done',
+    ]);
+
+    const QUESTION_SUBMIT_RE = /^(submit|check|save|confirm|mark)(\s+(answer|answers|marks|response|part))?$/i;
+
+    function getCleanElementText(el) {
+        if (!el) return '';
+        const raw = el.textContent || el.value || el.getAttribute('aria-label') || '';
+        return raw.trim().toLowerCase().replace(/\s+/g, ' ');
+    }
+
+    let lastResolvedSubmitBtn = null;
+
+    function isCandidateSubmitButton(btn, host) {
+        if (!btn || !btn.isConnected) return false;
+        if (btn.id === MANUAL_BUTTON_ID) return false;
+        if (host && typeof host.contains === 'function' && host.contains(btn)) return false;
+
+        const txt = getCleanElementText(btn);
+        let matches = QUESTION_SUBMIT_LABELS.has(txt) || QUESTION_SUBMIT_RE.test(txt);
+        if (!matches && btn.getAttribute('type') === 'submit' && txt.length > 0 && txt.length < 30) {
+            if (!/search|find|filter|menu|login|sign|logout|cancel|close/i.test(txt)) {
+                matches = true;
+            }
         }
-        const allButtons = document.querySelectorAll('button');
+        if (!matches) return false;
+
+        // Check layout visibility ONLY after text confirms candidate status (avoids forced layout reflows)
+        return isElementVisible(btn);
+    }
+
+    function findSubmitButton() {
+        const host = (uiHostEl && uiHostEl.isConnected)
+            ? uiHostEl
+            : (typeof document.getElementById === 'function' ? document.getElementById('__ul-heroui-host') : null);
+
+        // Fast-path: Check previously resolved button if still connected and valid
+        if (lastResolvedSubmitBtn && lastResolvedSubmitBtn.isConnected && isCandidateSubmitButton(lastResolvedSubmitBtn, host)) {
+            return lastResolvedSubmitBtn;
+        }
+
+        // 1. Search inside active question/quiz containers first
+        const containerSelectors = [
+            '[role="dialog"]',
+            '.quiz-content',
+            '[data-testid*="question"]',
+            '[data-testid*="quiz"]',
+            '.question',
+            'form',
+            'main'
+        ];
+
+        for (let s = 0; s < containerSelectors.length; s++) {
+            const containers = document.querySelectorAll(containerSelectors[s]);
+            for (let c = 0; c < containers.length; c++) {
+                const container = containers[c];
+                if (host && host.contains(container)) continue;
+                if (!isElementVisible(container)) continue;
+
+                const btns = container.querySelectorAll('button, input[type="submit"], [role="button"]');
+                for (let i = 0; i < btns.length; i++) {
+                    const b = btns[i];
+                    if (isCandidateSubmitButton(b, host)) {
+                        lastResolvedSubmitBtn = b;
+                        return b;
+                    }
+                }
+            }
+        }
+
+        // 2. Global search across all buttons in document
+        const allButtons = document.querySelectorAll('button, input[type="submit"], [role="button"]');
         for (let i = 0; i < allButtons.length; i++) {
             const b = allButtons[i];
-            if ((b.textContent || '').trim().toLowerCase() === MANUAL_TRIGGER_LABEL) return b;
+            if (isCandidateSubmitButton(b, host)) {
+                lastResolvedSubmitBtn = b;
+                return b;
+            }
         }
+
+        lastResolvedSubmitBtn = null;
         return null;
     }
 
@@ -1774,6 +1930,11 @@
         btn.setAttribute('tabindex', '0');
         btn.addEventListener('click',   onButtonClick,   true);
         btn.addEventListener('keydown', onButtonKeyDown, false);
+        btn.addEventListener('pointermove', (e) => {
+            const r = btn.getBoundingClientRect();
+            btn.style.setProperty('--lg-x', `${((e.clientX - r.left) / r.width) * 100}%`);
+            btn.style.setProperty('--lg-y', `${((e.clientY - r.top) / r.height) * 100}%`);
+        });
         return btn;
     }
 
@@ -1794,9 +1955,9 @@
         const submit = findSubmitButton();
 
         if (!submit) {
-            removeButton();
-            queuedSeconds = null;
-            editing = false;
+            if (!editing) {
+                removeButton();
+            }
             return;
         }
 
@@ -1867,7 +2028,6 @@
                 childList: true,
                 subtree: true,
             });
-            setInterval(ensureButton, 4000);
         } catch (e) {
             WARN('mutation observer for manual button failed', e);
         }
@@ -1881,14 +2041,14 @@
         const inspectedJson = inspectOutgoingGraphQL(body);
         if (inspectedJson === null) return { body, changed: false };
 
-        const boostActive = settings.timeBoostEnabled || queuedSeconds !== null;
+        const boostActive = settings.timeBoostEnabled || queuedSeconds !== null || accumulatedExtraSeconds > 0;
         const videoActive = settings.fullVideoWatchedEnabled || settings.addVideoDurationToTimeSpent;
         if (!boostActive && !videoActive) return { body, changed: false };
 
-        const hasQuiz  = boostActive && (inspectedJson !== undefined || body.includes(QUIZ_OP) || body.includes('AnswerInVideoQuestion') || body.includes('AnswerPreVideoQuestion'));
-        const hasGroup = boostActive && body.includes(GROUP_OP);
-        const hasVideo = (videoActive || boostActive) && body.includes(VIDEO_OP);
-        if (!hasQuiz && !hasGroup && !hasVideo) return { body, changed: false };
+        const hasTimeSpent = body.includes('timeSpent') || body.includes('timeSpentAnswering') || body.includes('timeSpentMarking');
+        const hasVideo = body.includes(VIDEO_OP) || body.includes('completeVideoLesson');
+        const hasQuestion = body.includes('Answer') || body.includes('SaveExam') || body.includes('Complete');
+        if (!hasTimeSpent && !hasVideo && !hasQuestion) return { body, changed: false };
 
         let json = inspectedJson;
         if (json === undefined) {
@@ -1903,9 +2063,13 @@
             if (!obj || !obj.variables) return;
 
             const opName = obj.operationName || '';
+            const qStr = typeof obj.query === 'string'
+                ? obj.query
+                : (typeof obj.mutation === 'string' ? obj.mutation : '');
+
             const isVideo = opName === VIDEO_OP ||
-                (typeof obj.query === 'string' && obj.query.includes(VIDEO_OP)) ||
-                (typeof obj.mutation === 'string' && obj.mutation.includes(VIDEO_OP));
+                qStr.includes(VIDEO_OP) ||
+                qStr.includes('completeVideoLesson');
 
             if (isVideo) {
                 let videoTouched = false;
@@ -1917,7 +2081,7 @@
                     const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
                     if (beforePercent !== targetPercent) {
                         obj.variables.percentWatched = targetPercent;
-                        stats.videosMaxed = (stats.videosMaxed || 0) + 1;
+                        bumpStat('videosMaxed');
                         videoTouched = true;
                         changed = true;
 
@@ -1967,7 +2131,7 @@
                     const newTimeSpent = round3(origTimeSpent + extraTime);
                     obj.variables.timeSpent = (typeof rawTimeSpent === 'string') ? String(newTimeSpent) : newTimeSpent;
                     if (settings.addVideoDurationToTimeSpent && vidDuration > 0) {
-                        stats.videoTimeAdded = (stats.videoTimeAdded || 0) + vidDuration;
+                        bumpStat('videoTimeAdded', vidDuration);
                     }
                     videoTouched = true;
                     changed = true;
@@ -1979,20 +2143,82 @@
                 }
 
                 if (videoTouched) {
-                    stats.seen++;
+                    bumpStat('seen');
                 }
+                return;
             }
 
-            const isQuizOp = opName === QUIZ_OP || opName === 'AnswerInVideoQuestion' || opName === 'AnswerPreVideoQuestion';
-            if (boostActive && isQuizOp && typeof obj.variables.timeSpent === 'string') {
-                const total = parseDurationToSeconds(obj.variables.timeSpent);
+            // Group / Session completion operations
+            const isGroup = isQuizGroupOp(opName, qStr);
+            if (boostActive && isGroup) {
+                let timeField = 'timeSpent';
+                if (obj.variables.timeSpent == null) {
+                    if (obj.variables.timeSpentAnswering != null) timeField = 'timeSpentAnswering';
+                    else if (obj.variables.timeSpentMarking != null) timeField = 'timeSpentMarking';
+                }
+
+                if (obj.variables[timeField] != null) {
+                    const rawVal = obj.variables[timeField];
+                    const total = parseDurationToSeconds(rawVal);
+                    if (total !== null) {
+                        let bonus = accumulatedExtraSeconds;
+                        let isManual = false;
+                        if (queuedSeconds !== null) {
+                            isManual = true;
+                            if (settings.manualTimeStacksWithAuto && settings.timeBoostEnabled) {
+                                bonus += queuedSeconds + pickExtraSeconds();
+                            } else {
+                                bonus += queuedSeconds;
+                            }
+                            manualResetNeeded = true;
+                        }
+
+                        if (bonus > 0) {
+                            const newTotal = total + bonus;
+                            if (typeof rawVal === 'string' && (rawVal.startsWith('P') || rawVal.startsWith('p'))) {
+                                obj.variables[timeField] = toIso(newTotal);
+                            } else if (typeof rawVal === 'number') {
+                                obj.variables[timeField] = round3(newTotal);
+                            } else {
+                                obj.variables[timeField] = String(round3(newTotal));
+                            }
+                            bumpStat('groupExtra', bonus);
+                            changed = true;
+                            const count = accumulatedQuestionCount;
+                            LOG(`[${source}] ${opName || 'QuizGroup'}: ${rawVal} → ${obj.variables[timeField]} ` +
+                                `(+${bonus}s${count > 0 ? ` from ${count} question(s)` : ''}${isManual ? ' [manual]' : ''})`);
+                            VLOG('group bonus applied; per-question accumulator reset', { bonus, count, opName });
+                        }
+                    }
+                    accumulatedExtraSeconds = 0;
+                    accumulatedQuestionCount = 0;
+                    notifyStatsChange();
+                }
+                return;
+            }
+
+            // Per-question operations (and any other question/lesson operation with timeSpent)
+            let timeField = 'timeSpent';
+            if (obj.variables.timeSpent == null) {
+                if (obj.variables.timeSpentAnswering != null) timeField = 'timeSpentAnswering';
+                else if (obj.variables.timeSpentMarking != null) timeField = 'timeSpentMarking';
+            }
+
+            if (boostActive && obj.variables[timeField] != null) {
+                const isQuestion = isQuestionAnswerOp(opName, qStr);
+                const hasManual = queuedSeconds !== null;
+                if (!hasManual && !isQuestion && !KNOWN_LESSON_OPS.has(opName)) {
+                    return;
+                }
+
+                const rawVal = obj.variables[timeField];
+                const total = parseDurationToSeconds(rawVal);
                 if (total === null) return;
-                const before = obj.variables.timeSpent;
 
                 let extra = 0;
                 let isManual = false;
 
-                if (queuedSeconds !== null) {
+                if (hasManual) {
                     isManual = true;
                     if (settings.manualTimeStacksWithAuto && settings.timeBoostEnabled) {
                         const autoExtra = pickExtraSeconds();
@@ -2006,51 +2232,46 @@
                     return;
                 }
 
-                obj.variables.timeSpent = toIso(total + extra);
-                accumulatedExtraSeconds  += extra;
-                accumulatedQuestionCount += 1;
-                stats.seen++;
-                stats.boosted++;
-                if (isManual) {
-                    stats.manualBoosted = (stats.manualBoosted || 0) + 1;
-                    manualResetNeeded = true;
-                }
-                changed = true;
+                if (extra > 0) {
+                    const newTotal = total + extra;
+                    if (typeof rawVal === 'string' && (rawVal.startsWith('P') || rawVal.startsWith('p'))) {
+                        obj.variables[timeField] = toIso(newTotal);
+                    } else if (typeof rawVal === 'number') {
+                        obj.variables[timeField] = round3(newTotal);
+                    } else {
+                        obj.variables[timeField] = String(round3(newTotal));
+                    }
 
-                if (isManual) {
-                    LOG(`[${source}] ${QUIZ_OP} (manual time): ${before} (+${formatSeconds(queuedSeconds)}${settings.manualTimeStacksWithAuto && settings.timeBoostEnabled ? ' + auto' : ''}) → ${obj.variables.timeSpent} ` +
-                        `(accumulated ${accumulatedExtraSeconds}s / ${accumulatedQuestionCount} q)`);
-                    nativeConsole.log(
-                        '[UpLearn timeSpent] original=' + before +
-                        ' (+' + formatSeconds(extra) + ')' +
-                        ' → ' + obj.variables.timeSpent
-                    );
-                } else {
-                    LOG(`[${source}] ${QUIZ_OP}: ${before} → ${obj.variables.timeSpent} ` +
-                        `(+${extra}s, accumulated ${accumulatedExtraSeconds}s / ${accumulatedQuestionCount} q)`);
-                    VLOG('boost roll', {
-                        rolled: extra,
-                        range: `[${settings.extraSecondsMin}–${settings.extraSecondsMax}]`,
-                        newAccumulated: accumulatedExtraSeconds,
-                        questionCount: accumulatedQuestionCount,
-                    });
+                    accumulatedExtraSeconds += extra;
+                    accumulatedQuestionCount += 1;
+                    bumpStat('seen');
+                    bumpStat('boosted');
+                    if (isManual) {
+                        bumpStat('manualBoosted');
+                        manualResetNeeded = true;
+                    }
+                    notifyStatsChange();
+                    changed = true;
+
+                    const displayOp = opName || 'Question';
+                    if (isManual) {
+                        LOG(`[${source}] ${displayOp} (manual time): ${rawVal} (+${formatSeconds(queuedSeconds)}${settings.manualTimeStacksWithAuto && settings.timeBoostEnabled ? ' + auto' : ''}) → ${obj.variables[timeField]} ` +
+                            `(accumulated ${accumulatedExtraSeconds}s / ${accumulatedQuestionCount} q)`);
+                        nativeConsole.log(
+                            `[UpLearn timeSpent] ${displayOp} original=${rawVal} (+${formatSeconds(extra)}) → ${obj.variables[timeField]}`
+                        );
+                    } else {
+                        LOG(`[${source}] ${displayOp}: ${rawVal} → ${obj.variables[timeField]} ` +
+                            `(+${extra}s, accumulated ${accumulatedExtraSeconds}s / ${accumulatedQuestionCount} q)`);
+                        VLOG('boost roll', {
+                            opName: displayOp,
+                            rolled: extra,
+                            range: `[${settings.extraSecondsMin}–${settings.extraSecondsMax}]`,
+                            newAccumulated: accumulatedExtraSeconds,
+                            questionCount: accumulatedQuestionCount,
+                        });
+                    }
                 }
-            }
-            else if (boostActive && opName === GROUP_OP && typeof obj.variables.timeSpent === 'string') {
-                if (!settings.timeBoostEnabled && accumulatedExtraSeconds === 0) return;
-                const total = parseDurationToSeconds(obj.variables.timeSpent);
-                if (total === null) return;
-                const before = obj.variables.timeSpent;
-                const bonus  = accumulatedExtraSeconds;
-                const count  = accumulatedQuestionCount;
-                obj.variables.timeSpent = toIso(total + bonus);
-                stats.groupExtra += bonus;
-                changed = true;
-                LOG(`[${source}] ${GROUP_OP}: ${before} → ${obj.variables.timeSpent} ` +
-                    `(+${bonus}s from ${count} question(s))`);
-                VLOG('group bonus applied; per-question accumulator reset', { bonus, count });
-                accumulatedExtraSeconds  = 0;
-                accumulatedQuestionCount = 0;
             }
         };
 
@@ -2109,12 +2330,12 @@
                 if (anyMatch) {
                     // ---- Telemetry block ----
                     if (isServiceMatchBlocked(anyMatch)) {
-                        stats.blocked++;
+                        bumpStat('blocked');
                         const isJitsu = anyMatch.key === 'jitsu';
 
                         const doBlock = (capturedBody) => {
                             if (isJitsu) {
-                                stats.jitsuPackets++;
+                                bumpStat('jitsuPackets');
                                 reportJitsuPacket('fetch · BLOCKED', url, capturedBody);
                             } else {
                                 reportBlock('fetch', url, { method, body: capturedBody });
@@ -2139,7 +2360,7 @@
 
                     // ---- Jitsu allowed: log the packet, then pass through ----
                     if (anyMatch.key === 'jitsu') {
-                        stats.jitsuPackets++;
+                        bumpStat('jitsuPackets');
                         const doLogAndPass = (capturedBody) => {
                             reportJitsuPacket('fetch', url, capturedBody);
                             return origFetch.call(self, input, init);
@@ -2162,7 +2383,7 @@
                 } else {
                     targetApi = isTargetApi(url);
                     if (method === 'POST' && targetApi) {
-                        stats.apiPosts++;
+                        bumpStat('apiPosts');
                         let body = init && typeof init.body === 'string' ? init.body : null;
 
                         if (body == null && typeof Request !== 'undefined' && input instanceof Request) {
@@ -2172,7 +2393,7 @@
                                 return input.clone().text().then((text) => {
                                     if (settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(text)) {
                                         reportLogImproperUse('fetch · Request body', url, text);
-                                        stats.blocked++;
+                                        bumpStat('blocked');
                                         return logImproperUseSyntheticResponse();
                                     }
                                     const { body: newBody, changed } = maybeBumpTimeSpent(text, 'fetch-Req');
@@ -2189,7 +2410,7 @@
 
                         if (body != null && settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(body)) {
                             reportLogImproperUse('fetch', url, body);
-                            stats.blocked++;
+                            bumpStat('blocked');
                             return Promise.resolve(logImproperUseSyntheticResponse());
                         }
 
@@ -2265,19 +2486,19 @@
                             }
                         } catch {}
                         if (anyMatch.key === 'jitsu') {
-                            stats.jitsuPackets++;
+                            bumpStat('jitsuPackets');
                             reportJitsuPacket('XHR · BLOCKED', url, bodyStr);
                         } else {
                             reportBlock('XHR', url, { method, body: bodyStr });
                         }
-                        stats.blocked++;
+                        bumpStat('blocked');
                         mockBlockedXHR(this, '{}', () => ({}));
                         return;
                     }
 
                     // ---- Jitsu allowed: log packet, then pass through ----
                     if (anyMatch.key === 'jitsu') {
-                        stats.jitsuPackets++;
+                        bumpStat('jitsuPackets');
                         let bodyStr = null;
                         try {
                             if (typeof body === 'string') bodyStr = body;
@@ -2288,12 +2509,12 @@
                         reportAllow('XHR', url, `service "${anyMatch.label}" disabled in settings`);
                     }
                 } else if (method === 'POST' && isTargetApi(url)) {
-                    stats.apiPosts++;
+                    bumpStat('apiPosts');
 
                     if (settings.blockLogImproperUse && bodyLooksLikeLogImproperUse(body)) {
                         reportLogImproperUse('XHR', url,
                             typeof body === 'string' ? body : '(non-string body)');
-                        stats.blocked++;
+                        bumpStat('blocked');
                         mockBlockedXHR(this, LOG_IMPROPER_PAYLOAD, () => ({ data: { logImproperUse: true } }));
                         return;
                     }
@@ -2338,17 +2559,17 @@
                             else if (data != null) bodyStr = `(${typeof data} body)`;
                         } catch {}
                         if (anyMatch.key === 'jitsu') {
-                            stats.jitsuPackets++;
+                            bumpStat('jitsuPackets');
                             reportJitsuPacket('sendBeacon · BLOCKED', String(url), bodyStr);
                         } else {
                             reportBlock('sendBeacon', String(url), { body: bodyStr });
                         }
-                        stats.blocked++;
+                        bumpStat('blocked');
                         return true;
                     }
 
                     if (anyMatch.key === 'jitsu') {
-                        stats.jitsuPackets++;
+                        bumpStat('jitsuPackets');
                         let bodyStr = null;
                         try {
                             if (typeof data === 'string') bodyStr = data;
@@ -2551,11 +2772,6 @@
         });
     });
 
-    setInterval(() => {
-        patchVisibilityProps();
-        installHasFocusPatch();
-    }, 5000);
-
     // ============================================================
     // AUTO FULLSCREEN BLOCKER
     // ============================================================
@@ -2571,7 +2787,7 @@
             const orig = proto[name];
             const wrapped = function () {
                 if (settings.disableAutoFullscreen) {
-                    stats.fullscreenBlocked++;
+                    bumpStat('fullscreenBlocked');
                     reportBlock('Fullscreen request', '(browser API)', {
                         element: this.tagName ? this.tagName.toLowerCase() : String(this),
                         method: name,
@@ -2689,12 +2905,12 @@
     ];
 
     const QUICK_COLOR_SWATCHES = [
-        { name: 'Emerald', hex: '#16a34a' },
-        { name: 'Blue', hex: '#006fee' },
-        { name: 'Purple', hex: '#7828c8' },
-        { name: 'Cyan', hex: '#06b6d4' },
-        { name: 'Amber', hex: '#f5a524' },
-        { name: 'Rose', hex: '#f43f5e' },
+        { name: 'Apple Blue',   hex: '#007aff' },
+        { name: 'Apple Green',  hex: '#34c759' },
+        { name: 'Apple Indigo', hex: '#5856d6' },
+        { name: 'Apple Cyan',   hex: '#32ade6' },
+        { name: 'Apple Orange', hex: '#ff9500' },
+        { name: 'Apple Red',    hex: '#ff3b30' },
     ];
 
     function ensureUIHost() {
@@ -2702,10 +2918,28 @@
             return uiShadowRoot;
         }
 
+        try {
+            if (document.documentElement) document.documentElement.setAttribute('data-glisse-backdrop', '');
+            if (document.body) document.body.setAttribute('data-glisse-backdrop', '');
+        } catch {}
+
+        let pageBackdrop = document.getElementById('__ul-page-backdrop');
+        if (!pageBackdrop) {
+            try {
+                pageBackdrop = document.createElement('div');
+                pageBackdrop.id = '__ul-page-backdrop';
+                pageBackdrop.setAttribute('data-glisse-backdrop', '');
+                pageBackdrop.setAttribute('aria-hidden', 'true');
+                pageBackdrop.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:0;opacity:0.001;';
+                (document.body || document.documentElement).appendChild(pageBackdrop);
+            } catch {}
+        }
+
         let host = document.getElementById('__ul-heroui-host');
         if (!host) {
             host = document.createElement('div');
             host.id = '__ul-heroui-host';
+            host.setAttribute('data-glisse-backdrop', '');
             host.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483645;';
             (document.body || document.documentElement).appendChild(host);
         }
@@ -2730,6 +2964,7 @@
             container = document.createElement('div');
             container.id = '__ul-root';
             container.className = 'heroui-root';
+            container.setAttribute('data-glisse-backdrop', '');
             uiShadowRoot.appendChild(container);
         }
         uiContainerEl = container;
@@ -2738,390 +2973,1113 @@
         return uiShadowRoot;
     }
 
+    let cachedHeroUIStyles = null;
     function getHeroUIStyles() {
-        return `
-            /* HeroUI v3 CSS Architecture & OKLCH Theming */
+        if (cachedHeroUIStyles !== null) return cachedHeroUIStyles;
+        return (cachedHeroUIStyles = `
+:where(:root, [data-theme="light"], .heroui-root[data-theme="light"]) {
+  --lg-foreground: #1c1c1e;
+  --lg-muted: #525257;
+  --lg-glass: rgba(255, 255, 255, 0.65);
+  --lg-glass-active: rgba(236, 236, 240, 0.88);
+  --lg-edge: rgba(0, 0, 0, 0.08);
+  --lg-drop: rgba(0, 0, 0, 0.06);
+  --lg-selection: rgba(0, 0, 0, 0.1);
+  --lg-lens: rgba(255, 255, 255, 0.3);
+  --lg-surface: rgba(250, 250, 252, 0.90);
+  --lg-surface-edge: rgba(0, 0, 0, 0.09);
+  --lg-shadow: rgba(25, 25, 35, 0.14);
+  --lg-highlight: rgba(60, 60, 67, 0.09);
+  --lg-separator: rgba(60, 60, 67, 0.18);
+  --lg-destructive: #ff383c;
+  --lg-track: rgba(59, 59, 66, 0.3);
+  --lg-rail: rgba(0, 0, 0, 0.1);
+  --lg-on: #34c759;
+  --lg-fill: #0088ff;
+  --lg-ring: rgba(0, 0, 0, 0.4);
+  --lg-ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --lg-blur: 1px;
+  --lg-bezel: 8px;
+  --lg-thickness: 16px;
+  --lg-zoom: 1.02;
+  --lg-rim-saturation: 1.6;
+  --lg-refraction: 1.05;
+  --lg-row-tint: rgba(0, 0, 0, 0.035);
+  --lg-card-tint: rgba(0, 0, 0, 0.02);
+  --lg-dialog-tint: rgba(240, 240, 246, 0.92);
+  --lg-pill-tint: rgba(240, 240, 245, 0.82);
+}
+
+:where([data-theme="dark"], .heroui-root[data-theme="dark"]) {
+  --lg-foreground: #ffffff;
+  --lg-muted: #b8b8c2;
+  --lg-glass: rgba(40, 40, 40, 0.65);
+  --lg-glass-active: rgba(70, 70, 70, 0.65);
+  --lg-edge: rgba(255, 255, 255, 0.09);
+  --lg-drop: transparent;
+  --lg-selection: rgba(255, 255, 255, 0.15);
+  --lg-lens: rgba(255, 255, 255, 0.06);
+  --lg-surface: rgba(18, 18, 22, 0.92);
+  --lg-surface-edge: rgba(255, 255, 255, 0.14);
+  --lg-shadow: rgba(0, 0, 0, 0.42);
+  --lg-highlight: rgba(235, 235, 245, 0.14);
+  --lg-separator: rgba(235, 235, 245, 0.20);
+  --lg-destructive: #ff4245;
+  --lg-track: rgba(235, 235, 245, 0.3);
+  --lg-rail: rgba(255, 255, 255, 0.1);
+  --lg-on: #30d158;
+  --lg-fill: #0091ff;
+  --lg-ring: rgba(255, 255, 255, 0.5);
+  --lg-blur: 1px;
+  --lg-bezel: 8px;
+  --lg-thickness: 16px;
+  --lg-zoom: 1.02;
+  --lg-rim-saturation: 1.6;
+  --lg-refraction: 1.05;
+  --lg-row-tint: rgba(255, 255, 255, 0.045);
+  --lg-card-tint: rgba(255, 255, 255, 0.025);
+  --lg-dialog-tint: rgba(14, 14, 18, 0.88);
+  --lg-pill-tint: rgba(18, 18, 22, 0.72);
+}
+
+@media (prefers-color-scheme: dark) {
+  :where(:root:not([data-theme="light"]), .heroui-root:not([data-theme="light"])) {
+    --lg-foreground: #ffffff;
+    --lg-muted: #b8b8c2;
+    --lg-glass: rgba(40, 40, 40, 0.65);
+    --lg-glass-active: rgba(70, 70, 70, 0.65);
+    --lg-edge: rgba(255, 255, 255, 0.09);
+    --lg-drop: transparent;
+    --lg-selection: rgba(255, 255, 255, 0.15);
+    --lg-lens: rgba(255, 255, 255, 0.06);
+    --lg-surface: rgba(18, 18, 22, 0.92);
+    --lg-surface-edge: rgba(255, 255, 255, 0.14);
+    --lg-shadow: rgba(0, 0, 0, 0.42);
+    --lg-highlight: rgba(235, 235, 245, 0.14);
+    --lg-separator: rgba(235, 235, 245, 0.20);
+    --lg-destructive: #ff4245;
+    --lg-track: rgba(235, 235, 245, 0.3);
+    --lg-rail: rgba(255, 255, 255, 0.1);
+    --lg-on: #30d158;
+    --lg-fill: #0091ff;
+    --lg-ring: rgba(255, 255, 255, 0.5);
+    --lg-blur: 1px;
+    --lg-bezel: 8px;
+    --lg-thickness: 16px;
+    --lg-zoom: 1.02;
+    --lg-rim-saturation: 1.6;
+    --lg-refraction: 1.05;
+    --lg-row-tint: rgba(255, 255, 255, 0.045);
+    --lg-card-tint: rgba(255, 255, 255, 0.025);
+    --lg-dialog-tint: rgba(14, 14, 18, 0.88);
+    --lg-pill-tint: rgba(18, 18, 22, 0.72);
+  }
+}
+
+/* Glass */
+
+.lg-glass {
+  position: relative;
+  background-color: var(--lg-glass);
+  background-image: var(--lg-rim, none);
+  background-size: 100% 100%;
+  --lg-blur: 1px;
+  --lg-bezel: 8px;
+  --lg-thickness: 16px;
+  --lg-zoom: 1.02;
+  --lg-rim-saturation: 1.6;
+  -webkit-backdrop-filter: blur(var(--lg-blur, 0px)) var(--lg-filter, saturate(1.8));
+  backdrop-filter: blur(var(--lg-blur, 0px)) var(--lg-filter, saturate(1.8));
+  box-shadow:
+    inset 0 0 0 0.5px var(--lg-edge),
+    0 1px 3px var(--lg-drop);
+}
+
+.lg-glass::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(
+    circle 240px at var(--lg-x, 50%) var(--lg-y, 50%),
+    rgb(255 255 255 / 0.035),
+    rgb(255 255 255 / 0.025) 50%,
+    transparent
+  );
+  opacity: 0;
+  transition: opacity 220ms ease-in-out;
+}
+
+.lg-glass[data-pressed]::after {
+  opacity: 1;
+  transition-duration: 0s;
+}
+
+/* Glass refracting a copy of its backdrop, where the live one can't be filtered */
+
+.lg-glass[data-copy] {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.lg-glass-copy {
+  position: absolute;
+  top: 0;
+  left: 0;
+  margin: 0;
+  overflow: hidden;
+  transform-origin: 0 0;
+  pointer-events: none;
+}
+
+.lg-glass-copy > div {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+}
+
+/* Button */
+
+.lg-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 20px;
+  color: var(--lg-foreground);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  /* A long press keeps pressing, as on iOS, rather than selecting the label. */
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: background-color 200ms ease;
+}
+
+.lg-button[data-icon] {
+  padding-left: 12px;
+}
+
+.lg-button[data-icon="only"] {
+  width: 40px;
+  padding: 0;
+}
+
+.lg-button > svg {
+  flex: none;
+  width: 20px;
+  height: 20px;
+}
+
+/* Lights up at once when pressed, as on iOS, and fades on release. */
+.lg-button:is(:active, [data-pressed]) {
+  background-color: var(--lg-glass-active);
+  transition-duration: 0s;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .lg-button:hover {
+    background-color: var(--lg-glass-active);
+  }
+}
+
+.lg-button:disabled {
+  background-color: var(--lg-glass);
+  opacity: 0.35;
+  cursor: default;
+}
+
+.lg-button[data-destructive]:not([data-tint]) {
+  --lg-tint: var(--lg-destructive);
+}
+
+.lg-button:is([data-tint], [data-destructive]) {
+  color: var(--lg-tint);
+}
+
+.lg-button[data-variant="filled"] {
+  --lg-button-fill: var(--lg-tint, var(--lg-fill));
+  color: #fff;
+}
+
+.lg-button[data-variant="filled"],
+.lg-button[data-variant="filled"]:disabled {
+  background-color: var(--lg-button-fill);
+}
+
+.lg-button[data-variant="filled"]:is(:active, [data-pressed]) {
+  background-color: color-mix(in srgb, var(--lg-button-fill) 85%, #000);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .lg-button[data-variant="filled"]:hover {
+    background-color: color-mix(in srgb, var(--lg-button-fill) 88%, #fff);
+  }
+
+  .lg-button[data-variant="filled"]:hover:is(:active, [data-pressed]) {
+    background-color: color-mix(in srgb, var(--lg-button-fill) 85%, #000);
+  }
+}
+
+.lg-button:focus-visible,
+.lg-tab:focus-visible,
+.lg-switch:focus-visible,
+.lg-menu-item:focus-visible {
+  outline: 2px solid var(--lg-ring);
+  outline-offset: 2px;
+}
+
+/* Tab bar */
+
+.lg-tab-bar {
+  --lg-tab-width: 84px;
+  --lg-tab-height: 32px;
+  --lg-lens-grow-x: 27px;
+  --lg-lens-grow-y: 20px;
+  position: relative;
+  display: inline-flex;
+  padding: 4px;
+  border-radius: calc(var(--lg-tab-height) / 2 + 4px);
+  touch-action: pan-y;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.lg-tab-bar-glass {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.lg-tab-bar-glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(
+    circle 260px at var(--lg-x, 20%) 50%,
+    rgb(255 255 255 / 0.09),
+    rgb(255 255 255 / 0.045) 60%,
+    transparent
+  );
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.lg-tab-bar[data-lifted] .lg-tab-bar-glass::before {
+  opacity: 1;
+  transition-duration: 120ms;
+}
+
+.lg-tab,
+.lg-tab-copy {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--lg-tab-width);
+  height: var(--lg-tab-height);
+  font: inherit;
+  font-size: 14px;
+}
+
+.lg-tab {
+  position: relative;
+  z-index: 1;
+  padding: 0;
+  border: 0;
+  border-radius: calc(var(--lg-tab-height) / 2);
+  color: var(--lg-muted);
+  background: none;
+  text-decoration: none;
+  cursor: pointer;
+  -webkit-touch-callout: none;
+  transition: color 200ms ease;
+}
+
+.lg-tab:focus-visible {
+  outline-offset: -2px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .lg-tab:hover {
+    color: var(--lg-foreground);
+  }
+}
+
+.lg-tab-lens,
+.lg-tab-tint {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: var(--lg-tab-width);
+  height: var(--lg-tab-height);
+  border-radius: calc(var(--lg-tab-height) / 2);
+  pointer-events: none;
+  transform: translateX(calc(var(--lg-tab-width) * var(--lg-index, 0)));
+  transition: opacity 140ms ease;
+  will-change: transform;
+}
+
+.lg-tab-tint {
+  z-index: 1;
+  overflow: hidden;
+  color: var(--lg-foreground);
+}
+
+.lg-tab-row {
+  display: flex;
+  height: 100%;
+  transform: translateX(calc(var(--lg-tab-width) * var(--lg-index, 0) * -1));
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.lg-tab-lens.lg-glass {
+  z-index: 2;
+  background-color: transparent;
+  background-image: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+  transition:
+    opacity 140ms ease,
+    background-color 140ms ease;
+}
+
+.lg-tab-bar[data-lifted] .lg-tab-lens.lg-glass {
+  background-color: var(--lg-lens);
+  transition-duration: 100ms;
+}
+
+.lg-tab-lens::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-selection);
+  transition: opacity 140ms ease;
+}
+
+.lg-tab-lens[data-pressed]::after {
+  opacity: 0.2;
+}
+
+.lg-tab-bar[data-lifted] .lg-tab-lens::before {
+  opacity: 0;
+  transition-duration: 100ms;
+}
+
+.lg-tab-bar[data-refracting] .lg-tab-lens.lg-glass {
+  background-image: var(--lg-rim, none);
+  -webkit-backdrop-filter: var(--lg-filter, none);
+  backdrop-filter: var(--lg-filter, none);
+}
+
+.lg-tab-bar[data-hidden] :is(.lg-tab-lens, .lg-tab-tint),
+.lg-tab-bar:not([data-ready]):not(:has([data-selected])) :is(.lg-tab-lens, .lg-tab-tint) {
+  opacity: 0;
+}
+
+/* Input */
+
+.lg-input {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 360px;
+  height: 40px;
+  padding: 0 14px;
+  border-radius: 20px;
+  color: var(--lg-foreground);
+  transition: background-color 200ms ease;
+}
+
+.lg-input:focus-within {
+  background-color: var(--lg-glass-active);
+}
+
+.lg-input input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  color: inherit;
+  background: none;
+  font: inherit;
+  font-size: 14px;
+}
+
+.lg-input input::placeholder {
+  color: var(--lg-muted);
+}
+
+.lg-input input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.lg-input-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--lg-muted);
+}
+
+.lg-input-icon {
+  display: grid;
+  place-items: center;
+}
+
+.lg-input-icon > svg {
+  width: 100%;
+  height: 100%;
+}
+
+.lg-input-clear {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  margin-right: -8px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: var(--lg-muted);
+  background: none;
+  cursor: pointer;
+}
+
+.lg-input-clear svg {
+  width: 14px;
+  height: 14px;
+}
+
+.lg-input:has(input:disabled) {
+  opacity: 0.35;
+}
+
+/* Switch and slider thumbs */
+
+.lg-switch-thumb,
+.lg-slider-thumb {
+  position: absolute;
+  border-radius: 999px;
+  pointer-events: none;
+  -webkit-backdrop-filter: blur(2px) brightness(1.15) saturate(1.5);
+  backdrop-filter: blur(2px) brightness(1.15) saturate(1.5);
+  box-shadow:
+    0 6px 24px rgb(0 0 0 / 0.2),
+    inset 0 0 0 1.5px rgb(255 255 255 / 0.5),
+    inset 0 2px 1px rgb(255 255 255 / 0.45),
+    inset 2px 7px 24px rgb(0 0 0 / 0.09),
+    inset -2px -7px 24px rgb(255 255 255 / 0.16);
+}
+
+.lg-thumb-face {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: #fff;
+}
+
+/* Switch */
+
+.lg-switch {
+  --lg-scale: 0.375;
+  position: relative;
+  flex: none;
+  width: calc(160px * var(--lg-scale));
+  height: calc(67px * var(--lg-scale));
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--lg-track);
+  cursor: pointer;
+  touch-action: pan-y;
+  -webkit-tap-highlight-color: transparent;
+}
+
+
+.lg-switch::before {
+  content: "";
+  position: absolute;
+  inset: min(0px, calc((67px * var(--lg-scale) - 44px) / 2)) -8px;
+}
+
+.lg-switch-fill {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-on);
+  opacity: 0;
+}
+
+.lg-switch-thumb {
+  top: 50%;
+  left: calc(-21.95px * var(--lg-scale));
+  width: calc(146px * var(--lg-scale));
+  height: calc(92px * var(--lg-scale));
+  transform: translate(0, -50%) scale(0.65);
+}
+
+.lg-switch[aria-checked="true"] .lg-switch-fill {
+  opacity: 1;
+}
+
+.lg-switch[aria-checked="true"] .lg-switch-thumb {
+  transform: translate(calc(57.9px * var(--lg-scale)), -50%) scale(0.65);
+}
+
+.lg-switch:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* Slider */
+
+.lg-slider {
+  position: relative;
+  width: 100%;
+  height: 40px;
+}
+
+.lg-slider-track {
+  position: absolute;
+  inset: 17px 0 auto;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--lg-rail);
+  pointer-events: none;
+}
+
+.lg-slider-fill {
+  display: block;
+  height: 100%;
+  background: var(--lg-fill);
+  transform: scaleX(var(--lg-progress));
+  transform-origin: left;
+}
+
+.lg-slider-thumb {
+  top: 0;
+  left: calc((100% - 36px) * var(--lg-progress) - 12px);
+  width: 60px;
+  height: 40px;
+  scale: 0.6;
+}
+
+.lg-slider input {
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  height: 40px;
+  margin: 0;
+  background: transparent;
+  outline: none;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  touch-action: pan-y;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.lg-slider input::-webkit-slider-runnable-track {
+  height: 6px;
+  background: transparent;
+}
+
+/* The native thumb only takes the touch; the glass thumb is drawn beneath.
+   iOS shades the native one even without its appearance, so hide it. */
+.lg-slider input::-webkit-slider-thumb {
+  width: 36px;
+  height: 40px;
+  margin-top: -17px;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  opacity: 0;
+  /* A touch on the thumb drags it rather than scrolling the page; the rest of
+     the track still scrolls. Blocking touchmove instead would stop Safari's
+     own drag. */
+  touch-action: none;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.lg-slider input::-moz-range-track {
+  height: 6px;
+  background: transparent;
+}
+
+.lg-slider input::-moz-range-thumb {
+  width: 36px;
+  height: 40px;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  opacity: 0;
+}
+
+.lg-slider:has(input:focus-visible) .lg-slider-thumb {
+  outline: 2px solid var(--lg-ring);
+  outline-offset: 3px;
+}
+
+.lg-slider:has(input:disabled) {
+  opacity: 0.35;
+}
+
+.lg-slider input:disabled {
+  cursor: default;
+}
+
+/* Menu */
+
+.lg-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.lg-menu-card {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 10;
+  box-sizing: border-box;
+  width: 200px;
+  border-radius: 20px;
+  color: var(--lg-foreground);
+  font-size: 14px;
+  transform-origin: calc(100% - 20px) 20px;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.lg-menu-card[data-align="start"] {
+  right: auto;
+  left: 0;
+  transform-origin: 20px 20px;
+}
+
+.lg-menu-card[data-phase="leaving"] {
+  pointer-events: none;
+}
+
+.lg-menu-surface {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--lg-surface);
+  -webkit-backdrop-filter: blur(22px) saturate(1.9);
+  backdrop-filter: blur(22px) saturate(1.9);
+  box-shadow:
+    inset 0 0 0 0.5px var(--lg-surface-edge),
+    0 12px 40px var(--lg-shadow);
+  pointer-events: none;
+}
+
+.lg-menu-card[data-align="start"] .lg-menu-surface {
+  right: auto;
+  left: 0;
+}
+
+.lg-menu-glyph {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  pointer-events: none;
+}
+
+.lg-menu-card[data-align="start"] .lg-menu-glyph {
+  right: auto;
+  left: 0;
+}
+
+.lg-menu-glyph > svg {
+  width: 20px;
+  height: 20px;
+}
+
+.lg-menu-content {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
+}
+
+.lg-menu-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(135deg, rgb(255 255 255 / 0.11), rgb(255 255 255 / 0.025));
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+
+.lg-menu-card[data-pressed]::after {
+  opacity: 1;
+}
+
+.lg-menu-plate {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border-radius: 14px;
+  background: var(--lg-highlight);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform 100ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 80ms ease-out;
+}
+
+.lg-menu-item {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 14px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.lg-menu-item > svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+
+.lg-menu-item:focus-visible {
+  outline-offset: -2px;
+  background: var(--lg-highlight);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .lg-menu-item:hover:not(:disabled) {
+    background: var(--lg-highlight);
+  }
+}
+
+.lg-menu-card[data-scrubbing] .lg-menu-item {
+  background: transparent;
+  outline: none;
+}
+
+.lg-menu-item[data-destructive] {
+  color: var(--lg-destructive);
+}
+
+.lg-menu-item:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.lg-menu-separator {
+  flex: none;
+  margin: 7px 11px;
+  border-top: 0.5px solid var(--lg-separator);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lg-menu-plate {
+    transition: opacity 80ms ease-out;
+  }
+
+  .lg-menu-card {
+    animation: lg-menu-fade 100ms ease-out;
+  }
+}
+
+@keyframes lg-menu-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+
+            /* ============================================================
+               UpLearn Bypass Layout & App Styling (built on Glisse)
+               ============================================================ */
             :host, .heroui-root {
-                --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
-                --ease-out-quad: cubic-bezier(0.25, 0.46, 0.45, 0.94);
-                --ease-out-quart: cubic-bezier(0.165, 0.84, 0.44, 1);
-                --ease-out-fluid: cubic-bezier(0.16, 1, 0.3, 1);
-                --cursor-interactive: pointer;
-                --cursor-disabled: not-allowed;
-                --disabled-opacity: 0.5;
-                --focus: var(--accent);
-                --radius-sm: 6px;
-                --radius-md: 9px;
-                --radius-lg: 13px;
-                --radius-xl: 18px;
-                --radius-2xl: 22px;
-                --radius-3xl: 26px;
-                --radius-full: 9999px;
-                --field-radius: 11px;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "SF Pro", -system-ui, "Helvetica Neue", Helvetica, Arial, sans-serif;
                 font-feature-settings: "cv02", "cv03", "cv04", "cv11";
                 -webkit-font-smoothing: antialiased;
+                -moz-osx-font-smoothing: grayscale;
+                text-rendering: optimizeLegibility;
                 box-sizing: border-box;
+                color: var(--lg-foreground);
+                --accent: var(--lg-fill);
             }
 
             *, *::before, *::after {
                 box-sizing: inherit;
             }
 
-            .heroui-root[data-theme="dark"] {
-                --background: oklch(12% 0.005 285.823);
-                --foreground: oklch(0.985 0 0);
-                --surface: oklch(18% 0.006 285.89);
-                --surface-foreground: var(--foreground);
-                --surface-secondary: oklch(21.5% 0.006 286.14);
-                --surface-secondary-foreground: var(--foreground);
-                --surface-tertiary: oklch(25.5% 0.006 286.14);
-                --overlay: oklch(16.5% 0.006 285.89);
-                --overlay-foreground: var(--foreground);
-                --muted: oklch(72% 0.015 286.067);
-                --muted-foreground: oklch(56% 0.015 286);
-                --default: oklch(27.5% 0.006 286.033);
-                --default-foreground: oklch(0.98 0 0);
-                --default-hover: oklch(33% 0.008 286);
-                --default-soft: oklch(27.5% 0.006 286.033 / 0.55);
-                --accent: #16a34a;
-                --accent-hover: color-mix(in srgb, var(--accent) 84%, white);
-                --accent-foreground: #ffffff;
-                --accent-soft: color-mix(in srgb, var(--accent) 18%, transparent);
-                --accent-soft-foreground: var(--accent);
-                --success: #22c55e;
-                --success-foreground: #ffffff;
-                --success-soft: rgba(34, 197, 94, 0.16);
-                --warning: #f59e0b;
-                --warning-foreground: #111827;
-                --warning-soft: rgba(245, 158, 11, 0.16);
-                --danger: #ef4444;
-                --danger-hover: #dc2626;
-                --danger-foreground: #ffffff;
-                --danger-soft: rgba(239, 68, 68, 0.16);
-                --danger-soft-foreground: #ef4444;
-                --border: oklch(28% 0.006 286.033);
-                --border-hover: oklch(38% 0.008 286.033);
-                --separator: oklch(24% 0.006 286.033);
-                --field-background: oklch(14% 0.005 285.89);
-                --field-foreground: var(--foreground);
-                --field-border: oklch(30% 0.006 286.033);
-                --backdrop: rgba(0, 0, 0, 0.68);
-                --shadow-overlay: 0 24px 70px -12px rgba(0, 0, 0, 0.85), 0 0 0 1px rgba(255, 255, 255, 0.08);
-                --shadow-surface: 0 4px 18px -2px rgba(0, 0, 0, 0.45);
-                --shadow-pill: 0 10px 32px -4px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.12);
-                color-scheme: dark;
+            /* Custom Glisse Scrollbars */
+            ::-webkit-scrollbar {
+                width: 6px;
+                height: 6px;
             }
-
-            .heroui-root[data-theme="light"] {
-                --background: oklch(0.985 0 0);
-                --foreground: oklch(0.18 0.005 285.89);
-                --surface: #ffffff;
-                --surface-foreground: var(--foreground);
-                --surface-secondary: #f8fafc;
-                --surface-secondary-foreground: var(--foreground);
-                --surface-tertiary: #f1f5f9;
-                --overlay: #ffffff;
-                --overlay-foreground: var(--foreground);
-                --muted: oklch(50% 0.015 286);
-                --muted-foreground: oklch(65% 0.015 286);
-                --default: #e2e8f0;
-                --default-foreground: #0f172a;
-                --default-hover: #cbd5e1;
-                --default-soft: rgba(226, 232, 240, 0.6);
-                --accent: #16a34a;
-                --accent-hover: color-mix(in srgb, var(--accent) 84%, black);
-                --accent-foreground: #ffffff;
-                --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
-                --accent-soft-foreground: var(--accent);
-                --success: #16a34a;
-                --success-foreground: #ffffff;
-                --success-soft: rgba(22, 163, 74, 0.14);
-                --warning: #d97706;
-                --warning-foreground: #ffffff;
-                --warning-soft: rgba(217, 119, 6, 0.14);
-                --danger: #dc2626;
-                --danger-hover: #b91c1c;
-                --danger-foreground: #ffffff;
-                --danger-soft: rgba(220, 38, 38, 0.12);
-                --danger-soft-foreground: #dc2626;
-                --border: #e2e8f0;
-                --border-hover: #cbd5e1;
-                --separator: #e2e8f0;
-                --field-background: #ffffff;
-                --field-foreground: var(--foreground);
-                --field-border: #cbd5e1;
-                --backdrop: rgba(15, 23, 42, 0.52);
-                --shadow-overlay: 0 24px 64px -12px rgba(15, 23, 42, 0.22), 0 0 0 1px rgba(15, 23, 42, 0.08);
-                --shadow-surface: 0 4px 16px -2px rgba(15, 23, 42, 0.06);
-                --shadow-pill: 0 10px 32px -4px rgba(15, 23, 42, 0.16), 0 0 0 1px rgba(15, 23, 42, 0.08);
-                color-scheme: light;
-            }
-
-            /* Floating Status Pill Component (Shape-Shifting) */
-            .heroui-pill {
-                position: fixed;
-                z-index: 2147483646;
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                padding: 6px 8px 6px 14px;
-                border-radius: var(--radius-full);
-                background: var(--surface);
-                color: var(--foreground);
-                border: 1px solid var(--border);
-                box-shadow: var(--shadow-pill);
-                transform: translateZ(0);
-                user-select: none;
-                font-size: 13px;
-                font-weight: 500;
-                line-height: 1.3;
-                pointer-events: auto;
-                cursor: pointer;
-                transition: transform 200ms var(--ease-out-fluid),
-                            box-shadow 200ms var(--ease-out),
-                            opacity 150ms ease,
-                            width 280ms cubic-bezier(0.16, 1, 0.3, 1),
-                            height 280ms cubic-bezier(0.16, 1, 0.3, 1),
-                            padding 280ms cubic-bezier(0.16, 1, 0.3, 1),
-                            border-radius 280ms cubic-bezier(0.16, 1, 0.3, 1);
-            }
-            .heroui-pill:hover {
-                transform: translateY(-2px) scale(1.03);
-                box-shadow: 0 14px 40px -4px rgba(0, 0, 0, 0.45), 0 0 0 1px var(--border-hover);
-            }
-            .heroui-pill:active {
-                transform: scale(0.96);
-            }
-
-            /* Minimal Mode: Compact circular button (Default) */
-            .heroui-pill--minimal {
-                width: 44px;
-                height: 44px;
-                padding: 0;
-                border-radius: 50%;
-                justify-content: center;
-                gap: 0;
-            }
-            .heroui-pill--minimal .heroui-pill__main {
-                display: none !important;
-            }
-            .heroui-pill--minimal .heroui-pill__gear {
-                width: 100%;
-                height: 100%;
-                border-radius: 50%;
-            }
-
-            .heroui-pill__main {
-                display: flex;
-                align-items: center;
-                gap: 9px;
-                cursor: pointer;
-            }
-            .heroui-pill__badge {
-                display: inline-flex;
-                align-items: center;
-                gap: 6px;
-                padding: 4px 10px;
-                border-radius: var(--radius-full);
-                font-weight: 600;
-                font-size: 11.5px;
-                letter-spacing: 0.2px;
-                transition: background 150ms, color 150ms;
-            }
-            .heroui-pill__dot {
-                width: 6.5px;
-                height: 6.5px;
-                border-radius: 50%;
-                background: currentColor;
-                box-shadow: 0 0 8px currentColor;
-                animation: heroui-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-            }
-            @keyframes heroui-pulse {
-                0%, 100% { opacity: 1; transform: scale(1); }
-                50% { opacity: 0.35; transform: scale(0.8); }
-            }
-            .heroui-pill__stats {
-                font-size: 11.5px;
-                color: var(--muted);
-                font-weight: 500;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }
-            .heroui-pill__stat-item {
-                display: inline-flex;
-                align-items: center;
-                gap: 4px;
-            }
-
-            /* Crisp Settings Gear Buttons */
-            .heroui-pill__gear {
-                position: relative;
+            ::-webkit-scrollbar-track {
                 background: transparent;
-                border: none;
-                color: var(--muted);
-                cursor: pointer;
-                border-radius: var(--radius-full);
-                width: 32px;
-                height: 32px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                padding: 0;
-                transition: background-color 150ms, color 150ms, transform 240ms var(--ease-out-fluid);
             }
-            .heroui-pill__gear:hover {
-                background: var(--default-soft);
-                color: var(--foreground);
-                transform: rotate(60deg);
+            ::-webkit-scrollbar-thumb {
+                background: var(--lg-separator);
+                border-radius: 9999px;
             }
-            .heroui-pill__gear:active {
-                transform: scale(0.92);
-            }
-            .heroui-pill__indicator-dot {
-                position: absolute;
-                top: 4px;
-                right: 4px;
-                width: 8px;
-                height: 8px;
-                border-radius: 50%;
-                background: var(--accent);
-                box-shadow: 0 0 8px var(--accent);
-                display: none;
-                animation: heroui-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+            ::-webkit-scrollbar-thumb:hover {
+                background: var(--lg-muted);
             }
 
-            /* Modal Overlay & Fluid Open/Close Animations */
+            /* Glisse Modal Container & Window */
             .modal__backdrop {
                 position: fixed;
                 inset: 0;
                 z-index: 2147483647;
-                background: var(--backdrop);
+                background: rgba(0, 0, 0, 0.45);
+                -webkit-backdrop-filter: blur(16px);
+                backdrop-filter: blur(16px);
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                padding: 16px;
+                padding: 20px;
                 box-sizing: border-box;
                 pointer-events: auto;
-                animation: heroui-modal-fade-in 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
-                will-change: opacity;
-                transform: translateZ(0);
+                animation: lg-fade-in 180ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
             }
+
             .modal__backdrop--closing {
                 pointer-events: none !important;
-                animation: heroui-modal-fade-out 180ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
+                animation: lg-fade-out 160ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
             }
-            @keyframes heroui-modal-fade-in {
-                0% { opacity: 0; }
-                100% { opacity: 1; }
+
+            .modal__backdrop--draggable {
+                background: transparent !important;
+                backdrop-filter: none !important;
+                -webkit-backdrop-filter: none !important;
+                pointer-events: none !important;
             }
-            @keyframes heroui-modal-fade-out {
-                0% { opacity: 1; }
-                100% { opacity: 0; }
+
+            @keyframes lg-fade-in {
+                from { opacity: 0; }
+                to { opacity: 1; }
+            }
+            @keyframes lg-fade-out {
+                from { opacity: 1; }
+                to { opacity: 0; }
             }
 
             .modal__container {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                width: min(1340px, 92vw);
-                height: min(920px, 93vh);
+                width: min(940px, 95vw);
+                height: min(700px, 88vh);
+                min-height: 520px;
+            }
+
+            .modal__container--draggable {
+                pointer-events: none !important;
+                position: fixed !important;
+                inset: 0 !important;
+                width: 100vw !important;
+                height: 100vh !important;
+                max-width: none !important;
+                max-height: none !important;
+                display: block !important;
+                padding: 0 !important;
             }
 
             .modal__dialog {
                 width: 100%;
                 height: 100%;
-                max-height: 93vh;
-                background: var(--overlay);
-                color: var(--foreground);
-                border-radius: min(24px, var(--radius-3xl));
-                border: 1px solid var(--border);
-                box-shadow: var(--shadow-overlay);
+                border-radius: 24px;
+                color: var(--lg-foreground);
+                background-color: var(--lg-dialog-tint, rgba(14, 14, 18, 0.88)) !important;
+                -webkit-backdrop-filter: blur(36px) saturate(1.8) !important;
+                backdrop-filter: blur(36px) saturate(1.8) !important;
+                border: 0.5px solid var(--lg-surface-edge, rgba(255, 255, 255, 0.14));
+                box-shadow:
+                    inset 0 1px 1.5px 0 rgba(255, 255, 255, 0.20),
+                    inset 0 0 0 0.5px var(--lg-surface-edge, rgba(255, 255, 255, 0.14)),
+                    0 28px 72px rgba(0, 0, 0, 0.60),
+                    0 6px 24px rgba(0, 0, 0, 0.35) !important;
                 display: flex;
                 flex-direction: column;
                 overflow: hidden;
-                animation: heroui-modal-scale-in 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
-                will-change: transform, opacity;
-                transform: translateZ(0);
-            }
-            .modal__backdrop--closing .modal__dialog {
-                animation: heroui-modal-scale-out 180ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
-            }
-            @keyframes heroui-modal-scale-in {
-                0% {
-                    opacity: 0;
-                    transform: scale(0.96) translateY(10px);
-                }
-                100% {
-                    opacity: 1;
-                    transform: scale(1) translateY(0);
-                }
-            }
-            @keyframes heroui-modal-scale-out {
-                0% {
-                    opacity: 1;
-                    transform: scale(1) translateY(0);
-                }
-                100% {
-                    opacity: 0;
-                    transform: scale(0.97) translateY(6px);
-                }
+                animation: lg-scale-in 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
             }
 
-            /* Modal Header */
-            .modal__header {
-                display: flex;
-                flex-direction: column;
-                padding: 20px 28px 14px 28px;
-                background: var(--surface);
-                border-bottom: 1px solid var(--border);
-                flex-shrink: 0;
-                gap: 14px;
+            .modal__dialog--draggable {
+                pointer-events: auto !important;
+                position: absolute !important;
+                margin: 0 !important;
+                width: min(920px, 92vw);
+                height: min(680px, 86vh);
+                min-height: 480px;
+                box-sizing: border-box;
+                will-change: left, top;
+                transition: none !important;
             }
-            .modal__header-top {
+
+            :where([data-theme="light"], .heroui-root[data-theme="light"]) .modal__dialog {
+                background-color: var(--lg-dialog-tint, rgba(240, 240, 246, 0.92)) !important;
+                border-color: rgba(0, 0, 0, 0.12);
+                box-shadow:
+                    inset 0 1px 1.5px 0 rgba(255, 255, 255, 0.85),
+                    inset 0 0 0 0.5px rgba(255, 255, 255, 0.50),
+                    0 24px 64px rgba(20, 20, 30, 0.22),
+                    0 4px 16px rgba(20, 20, 30, 0.10) !important;
+            }
+
+            :where([data-theme="dark"], .heroui-root[data-theme="dark"]) .modal__dialog {
+                background-color: var(--lg-dialog-tint, rgba(14, 14, 18, 0.88)) !important;
+            }
+
+            .modal__dialog::before {
+                content: "";
+                position: absolute;
+                inset: 0;
+                border-radius: inherit;
+                pointer-events: none;
+                background: linear-gradient(
+                    135deg,
+                    rgba(255, 255, 255, 0.24) 0%,
+                    rgba(255, 255, 255, 0.08) 22%,
+                    rgba(255, 255, 255, 0.01) 50%,
+                    rgba(255, 255, 255, 0.06) 78%,
+                    rgba(255, 255, 255, 0.18) 100%
+                );
+                -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+                -webkit-mask-composite: xor;
+                mask-composite: exclude;
+                padding: 1px;
+                z-index: 2;
+            }
+
+            .modal__backdrop--closing .modal__dialog {
+                animation: lg-scale-out 160ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
+            }
+
+            @keyframes lg-scale-in {
+                from { opacity: 0; transform: scale(0.96) translateY(8px); }
+                to { opacity: 1; transform: scale(1) translateY(0); }
+            }
+            @keyframes lg-scale-out {
+                from { opacity: 1; transform: scale(1) translateY(0); }
+                to { opacity: 0; transform: scale(0.97) translateY(6px); }
+            }
+
+            .modal__header {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-            }
-            .modal__brand {
-                display: flex;
-                align-items: center;
-                gap: 14px;
-            }
-            .modal__icon {
-                width: 42px;
-                height: 42px;
-                border-radius: var(--radius-xl);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                background: var(--accent-soft);
-                color: var(--accent);
+                padding: 12px 18px;
+                border-bottom: 0.5px solid var(--lg-separator);
                 flex-shrink: 0;
-                box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.15);
+                gap: 16px;
+                position: relative;
+                z-index: 4;
             }
-            .modal__title-box {
+
+            .modal__header--draggable {
+                cursor: grab;
+                user-select: none;
+                -webkit-user-select: none;
+                touch-action: none;
+            }
+
+            .modal__header--draggable:active,
+            .modal__header--dragging {
+                cursor: grabbing !important;
+            }
+
+            .modal__header--draggable .modal__header-nav,
+            .modal__header--draggable .lg-tab-bar,
+            .modal__header--draggable .lg-button,
+            .modal__header--draggable button {
+                cursor: default;
+                pointer-events: auto;
+            }
+
+            .modal__brand {
                 display: flex;
                 align-items: center;
                 gap: 10px;
             }
+
+            .modal__icon {
+                width: 32px;
+                height: 32px;
+                border-radius: 10px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: color-mix(in srgb, var(--accent, var(--lg-fill)) 18%, transparent);
+                color: var(--accent, var(--lg-fill));
+                flex-shrink: 0;
+                box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--accent, var(--lg-fill)) 30%, transparent);
+            }
+
             .modal__heading {
                 margin: 0;
-                font-size: 17px;
-                font-weight: 700;
-                letter-spacing: -0.2px;
-                color: var(--foreground);
+                font-size: 15px;
+                font-weight: 600;
+                letter-spacing: -0.015em;
+                color: var(--lg-foreground);
+                white-space: nowrap;
             }
-            .modal__close-trigger {
-                color: var(--muted) !important;
-                border: none !important;
-                background: transparent !important;
-                flex-shrink: 0;
+
+            .modal__header-nav {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                flex: 1;
             }
-            .modal__close-trigger:hover {
-                background: var(--default-soft) !important;
-                color: var(--foreground) !important;
+
+            .modal__body {
+                position: relative;
+                padding: 16px 20px 20px 20px;
+                overflow: hidden;
+                flex: 1;
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+                z-index: 3;
             }
 
             .modal__footer {
@@ -3129,799 +4087,357 @@
                 align-items: center;
                 justify-content: flex-end;
                 gap: 10px;
-                padding: 14px 24px;
-                border-top: 1px solid var(--separator);
-                background: var(--surface);
-                border-bottom-left-radius: var(--radius-2xl);
-                border-bottom-right-radius: var(--radius-2xl);
+                padding: 12px 20px;
+                border-top: 0.5px solid var(--lg-separator);
+                background: transparent;
                 flex-shrink: 0;
             }
 
-            /* HeroUI Animated Tabs Component */
-            .tabs {
-                display: flex;
-                flex-direction: column;
-            }
-            .tabs__list-container {
-                display: flex;
-                width: 100%;
-            }
-            .tabs__list {
-                position: relative;
-                display: flex;
-                align-items: center;
-                gap: 4px;
-                padding: 4px;
-                border-radius: var(--radius-xl);
-                background: var(--surface-secondary);
-                border: 1px solid var(--border);
-                overflow-x: auto;
-                scrollbar-width: none;
-            }
-            .tabs__list::-webkit-scrollbar {
-                display: none;
-            }
-            .tabs__indicator {
-                position: absolute;
-                top: 4px;
-                bottom: 4px;
-                left: 0;
-                border-radius: calc(var(--radius-xl) - 3px);
-                background: var(--surface);
-                border: 1px solid var(--border);
-                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 3px 10px -2px rgba(0, 0, 0, 0.18);
-                pointer-events: none;
-                z-index: 1;
-                transition: transform 280ms cubic-bezier(0.16, 1, 0.3, 1),
-                            width 280ms cubic-bezier(0.16, 1, 0.3, 1),
-                            opacity 160ms ease;
-                opacity: 0;
-            }
-            .tabs__tab {
-                position: relative;
-                z-index: 2;
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                gap: 8px;
-                padding: 8px 18px;
-                font-size: 13.5px;
-                font-weight: 500;
-                color: var(--muted);
-                background: transparent;
-                border: none;
-                border-radius: calc(var(--radius-xl) - 3px);
-                cursor: pointer;
-                transition: color 180ms ease, transform 120ms ease;
-                white-space: nowrap;
-                user-select: none;
-                outline: none;
-            }
-            .tabs__tab:hover {
-                color: var(--foreground);
-            }
-            .tabs__tab:active {
-                transform: scale(0.96);
-            }
-            .tabs__tab[data-selected="true"] {
-                color: var(--foreground);
-                font-weight: 600;
-            }
-
-            /* Modal Body & Direction-Aware Panel Transitions */
-            .modal__body {
-                position: relative;
-                padding: 16px 24px;
-                overflow: hidden;
-                flex: 1;
-                min-height: 0;
-                display: flex;
-                flex-direction: column;
-            }
-
+            /* Tabs Panels */
             .tabs__panel {
                 display: none;
                 flex-direction: column;
-                gap: 16px;
+                gap: 14px;
                 width: 100%;
                 height: 100%;
                 min-height: 0;
                 overflow-y: auto;
-                padding-right: 6px;
+                padding: 2px 6px 80px 2px;
                 scrollbar-width: thin;
-                scrollbar-color: var(--border) transparent;
-                will-change: transform, opacity;
-                transform: translateZ(0);
+                scrollbar-color: var(--lg-separator) transparent;
             }
-            .tabs__panel::-webkit-scrollbar {
-                width: 6px;
-            }
-            .tabs__panel::-webkit-scrollbar-thumb {
-                background: var(--border);
-                border-radius: 4px;
-            }
-
             .tabs__panel[data-active="true"] {
                 display: flex;
             }
-            .tabs__panel[data-active="true"][data-direction="forward"] {
-                animation: heroui-tab-forward 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
-            }
-            .tabs__panel[data-active="true"][data-direction="backward"] {
-                animation: heroui-tab-backward 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
-            }
 
-            @keyframes heroui-tab-forward {
-                0% {
-                    opacity: 0;
-                    transform: translateX(16px);
-                }
-                100% {
-                    opacity: 1;
-                    transform: translateX(0);
-                }
-            }
-
-            @keyframes heroui-tab-backward {
-                0% {
-                    opacity: 0;
-                    transform: translateX(-16px);
-                }
-                100% {
-                    opacity: 1;
-                    transform: translateX(0);
-                }
-            }
-
-            /* Responsive 2-Column Dashboard Grid */
+            /* Responsive 2-Column Grid */
             .grid-2col {
                 display: grid;
                 grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 12px;
+                gap: 14px;
                 align-items: start;
                 width: 100%;
             }
             .col-stack {
                 display: flex;
                 flex-direction: column;
-                gap: 10px;
+                gap: 12px;
                 min-width: 0;
             }
-            @media (max-width: 960px) {
+            @media (max-width: 840px) {
                 .grid-2col {
                     grid-template-columns: 1fr;
                 }
             }
 
-            /* Cards Component (Comfortable, Proportional Sizing) */
+            /* Clean Uniform Inset Cards (Lightweight & Smooth) */
             .card {
                 display: flex;
                 flex-direction: column;
-                gap: 12px;
-                padding: 16px 18px;
-                border-radius: var(--radius-xl);
-                border: 1px solid var(--border);
-                background: var(--surface);
-                transition: border-color 150ms;
-                flex-shrink: 0;
+                border-radius: 20px;
+                background-color: var(--card-bg, rgba(255, 255, 255, 0.035));
+                border: 0.5px solid var(--lg-edge);
+                box-shadow:
+                    inset 0 1px 1px 0 rgba(255, 255, 255, 0.08),
+                    0 2px 8px -2px var(--lg-drop);
+                overflow: visible;
+                padding: 0;
+                position: relative;
             }
-            .card--compact {
-                padding: 12px 15px;
-                gap: 8px;
+            :where([data-theme="light"], .heroui-root[data-theme="light"]) .card {
+                --card-bg: rgba(0, 0, 0, 0.025);
+                box-shadow:
+                    inset 0 1px 1px 0 rgba(255, 255, 255, 0.6),
+                    0 2px 8px -2px rgba(0, 0, 0, 0.04);
             }
-            .card--compact .card__header {
-                gap: 2px;
+            :where([data-theme="dark"], .heroui-root[data-theme="dark"]) .card {
+                --card-bg: rgba(255, 255, 255, 0.035);
             }
-            .card--compact .card__title {
-                font-size: 13.5px;
+            /* ============================================================
+               Dropdown Menus Z-Index Stacking & Popover Elevation
+               Ensures dropdown menus ALWAYS stay on top of all other cards,
+               rows, switches, sliders, and buttons in both static and floating mode
+               ============================================================ */
+            :is(.card, .col-stack):has(.lg-menu-card),
+            :is(.card, .col-stack):has(.lg-menu--active),
+            :is(.card, .col-stack):has([data-phase="open"]),
+            :is(.card, .col-stack):has([aria-expanded="true"]) {
+                z-index: 9000 !important;
             }
-            .card--compact .card__description {
-                font-size: 11px;
-                line-height: 1.3;
+
+            :is(.card__content):has(.lg-menu-card),
+            :is(.card__content):has(.lg-menu--active),
+            :is(.card__content):has([data-phase="open"]),
+            :is(.card__content):has([aria-expanded="true"]) {
+                z-index: 9100 !important;
             }
-            .card--secondary {
-                background: var(--surface-secondary);
+
+            :is(.field-row, .field-switch-row, .field-box, .switch):has(.lg-menu-card),
+            :is(.field-row, .field-switch-row, .field-box, .switch):has(.lg-menu--active),
+            :is(.field-row, .field-switch-row, .field-box, .switch):has([data-phase="open"]),
+            :is(.field-row, .field-switch-row, .field-box, .switch):has([aria-expanded="true"]) {
+                z-index: 9200 !important;
             }
+
+            .lg-menu-select:has(.lg-menu-card),
+            .lg-menu-select:has(.lg-menu--active),
+            .lg-menu-select:has([data-phase="open"]),
+            .lg-menu-select:has([aria-expanded="true"]),
+            .lg-menu:has(.lg-menu-card),
+            .lg-menu:has(.lg-menu--active),
+            .lg-menu[data-phase="open"],
+            .lg-menu[data-open="true"] {
+                z-index: 9500 !important;
+            }
+
+            /* Prevent other rows/buttons from elevating on hover above open dropdown menus */
+            .tabs__panel:has(.lg-menu-card) :is(.field-row, .field-switch-row, .field-box, .switch):not(:has(.lg-menu-card)):hover,
+            .modal__body:has(.lg-menu-card) :is(.field-row, .field-switch-row, .field-box, .switch):not(:has(.lg-menu-card)):hover {
+                transform: none !important;
+                z-index: 1 !important;
+            }
+
             .card__header {
                 display: flex;
                 flex-direction: column;
-                gap: 3px;
+                gap: 2px;
+                padding: 12px 16px 10px 16px;
+                border-bottom: 0.5px solid var(--lg-separator);
+                border-top-left-radius: 18px;
+                border-top-right-radius: 18px;
             }
+
             .card__title {
-                font-size: 14px;
+                font-size: 13.5px;
                 font-weight: 600;
-                color: var(--foreground);
+                letter-spacing: -0.01em;
+                color: var(--lg-foreground);
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
             }
+
             .card__description {
-                font-size: 12.5px;
-                color: var(--muted);
-                line-height: 1.45;
+                font-size: 11.5px;
+                color: var(--lg-muted);
+                line-height: 1.35;
             }
+
             .card__content {
                 display: flex;
                 flex-direction: column;
-                gap: 10px;
+                gap: 8px;
+                padding: 10px 12px 14px 12px;
             }
 
-            /* Core Protection Compact Toggles */
-            .core-toggles-list {
-                display: flex;
-                flex-direction: column;
-                gap: 4px !important;
-            }
-            .core-toggles-list .switch,
-            .core-toggle-item.switch {
-                padding: 6px 12px;
-                border-radius: var(--radius-md);
-                gap: 10px;
-                min-height: 38px;
-                background: var(--surface);
-            }
-            .core-toggles-list .switch .switch__control,
-            .core-toggle-item .switch__control {
-                height: 19.5px;
-                width: 34px;
-            }
-            .core-toggles-list .switch .switch__thumb,
-            .core-toggle-item .switch__thumb {
-                height: 14.5px;
-                width: 14.5px;
-                margin-left: 2.5px;
-            }
-            .core-toggles-list .switch[data-selected="true"] .switch__thumb,
-            .core-toggle-item[data-selected="true"] .switch__thumb {
-                margin-left: calc(34px - 14.5px - 2.5px);
-            }
-            .core-toggles-list .switch .switch__content,
-            .core-toggle-item .switch__content {
-                gap: 1px;
-            }
-            .core-toggles-list .switch [data-slot="label"],
-            .core-toggle-item [data-slot="label"] {
-                font-size: 12.5px;
-                font-weight: 500;
-                line-height: 1.25;
-                color: var(--foreground);
-            }
-            .core-toggles-list .switch [data-slot="description"],
-            .core-toggle-item [data-slot="description"] {
-                font-size: 10.5px;
-                color: var(--muted);
-                line-height: 1.2;
-            }
-
-            /* Switch Component */
-            .switch {
+            /* Uniform Clean Setting Rows (Lightweight & Smooth) */
+            .field-row, .field-switch-row, .field-box, .switch {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                gap: 12px;
-                cursor: pointer;
-                padding: 10px 14px;
-                border-radius: var(--radius-lg);
-                background: var(--surface);
-                border: 1px solid var(--border);
-                transition: background-color 150ms, border-color 150ms;
-                user-select: none;
-                outline: none;
-            }
-            .switch:hover {
-                background: var(--surface-tertiary);
-                border-color: var(--border-hover);
-            }
-            .switch:focus-visible {
-                border-color: var(--accent);
-                box-shadow: 0 0 0 2px var(--accent-soft);
-            }
-            .switch__control {
-                position: relative;
-                display: inline-flex;
-                align-items: center;
-                height: 20px;
-                width: 36px;
-                border-radius: 9999px;
-                background-color: var(--default);
-                transition: background-color 200ms var(--ease-smooth);
-                flex-shrink: 0;
-                order: 2;
-            }
-            .switch[data-selected="true"] .switch__control {
-                background-color: var(--accent);
-            }
-            .switch__thumb {
-                height: 15px;
-                width: 15px;
-                border-radius: 50%;
-                background-color: #ffffff;
-                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-                margin-left: 2.5px;
-                transition: margin-left 220ms var(--ease-out-fluid);
-            }
-            .switch[data-selected="true"] .switch__thumb {
-                margin-left: calc(36px - 15px - 2.5px);
-            }
-            .switch--sm {
-                padding: 6px 11px;
-                gap: 9px;
-                border-radius: var(--radius-md);
-                min-height: 38px;
-            }
-            .switch--sm .switch__control {
-                height: 19.5px;
-                width: 34px;
-            }
-            .switch--sm .switch__thumb {
-                height: 14.5px;
-                width: 14.5px;
-                margin-left: 2.5px;
-            }
-            .switch--sm[data-selected="true"] .switch__thumb {
-                margin-left: calc(34px - 14.5px - 2.5px);
-            }
-            .switch--sm .switch__content {
-                gap: 1px;
-            }
-            .switch--sm [data-slot="label"] {
-                font-size: 12.5px;
-                font-weight: 500;
-                line-height: 1.25;
-            }
-            .switch--sm [data-slot="description"] {
-                font-size: 10.5px;
-                line-height: 1.2;
-                color: var(--muted);
-            }
-            .switch__content {
-                display: flex;
-                flex-direction: column;
-                gap: 2px;
-                order: 1;
-                flex: 1;
-            }
-            .switch [data-slot="label"] {
-                font-size: 13px;
-                font-weight: 500;
-                color: var(--foreground);
-            }
-            .switch [data-slot="description"] {
-                font-size: 11px;
-                color: var(--muted);
-                line-height: 1.3;
-            }
-            .switch[data-disabled="true"] {
-                opacity: 0.55;
-                cursor: not-allowed;
-            }
-
-            /* Badge Component */
-            .badge {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                gap: 4px;
-                font-weight: 600;
-                border-radius: var(--radius-full);
-                padding: 3px 9px;
-                font-size: 12px;
-                line-height: 1.25;
-            }
-            .badge--sm {
-                font-size: 10.5px;
-                padding: 2px 7px;
-            }
-            .badge--primary.badge--accent {
-                background: var(--accent);
-                color: var(--accent-foreground);
-            }
-            .badge--soft.badge--accent {
-                background: var(--accent-soft);
-                color: var(--accent-soft-foreground);
-            }
-            .badge--soft.badge--success {
-                background: var(--success-soft);
-                color: var(--success);
-            }
-            .badge--soft.badge--warning {
-                background: var(--warning-soft);
-                color: var(--warning);
-            }
-            .badge--soft.badge--danger {
-                background: var(--danger-soft);
-                color: var(--danger);
-            }
-            .badge--secondary {
-                background: var(--default);
-                color: var(--default-foreground);
-            }
-
-            /* ============================================================
-               HeroUI v3 Button & ButtonGroup Components (https://heroui.com/docs/react/components/button)
-               ============================================================ */
-            .button {
-                position: relative;
-                isolation: isolate;
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                gap: 8px;
-                height: 36px;
-                width: fit-content;
-                transform-origin: center;
-                border-radius: var(--radius-3xl, 24px);
-                padding: 0 16px;
-                font-size: 14px;
-                line-height: 20px;
-                font-weight: 500;
-                font-family: inherit;
-                white-space: nowrap;
-                outline: none;
-                user-select: none;
-                -webkit-tap-highlight-color: transparent;
-                cursor: var(--cursor-interactive, pointer);
-                border: 1px solid transparent;
-                transition:
-                    transform 250ms var(--ease-smooth),
-                    background-color 100ms var(--ease-out-quad),
-                    box-shadow 100ms var(--ease-out-quad),
-                    border-color 100ms var(--ease-out-quad),
-                    color 100ms var(--ease-out-quad);
-
-                /* Default tokens (fallback behavior) */
-                --button-bg: transparent;
-                --button-bg-hover: var(--button-bg);
-                --button-bg-pressed: var(--button-bg-hover);
-                --button-fg: currentColor;
-
-                background-color: var(--button-bg);
-                color: var(--button-fg);
-            }
-
-            @media (prefers-reduced-motion: reduce) {
-                .button {
-                    transition: none;
-                }
-            }
-
-            /* Interactive States */
-            @media (hover: hover) {
-                .button:hover,
-                .button[data-hovered="true"] {
-                    background-color: var(--button-bg-hover);
-                }
-            }
-
-            .button:active,
-            .button[data-pressed="true"] {
-                will-change: transform;
-                background-color: var(--button-bg-pressed);
-                transform: scale(0.97);
-            }
-
-            .button:focus-visible,
-            .button[data-focus-visible="true"] {
-                outline: none;
-                box-shadow: 0 0 0 2px var(--background), 0 0 0 4px var(--focus, var(--accent));
-                z-index: 2;
-            }
-
-            .button:disabled,
-            .button[aria-disabled="true"] {
-                opacity: var(--disabled-opacity, 0.5);
-                cursor: var(--cursor-disabled, not-allowed);
-                pointer-events: none;
-                transform: none !important;
-            }
-
-            .button[data-pending="true"] {
-                opacity: 0.75;
-                pointer-events: none;
-                cursor: default;
-            }
-
-            /* SVG Icon styling */
-            .button svg:not([data-slot="spinner"] svg, [data-slot="link-icon"] svg) {
-                pointer-events: none;
-                margin-left: -2px;
-                margin-right: -2px;
-                width: 16px;
-                height: 16px;
-                flex-shrink: 0;
-                align-self: center;
-            }
-
-            /* Size Variants */
-            .button--sm {
-                height: 32px;
-                padding: 0 12px;
-                font-size: 13px;
-                gap: 6px;
-                border-radius: var(--radius-3xl, 24px);
-            }
-            .button--sm:active,
-            .button--sm[data-pressed="true"] {
-                transform: scale(0.98);
-            }
-            .button--sm svg:not([data-slot="spinner"] svg, [data-slot="link-icon"] svg) {
-                width: 14px;
-                height: 14px;
-            }
-
-            .button--md {
-                height: 36px;
-                padding: 0 16px;
-                font-size: 14px;
-                gap: 8px;
-                border-radius: var(--radius-3xl, 24px);
-            }
-            .button--md:active,
-            .button--md[data-pressed="true"] {
-                transform: scale(0.97);
-            }
-
-            .button--lg {
-                height: 44px;
-                padding: 0 20px;
-                font-size: 15px;
-                gap: 10px;
-                border-radius: var(--radius-3xl, 24px);
-            }
-            .button--lg:active,
-            .button--lg[data-pressed="true"] {
-                transform: scale(0.96);
-            }
-            .button--lg svg:not([data-slot="spinner"] svg, [data-slot="link-icon"] svg) {
-                width: 18px;
-                height: 18px;
-            }
-
-            /* Variant Classes */
-            .button--primary {
-                --button-bg: var(--accent);
-                --button-bg-hover: var(--accent-hover);
-                --button-bg-pressed: var(--accent-hover);
-                --button-fg: var(--accent-foreground, #ffffff);
-                box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.08);
-                border-color: transparent;
-            }
-
-            .button--secondary {
-                --button-bg: var(--default);
-                --button-bg-hover: var(--default-hover);
-                --button-bg-pressed: var(--default-hover);
-                --button-fg: var(--foreground);
-                border-color: transparent;
-            }
-
-            .button--tertiary {
-                --button-bg: var(--default);
-                --button-bg-hover: var(--default-hover);
-                --button-bg-pressed: var(--default-hover);
-                --button-fg: var(--foreground);
-                border-color: transparent;
-            }
-
-            .button--outline {
-                --button-bg: transparent;
-                --button-bg-hover: color-mix(in srgb, var(--default) 60%, transparent);
-                --button-bg-pressed: var(--default);
-                --button-fg: var(--foreground);
-                border-color: var(--border);
-            }
-            .button--outline:hover,
-            .button--outline[data-hovered="true"] {
-                border-color: var(--border-hover, var(--border));
-            }
-
-            .button--ghost {
-                --button-bg: transparent;
-                --button-bg-hover: var(--default);
-                --button-bg-pressed: var(--default);
-                --button-fg: var(--foreground);
-                border-color: transparent;
-            }
-
-            .button--danger {
-                --button-bg: var(--danger);
-                --button-bg-hover: var(--danger-hover);
-                --button-bg-pressed: var(--danger-hover);
-                --button-fg: var(--danger-foreground, #ffffff);
-                box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.08);
-                border-color: transparent;
-            }
-
-            .button--danger-soft {
-                --button-bg: var(--danger-soft);
-                --button-bg-hover: color-mix(in srgb, var(--danger) 24%, transparent);
-                --button-bg-pressed: color-mix(in srgb, var(--danger) 28%, transparent);
-                --button-fg: var(--danger);
-                border-color: transparent;
-            }
-
-            /* Modifier Classes */
-            .button--icon-only {
-                padding: 0 !important;
-                border-radius: var(--radius-full, 9999px) !important;
-                width: 36px;
-                min-width: 36px;
-                height: 36px;
-            }
-            .button--icon-only.button--sm {
-                width: 32px;
-                min-width: 32px;
-                height: 32px;
-            }
-            .button--icon-only.button--lg {
-                width: 44px;
-                min-width: 44px;
-                height: 44px;
-            }
-            .button--icon-only svg:not([data-slot="spinner"] svg, [data-slot="link-icon"] svg) {
-                margin: 0;
-            }
-
-            .button--full-width {
-                width: 100%;
-            }
-
-            .button--capturing {
-                background: var(--accent) !important;
-                color: var(--accent-foreground, #ffffff) !important;
-                border-color: transparent !important;
-                animation: heroui-pulse 1.2s ease-in-out infinite;
-            }
-
-            /* Button Spinner */
-            .button__spinner {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                animation: heroui-spin 0.8s linear infinite;
-            }
-            @keyframes heroui-spin {
-                from { transform: rotate(0deg); }
-                to { transform: rotate(360deg); }
-            }
-
-            /* HeroUI v3 ButtonGroup */
-            .button-group {
-                display: inline-flex;
-                height: auto;
-                align-items: center;
-                justify-content: center;
-                gap: 0;
-            }
-            .button-group--horizontal {
-                flex-direction: row;
-            }
-            .button-group--vertical {
-                flex-direction: column;
-            }
-            .button-group .button {
-                border-radius: 0;
-            }
-            .button-group--horizontal .button:first-child {
-                border-top-left-radius: var(--radius-3xl, 24px);
-                border-bottom-left-radius: var(--radius-3xl, 24px);
-            }
-            .button-group--horizontal .button:last-child {
-                border-top-right-radius: var(--radius-3xl, 24px);
-                border-bottom-right-radius: var(--radius-3xl, 24px);
-            }
-            .button-group--horizontal .button:first-child:last-child {
-                border-radius: var(--radius-3xl, 24px);
-            }
-            .button-group--vertical .button:first-child {
-                border-top-left-radius: var(--radius-3xl, 24px);
-                border-top-right-radius: var(--radius-3xl, 24px);
-            }
-            .button-group--vertical .button:last-child {
-                border-bottom-left-radius: var(--radius-3xl, 24px);
-                border-bottom-right-radius: var(--radius-3xl, 24px);
-            }
-            .button-group--vertical .button:first-child:last-child {
-                border-radius: var(--radius-3xl, 24px);
-            }
-            .button-group .button:active,
-            .button-group .button[data-pressed="true"] {
-                transform: none;
-            }
-            .button-group .button:focus-visible,
-            .button-group .button[data-focus-visible="true"] {
-                z-index: 10;
-            }
-            .button-group--horizontal .button--outline:not(:first-child) {
-                margin-left: -1px;
-            }
-            .button-group--vertical .button--outline:not(:first-child) {
-                margin-top: -1px;
-            }
-            .button-group--full-width {
-                width: 100%;
-            }
-            .button-group--full-width .button {
-                flex: 1;
-            }
-
-            /* Form Elements */
-            .field-row {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                gap: 16px;
+                gap: 14px;
+                min-height: 48px;
                 padding: 12px 16px;
-                border-radius: var(--radius-lg);
-                background: var(--surface);
-                border: 1px solid var(--border);
+                border-radius: 14px;
+                background-color: var(--row-bg, rgba(255, 255, 255, 0.045));
+                border: 0.5px solid var(--lg-edge);
+                color: var(--lg-foreground);
+                box-shadow:
+                    inset 0 1px 1px 0 rgba(255, 255, 255, 0.08),
+                    0 1px 3px var(--lg-drop);
+                transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease, box-shadow 140ms ease;
+                box-sizing: border-box;
+                position: relative;
             }
-            .field-row > label {
+            :where([data-theme="light"], .heroui-root[data-theme="light"]) :is(.field-row, .field-switch-row, .field-box, .switch) {
+                --row-bg: rgba(0, 0, 0, 0.035);
+                box-shadow:
+                    inset 0 1px 1px 0 rgba(255, 255, 255, 0.6),
+                    0 1px 2px rgba(0, 0, 0, 0.04);
+            }
+            :where([data-theme="dark"], .heroui-root[data-theme="dark"]) :is(.field-row, .field-switch-row, .field-box, .switch) {
+                --row-bg: rgba(255, 255, 255, 0.045);
+            }
+            .field-row:hover, .field-switch-row:hover, .field-box:hover, .switch:hover {
+                background-color: var(--lg-highlight);
+                border-color: rgba(255, 255, 255, 0.22);
+                transform: translateY(-0.5px);
+                box-shadow: 0 3px 10px -1px var(--lg-drop);
+            }
+            .field-row:active, .field-switch-row:active, .field-box:active, .switch:active {
+                transform: scale(0.995);
+            }
+            .field-row--danger {
+                border-color: rgba(255, 56, 60, 0.32);
+            }
+            .field-row--danger:hover {
+                border-color: rgba(255, 56, 60, 0.5);
+                background-color: rgba(255, 56, 60, 0.08);
+            }
+
+            /* Uniform Action Buttons System (Clean, Legible & Never-Wrap) */
+            .field-row > label,
+            .field-row > div:first-child:not([class*="btn"]):not([class*="button"]) {
+                flex: 1 1 auto;
+                min-width: 0;
+                padding-right: 12px;
+            }
+            .field-row > :last-child:not(label) {
+                flex-shrink: 0;
+            }
+
+            .lg-button {
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                white-space: nowrap !important;
+                flex-shrink: 0 !important;
+                height: 34px !important;
+                padding: 0 16px !important;
+                border-radius: 17px !important;
+                font-size: 12.5px !important;
+                font-weight: 550 !important;
+                letter-spacing: -0.01em !important;
+                box-sizing: border-box !important;
+                background-color: var(--lg-highlight) !important;
+                border: 0.5px solid var(--lg-edge) !important;
+                color: var(--lg-foreground) !important;
+                box-shadow: 0 1px 2px var(--lg-drop) !important;
+                transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease, box-shadow 140ms ease !important;
+            }
+            .lg-button:hover {
+                background-color: var(--lg-glass-active) !important;
+                border-color: rgba(255, 255, 255, 0.22) !important;
+                transform: translateY(-0.5px) !important;
+            }
+            .lg-button:active {
+                transform: scale(0.98) !important;
+            }
+
+            .lg-button[data-icon="only"] {
+                width: 34px !important;
+                height: 34px !important;
+                min-width: 34px !important;
+                padding: 0 !important;
+                border-radius: 17px !important;
+            }
+
+            /* Destructive Action Buttons (e.g. Reset All Preferences) */
+            .lg-button[data-destructive] {
+                background-color: rgba(255, 59, 48, 0.12) !important;
+                border: 0.5px solid rgba(255, 59, 48, 0.35) !important;
+                color: #ff453a !important;
+                font-weight: 590 !important;
+            }
+            .lg-button[data-destructive]:hover {
+                background-color: rgba(255, 59, 48, 0.22) !important;
+                border-color: rgba(255, 59, 48, 0.6) !important;
+                box-shadow: 0 2px 8px rgba(255, 59, 48, 0.2) !important;
+            }
+
+            /* Filled Accent Buttons */
+            .lg-button[data-variant="filled"] {
+                background-color: var(--accent, var(--lg-fill)) !important;
+                border-color: transparent !important;
+                color: #ffffff !important;
+                box-shadow: 0 2px 6px color-mix(in srgb, var(--accent, var(--lg-fill)) 35%, transparent) !important;
+            }
+            .lg-button[data-variant="filled"]:hover {
+                background-color: color-mix(in srgb, var(--accent, var(--lg-fill)) 90%, #ffffff) !important;
+            }
+
+            /* Quick Range Presets Chips in TimeBoost */
+            .field-box .lg-button {
+                height: 30px !important;
+                padding: 0 13px !important;
+                font-size: 12px !important;
+                border-radius: 9999px !important;
+            }
+
+            /* Keybind Recorder Button */
+            .keybind-btn {
+                min-width: 104px !important;
+                font-variant-numeric: tabular-nums !important;
+                border-color: var(--lg-separator) !important;
+                font-weight: 600 !important;
+            }
+            .keybind-btn--capturing {
+                border-color: var(--accent, var(--lg-fill)) !important;
+                background-color: color-mix(in srgb, var(--accent, var(--lg-fill)) 18%, transparent) !important;
+                color: var(--accent, var(--lg-fill)) !important;
+                box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, var(--lg-fill)) 28%, transparent) !important;
+                animation: keybind-pulse 1.2s infinite ease-in-out !important;
+            }
+            @keyframes keybind-pulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.7; }
+            }
+
+            .field-callout {
+                padding: 10px 14px;
+                border-radius: 14px;
+                background: var(--lg-highlight);
+                border: 0.5px solid var(--lg-separator);
+                color: var(--lg-muted);
+                font-size: 12px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                line-height: 1.4;
+                box-sizing: border-box;
+            }
+
+            .field-switch-content, .switch__content {
+                display: flex;
+                flex-direction: column;
+                gap: 3px;
+                flex: 1;
+                min-width: 0;
+            }
+
+            .field-switch-content [data-slot="label"],
+            .field-switch-row [data-slot="label"],
+            .field-row > label,
+            .switch [data-slot="label"] {
                 font-size: 13.5px;
-                font-weight: 500;
-                color: var(--foreground);
+                font-weight: 590;
+                letter-spacing: -0.01em;
+                color: var(--lg-foreground);
+                line-height: 1.3;
                 display: flex;
                 flex-direction: column;
                 gap: 2px;
-                flex: 1;
-            }
-            .field-row > label small {
-                font-size: 11.5px;
-                color: var(--muted);
-                font-weight: 400;
-            }
-            .select, .input {
-                background: var(--field-background);
-                color: var(--field-foreground);
-                border: 1px solid var(--field-border);
-                border-radius: var(--field-radius);
-                padding: 8px 14px;
-                font-size: 13px;
-                font-family: inherit;
-                transition: border-color 150ms, box-shadow 150ms;
-                outline: none;
-                min-width: 150px;
-                cursor: pointer;
-            }
-            .input {
-                cursor: text;
-            }
-            .select:focus, .input:focus {
-                border-color: var(--accent);
-                box-shadow: 0 0 0 2px var(--accent-soft);
-            }
-            .input[type="number"] {
-                -moz-appearance: textfield;
-            }
-            .input[type="number"]::-webkit-outer-spin-button,
-            .input[type="number"]::-webkit-inner-spin-button {
-                -webkit-appearance: none;
-                margin: 0;
             }
 
-            /* Range & Quick Presets */
-            .preset-chips {
-                display: flex;
+            .field-switch-content [data-slot="description"],
+            .field-switch-row [data-slot="description"],
+            .field-row > label small,
+            .field-row small,
+            .switch [data-slot="description"] {
+                font-size: 12px;
+                color: var(--lg-muted);
+                font-weight: 450;
+                line-height: 1.45;
+                display: block;
+                margin-top: 2px;
+                opacity: 1;
+            }
+
+            /* Glisse Slider Container */
+            .field-slider-wrapper {
+                display: inline-flex;
                 align-items: center;
-                gap: 7px;
-                flex-wrap: wrap;
-                margin-top: 6px;
+                gap: 12px;
+                width: 260px;
             }
-            .preset-chip {
-                padding: 5px 12px;
-                font-size: 11.5px;
+            .slider__output {
+                font-size: 13px;
                 font-weight: 600;
-                border-radius: var(--radius-full);
-                background: var(--default-soft);
-                color: var(--muted);
-                border: 1px solid var(--border);
-                cursor: pointer;
-                transition: background 150ms, color 150ms, border-color 150ms;
-            }
-            .preset-chip:hover {
-                background: var(--default-hover);
-                color: var(--foreground);
-                border-color: var(--border-hover);
+                letter-spacing: -0.01em;
+                color: var(--lg-foreground);
+                min-width: 44px;
+                text-align: right;
+                font-variant-numeric: tabular-nums;
             }
 
             /* Color Swatches */
@@ -3936,63 +4452,101 @@
                 border-radius: 50%;
                 border: 2px solid transparent;
                 cursor: pointer;
-                transition: transform 150ms, border-color 150ms;
+                position: relative;
+                transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 180ms ease;
+                box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
             }
             .color-swatch:hover {
                 transform: scale(1.15);
             }
             .color-swatch[data-active="true"] {
-                border-color: #ffffff;
-                box-shadow: 0 0 0 2px var(--accent);
+                transform: scale(1.1);
+                box-shadow: 0 0 0 2px var(--lg-surface), 0 0 0 4px var(--accent, var(--lg-fill));
             }
 
-            /* Services Filter & Grid */
-            .services-search-bar {
+            /* Services Search & Grid */
+            .services-search-bar,
+            .services-toolbar {
                 display: flex;
                 align-items: center;
                 gap: 8px;
-                margin-bottom: 8px;
+                width: 100%;
+                box-sizing: border-box;
+                margin-bottom: 4px;
             }
-            .services-search-input {
-                flex: 1;
-                background: var(--field-background);
-                color: var(--field-foreground);
-                border: 1px solid var(--field-border);
-                border-radius: var(--field-radius);
-                padding: 7px 13px;
-                font-size: 12.5px;
-                outline: none;
+            .services-search-field {
+                flex: 1 1 auto;
+                min-width: 0 !important;
             }
-            .services-search-input:focus {
-                border-color: var(--accent);
+            .services-search-field .lg-input,
+            .services-search-field.lg-input {
+                width: 100% !important;
+                max-width: 100% !important;
+                height: 34px !important;
+                padding: 0 12px !important;
+                border-radius: 17px !important;
+                background-color: var(--row-bg, rgba(255, 255, 255, 0.045)) !important;
+                border: 0.5px solid var(--lg-edge) !important;
+                box-shadow: inset 0 1px 1px 0 rgba(255, 255, 255, 0.08), 0 1px 2px var(--lg-drop) !important;
+                box-sizing: border-box !important;
             }
+            .services-search-field .lg-input:focus-within,
+            .services-search-field.lg-input:focus-within {
+                border-color: var(--accent, var(--lg-fill)) !important;
+                background-color: var(--lg-highlight) !important;
+            }
+            .services-search-field input {
+                font-size: 12.5px !important;
+                min-width: 0 !important;
+            }
+            .services-actions {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                flex-shrink: 0;
+            }
+            .services-actions .lg-button,
+            .services-action-btn {
+                height: 34px !important;
+                padding: 0 11px !important;
+                font-size: 12px !important;
+                font-weight: 550 !important;
+                border-radius: 17px !important;
+                white-space: nowrap !important;
+                flex-shrink: 0 !important;
+            }
+
             .services-grid {
                 display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-                gap: 7px;
-                max-height: 390px;
+                grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+                gap: 8px;
+                max-height: 420px;
                 overflow-y: auto;
-                padding-right: 4px;
-                scrollbar-width: thin;
-                scrollbar-color: var(--border) transparent;
+                padding: 8px 0 2px 0;
             }
+
             .service-tile {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                padding: 7px 12px;
-                min-height: 38px;
-                border-radius: var(--radius-md);
-                background: var(--surface);
-                border: 1px solid var(--border);
+                padding: 8px 12px;
+                min-height: 42px;
+                border-radius: 14px;
+                background-color: var(--row-bg, rgba(255, 255, 255, 0.04));
+                border: 0.5px solid var(--lg-edge);
+                box-shadow: 0 1px 3px var(--lg-drop);
                 font-size: 12.5px;
                 cursor: pointer;
-                transition: background 120ms, border-color 120ms;
                 user-select: none;
+                transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease;
             }
             .service-tile:hover {
-                background: var(--surface-tertiary);
-                border-color: var(--border-hover);
+                background-color: var(--lg-highlight);
+                border-color: rgba(255, 255, 255, 0.22);
+                transform: translateY(-0.5px);
+            }
+            .service-tile:active {
+                transform: scale(0.98);
             }
             .service-tile__label {
                 font-weight: 500;
@@ -4001,355 +4555,413 @@
                 white-space: nowrap;
                 padding-right: 8px;
                 flex: 1;
+                color: var(--lg-foreground);
             }
-            .service-tile .switch {
-                padding: 0;
-                border: none;
-                background: transparent;
-                flex-shrink: 0;
-                min-height: unset;
+
+            /* Glisse Liquid Glass Switch Controls (Subtle & Drag-Responsive) */
+            .lg-switch {
+                box-shadow:
+                    inset 0 1px 2px rgba(0, 0, 0, 0.25),
+                    inset 0 0 0 0.5px var(--lg-edge),
+                    0 1px 2px rgba(0, 0, 0, 0.08);
+                transition: box-shadow 150ms ease, opacity 150ms ease;
             }
-            .service-tile .switch:hover {
-                background: transparent;
+            .lg-switch:hover {
+                box-shadow:
+                    inset 0 1px 2px rgba(0, 0, 0, 0.35),
+                    inset 0 0 0 0.5px rgba(255, 255, 255, 0.25),
+                    0 2px 6px rgba(0, 0, 0, 0.12);
             }
-            .service-tile .switch .switch__control {
-                height: 19.5px;
-                width: 34px;
-            }
-            .service-tile .switch .switch__thumb {
-                height: 14.5px;
-                width: 14.5px;
-                margin-left: 2.5px;
-            }
-            .service-tile .switch[data-selected="true"] .switch__thumb {
-                margin-left: calc(34px - 14.5px - 2.5px);
-            }
-            .service-tile[data-disabled="true"] {
-                opacity: 0.55;
-                cursor: not-allowed;
+            .lg-switch-thumb {
+                box-shadow:
+                    0 3px 8px rgba(0, 0, 0, 0.22),
+                    inset 0 1px 1px rgba(255, 255, 255, 0.8),
+                    inset 0 -1px 1px rgba(0, 0, 0, 0.1),
+                    inset 0 0 0 0.5px rgba(255, 255, 255, 0.4) !important;
+                background-image: var(--lg-rim, none) !important;
+                background-size: 100% 100% !important;
+                -webkit-backdrop-filter: blur(2px) saturate(1.3) !important;
+                backdrop-filter: blur(2px) saturate(1.3) !important;
             }
 
             /* Statistics Tiles Grid */
             .stats-grid {
                 display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-                gap: 12px;
+                grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+                gap: 10px;
+                padding: 4px 0 8px 0;
             }
             .stat-card {
-                background: var(--surface);
-                border: 1px solid var(--border);
-                border-radius: var(--radius-lg);
-                padding: 16px 20px;
+                background-color: var(--row-bg, rgba(255, 255, 255, 0.04));
+                border: 0.5px solid var(--lg-edge);
+                border-radius: 14px;
+                padding: 12px 14px;
                 display: flex;
                 flex-direction: column;
-                gap: 6px;
-                transition: transform 150ms, border-color 150ms;
+                gap: 4px;
+                box-shadow: 0 1px 3px var(--lg-drop);
+                transition: transform 140ms ease, background-color 140ms ease, box-shadow 140ms ease;
             }
             .stat-card:hover {
-                transform: translateY(-2px);
-                border-color: var(--border-hover);
+                background-color: var(--lg-highlight);
+                border-color: rgba(255, 255, 255, 0.22);
+                transform: translateY(-1px);
+                box-shadow: 0 4px 12px -2px var(--lg-drop);
             }
             .stat-card__label {
-                font-size: 11px;
-                font-weight: 700;
+                font-size: 10.5px;
+                font-weight: 600;
                 text-transform: uppercase;
-                letter-spacing: 0.6px;
-                color: var(--muted);
+                letter-spacing: 0.5px;
+                color: var(--lg-muted);
             }
             .stat-card__value {
-                font-size: 26px;
-                font-weight: 700;
-                color: var(--foreground);
+                font-size: 20px;
+                font-weight: 650;
+                letter-spacing: -0.02em;
+                font-variant-numeric: tabular-nums;
+                color: var(--lg-foreground);
+            }
+
+            /* Badges */
+            .badge {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+                font-weight: 590;
+                border-radius: 9999px;
+                padding: 2.5px 9px;
+                font-size: 11.5px;
+                letter-spacing: 0.1px;
+                line-height: 1.25;
+            }
+            .badge--sm {
+                font-size: 10.5px;
+                padding: 2px 7px;
+            }
+            .badge--primary, .badge--accent {
+                background: var(--accent, var(--lg-fill));
+                color: #ffffff;
+            }
+            .badge--soft.badge--accent {
+                background: color-mix(in srgb, var(--accent, var(--lg-fill)) 16%, transparent);
+                color: var(--accent, var(--lg-fill));
+                box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--accent, var(--lg-fill)) 30%, transparent);
+            }
+            .badge--soft.badge--success {
+                background: rgba(52, 199, 89, 0.16);
+                color: #34c759;
+            }
+            .badge--soft.badge--warning {
+                background: rgba(255, 149, 0, 0.16);
+                color: #ff9500;
+            }
+            .badge--soft.badge--danger {
+                background: rgba(255, 59, 48, 0.16);
+                color: #ff3b30;
+            }
+            .badge--secondary {
+                background: var(--lg-highlight);
+                color: var(--lg-foreground);
+            }
+
+            /* Glisse Dynamic Island Status Pill (Subtle Refraction Lens) */
+            .heroui-pill {
+                position: fixed;
+                z-index: 2147483646;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                height: 38px;
+                padding: 0 8px 0 12px;
+                border-radius: 9999px;
+                background: none !important;
+                background-color: var(--lg-pill-tint, rgba(18, 18, 22, 0.72)) !important;
+                background-image: var(--lg-rim, none) !important;
+                background-size: 100% 100% !important;
+                --lg-blur: 1px !important;
+                --lg-bezel: 8px !important;
+                --lg-thickness: 16px !important;
+                --lg-zoom: 1.02 !important;
+                --lg-rim-saturation: 1.6 !important;
+                -webkit-backdrop-filter: blur(12px) saturate(1.4) !important;
+                backdrop-filter: blur(12px) saturate(1.4) !important;
+                color: var(--lg-foreground);
+                box-shadow:
+                    inset 0 1px 1px 0 rgba(255, 255, 255, 0.35),
+                    inset 0 0 0 0.5px var(--lg-edge),
+                    0 8px 32px -4px var(--lg-shadow);
+                transform: translateZ(0);
+                user-select: none;
+                font-size: 13px;
+                font-weight: 500;
+                line-height: 1.3;
+                pointer-events: auto;
+                cursor: pointer;
+                transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1),
+                            box-shadow 200ms ease,
+                            opacity 150ms ease,
+                            width 280ms cubic-bezier(0.16, 1, 0.3, 1),
+                            height 280ms cubic-bezier(0.16, 1, 0.3, 1),
+                            padding 280ms cubic-bezier(0.16, 1, 0.3, 1);
+            }
+
+            .heroui-pill:hover {
+                transform: translateY(-1.5px) scale(1.03);
+                box-shadow: 0 16px 42px -4px var(--lg-shadow), inset 0 1px 1px 0 rgba(255, 255, 255, 0.3);
+            }
+
+            .heroui-pill:active {
+                transform: scale(0.96);
+            }
+
+            .heroui-pill--minimal {
+                width: 44px !important;
+                height: 44px !important;
+                padding: 0 !important;
+                border-radius: 50% !important;
+                background-color: transparent !important;
+                background: none !important;
+                justify-content: center;
+                gap: 0;
+            }
+
+            .heroui-pill--minimal .heroui-pill__main {
+                display: none !important;
+            }
+
+            .heroui-pill--minimal .heroui-pill__gear {
+                width: 100%;
+                height: 100%;
+                border-radius: 50%;
+                background: transparent;
+                border: none;
+            }
+
+            .heroui-pill__main {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                cursor: pointer;
+            }
+
+            .heroui-pill__badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+                padding: 3px 9px;
+                border-radius: 9999px;
+                font-weight: 600;
+                font-size: 11px;
+                letter-spacing: 0.1px;
+            }
+
+            .heroui-pill__dot {
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                background: currentColor;
+                box-shadow: 0 0 8px currentColor;
+                animation: heroui-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+            }
+
+            @keyframes heroui-pulse {
+                0%, 100% { opacity: 1; transform: scale(1); }
+                50% { opacity: 0.35; transform: scale(0.8); }
+            }
+
+            .heroui-pill__stats {
+                font-size: 12px;
+                color: var(--lg-foreground);
+                font-weight: 550;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+
+            .heroui-pill__stat-item {
+                display: inline-flex;
+                align-items: center;
+                gap: 3px;
                 font-variant-numeric: tabular-nums;
             }
 
-            /* HeroUI v3 Dropdown */
-            .dropdown {
+            .heroui-pill__gear {
                 position: relative;
-                display: inline-flex;
-                width: auto;
-                flex-shrink: 0;
+                background: transparent;
+                border: none;
+                color: var(--lg-muted);
+                cursor: pointer;
+                border-radius: 50%;
+                width: 28px;
+                height: 28px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0;
+                transition: background-color 150ms, color 150ms, transform 240ms cubic-bezier(0.16, 1, 0.3, 1);
             }
-            .dropdown__trigger-wrapper {
-                display: inline-flex;
-                width: auto;
+
+            .heroui-pill__gear:hover {
+                background: var(--lg-highlight);
+                color: var(--lg-foreground);
+                transform: rotate(60deg);
             }
-            .dropdown__trigger-btn {
+
+            .heroui-pill__gear:active {
+                transform: scale(0.92);
+            }
+
+            .heroui-pill__indicator-dot {
+                position: absolute;
+                top: 3px;
+                right: 3px;
+                width: 7px;
+                height: 7px;
+                border-radius: 50%;
+                background: var(--accent, var(--lg-on));
+                box-shadow: 0 0 6px var(--accent, var(--lg-on));
+                display: none;
+                animation: heroui-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+            }
+
+            .input {
+                background: var(--lg-glass);
+                color: var(--lg-foreground);
+                border: 0.5px solid var(--lg-separator);
+                border-radius: 9999px;
+                height: 32px;
+                padding: 0 12px;
+                font-size: 13px;
+                font-family: inherit;
+                outline: none;
+                transition: border-color 150ms, box-shadow 150ms;
+            }
+            .input:focus {
+                border-color: var(--accent, var(--lg-fill));
+                box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, var(--lg-fill)) 25%, transparent);
+            }
+
+            /* Pop-up Options powered by Glisse.Menu */
+            .lg-menu-select {
+                display: inline-flex;
+                position: relative;
+            }
+            .lg-menu-select .lg-button {
+                width: auto !important;
+                min-width: 140px;
+                height: 34px !important;
+                padding: 0 12px 0 14px !important;
                 display: inline-flex !important;
+                align-items: center !important;
+                justify-content: space-between !important;
+                border-radius: 17px !important;
+                box-sizing: border-box !important;
+            }
+            .lg-menu-select .lg-button[data-icon="only"] {
+                width: auto !important;
+                padding: 0 12px 0 14px !important;
+            }
+            .lg-menu-select .lg-select-trigger-content {
+                display: flex;
                 align-items: center;
                 justify-content: space-between;
                 gap: 8px;
-                width: auto !important;
-                min-width: 90px;
-                max-width: 240px;
-                height: 32px;
-                padding: 0 12px !important;
-                background: var(--surface) !important;
-                border: 1px solid var(--border) !important;
-                border-radius: var(--radius-3xl, 24px) !important;
-                color: var(--foreground) !important;
-                font-size: 13px !important;
-                font-weight: 500 !important;
-                cursor: pointer;
-                transition: all 150ms var(--ease-smooth);
-                text-align: left;
+                width: 100%;
+            }
+            .lg-menu-select .lg-select-current-label {
+                font-size: 13px;
+                font-weight: 500;
+                color: var(--lg-foreground);
                 white-space: nowrap;
             }
-            .dropdown__trigger-btn > span {
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-            }
-            .dropdown__trigger-btn:hover {
-                background: var(--surface-tertiary) !important;
-                border-color: var(--border-hover) !important;
-            }
-            .dropdown__trigger-chevron {
-                width: 14px;
-                height: 14px;
+            .lg-menu-select .lg-select-chevron {
+                width: 12px;
+                height: 12px;
+                color: var(--lg-muted);
                 flex-shrink: 0;
-                margin-left: 6px;
-                color: var(--muted);
-                transition: transform 180ms var(--ease-smooth);
+                transition: transform 180ms ease;
             }
-            .dropdown[data-open="true"] .dropdown__trigger-chevron {
+            .lg-menu-select:has(.lg-menu-card[data-phase="open"]) .lg-select-chevron {
                 transform: rotate(180deg);
-                color: var(--foreground);
             }
-            .dropdown__popover {
-                position: absolute;
-                top: calc(100% + 5px);
-                right: 0;
-                left: auto;
-                min-width: 210px;
-                width: max-content;
-                max-width: 320px;
-                background: var(--overlay);
-                color: var(--overlay-foreground);
-                border: 1px solid var(--border);
-                border-radius: var(--radius-lg);
-                box-shadow: 0 12px 30px -4px rgba(0, 0, 0, 0.45), 0 4px 12px -2px rgba(0, 0, 0, 0.25);
-                z-index: 100;
-                overflow: hidden;
-                will-change: transform, opacity;
-                transform: translateZ(0);
-                animation: dropdownIn 160ms cubic-bezier(0.16, 1, 0.3, 1);
+            .lg-menu-select .lg-menu-glyph {
+                display: none !important;
             }
-            @keyframes dropdownIn {
-                from { opacity: 0; transform: translateY(-5px) scale(0.98); }
-                to { opacity: 1; transform: translateY(0) scale(1); }
+            .lg-menu-select .lg-menu-card {
+                min-width: 240px !important;
+                max-width: 340px !important;
+                width: max-content !important;
+                border-radius: 18px !important;
+                background: transparent !important;
+                box-shadow: none !important;
+                border: none !important;
+                outline: none !important;
+                z-index: 100000 !important;
             }
-            .dropdown__menu {
-                display: flex;
-                flex-direction: column;
-                padding: 5px;
-                gap: 2px;
-                max-height: 250px;
-                overflow-y: auto;
+            .lg-menu-select .lg-menu-surface {
+                border-radius: inherit;
+                background: var(--lg-surface);
+                -webkit-backdrop-filter: blur(28px) saturate(2);
+                backdrop-filter: blur(28px) saturate(2);
+                box-shadow:
+                    inset 0 0 0 0.5px var(--lg-surface-edge),
+                    0 20px 60px var(--lg-shadow);
+                pointer-events: none;
+                z-index: -1;
             }
-            .dropdown__item {
+            .lg-menu-select .lg-menu-content {
+                padding: 6px !important;
+            }
+            .lg-menu-select .lg-menu-item {
+                padding: 8px 12px !important;
+                min-height: 38px !important;
+                border-radius: 12px !important;
+                width: 100% !important;
+                box-sizing: border-box !important;
+            }
+            .lg-select-item-inner {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                padding: 7px 11px;
-                border-radius: var(--radius-md);
-                cursor: pointer;
-                color: var(--foreground);
-                transition: background 120ms, color 120ms;
-                user-select: none;
+                width: 100%;
+                gap: 12px;
             }
-            .dropdown__item:hover {
-                background: var(--surface-tertiary);
-            }
-            .dropdown__item[data-selected="true"] {
-                background: var(--accent-soft);
-                color: var(--accent);
-            }
-            .dropdown__item-content {
+            .lg-select-item-text {
                 display: flex;
                 flex-direction: column;
                 gap: 1px;
+                text-align: left;
             }
-            .dropdown__item-label {
+            .lg-select-item-title {
+                font-size: 13px;
                 font-weight: 500;
-                font-size: 12.5px;
+                color: var(--lg-foreground);
             }
-            .dropdown__item-description {
+            .lg-select-item-desc {
                 font-size: 11px;
-                color: var(--muted);
+                color: var(--lg-muted);
+                font-weight: 400;
+                line-height: 1.3;
             }
-            .dropdown__item-indicator {
-                font-size: 12px;
-                font-weight: 700;
-                color: var(--accent);
-                margin-left: 8px;
+            .lg-select-item-check {
+                color: var(--accent, var(--lg-fill));
+                flex-shrink: 0;
             }
-
-            /* HeroUI v3 TagGroup & Tag */
-            .tag-group {
-                display: flex;
-                flex-direction: column;
-                gap: 6px;
-            }
-            .tag-group__label {
-                font-size: 11.5px;
+            .lg-input input[type="number"] {
+                text-align: center;
                 font-weight: 600;
-                color: var(--muted);
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
+                -moz-appearance: textfield;
             }
-            .tag-group__list {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 6px;
+            .lg-input input[type="number"]::-webkit-outer-spin-button,
+            .lg-input input[type="number"]::-webkit-inner-spin-button {
+                -webkit-appearance: none;
+                margin: 0;
             }
-            .tag {
-                display: inline-flex;
-                align-items: center;
-                gap: 6px;
-                padding: 5px 12px;
-                border-radius: var(--radius-full);
-                font-size: 12px;
-                font-weight: 500;
-                background: var(--surface);
-                color: var(--foreground);
-                border: 1px solid var(--border);
-                cursor: pointer;
-                transition: all 140ms var(--ease-smooth);
-                user-select: none;
-                outline: none;
-            }
-            .tag:hover {
-                background: var(--surface-tertiary);
-                border-color: var(--border-hover);
-                transform: translateY(-1px);
-            }
-            .tag[data-selected="true"] {
-                background: var(--accent);
-                color: var(--accent-foreground);
-                border-color: var(--accent);
-                box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 35%, transparent);
-            }
-
-            /* Modal Header TagGroup Tab Navigation */
-            .modal__tab-group {
-                margin-top: 6px;
-                width: 100%;
-            }
-            .modal__tab-tags {
-                display: flex;
-                align-items: center;
-                gap: 6px;
-                padding: 4px;
-                border-radius: var(--radius-xl);
-                background: var(--surface-secondary);
-                border: 1px solid var(--border);
-                width: fit-content;
-                max-width: 100%;
-                overflow-x: auto;
-                scrollbar-width: none;
-            }
-            .modal__tab-tags::-webkit-scrollbar {
-                display: none;
-            }
-            .modal__tab-tags .tag {
-                padding: 7px 16px;
-                font-size: 13px;
-                font-weight: 500;
-                border-radius: calc(var(--radius-xl) - 4px);
-                border: 1px solid transparent;
-                background: transparent;
-                color: var(--muted);
-                cursor: pointer;
-                transition: all 180ms var(--ease-smooth);
-                white-space: nowrap;
-            }
-            .modal__tab-tags .tag:hover {
-                color: var(--foreground);
-                background: var(--surface-tertiary);
-                border-color: transparent;
-                transform: none;
-            }
-            .modal__tab-tags .tag[data-selected="true"] {
-                background: var(--surface);
-                color: var(--foreground);
-                font-weight: 600;
-                border: 1px solid var(--border);
-                box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 3px 10px -2px rgba(0, 0, 0, 0.18);
-            }
-            .modal__tab-tags .tag[data-selected="true"]:hover {
-                background: var(--surface);
-                border-color: var(--border-hover);
-            }
-
-            /* HeroUI v3 Slider */
-            .slider {
-                display: flex;
-                flex-direction: column;
-                gap: 8px;
-                width: 100%;
-                user-select: none;
-            }
-            .slider--inline {
-                display: inline-flex;
-                flex-direction: row;
-                align-items: center;
-                gap: 12px;
-                width: auto;
-            }
-            .slider-track {
-                position: relative;
-                height: 6px;
-                width: 140px;
-                border-radius: var(--radius-full);
-                background: var(--surface-secondary);
-                border: 1px solid var(--border);
-                cursor: pointer;
-                touch-action: none;
-            }
-            .slider-fill {
-                position: absolute;
-                top: 0;
-                left: 0;
-                height: 100%;
-                border-radius: var(--radius-full);
-                background: var(--accent);
-                pointer-events: none;
-            }
-            .slider-thumb {
-                position: absolute;
-                top: 50%;
-                width: 16px;
-                height: 16px;
-                border-radius: 50%;
-                background: #ffffff;
-                border: 2px solid var(--accent);
-                box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
-                transform: translate(-50%, -50%);
-                cursor: grab;
-                transition: transform 120ms ease, box-shadow 120ms ease;
-                outline: none;
-            }
-            .slider-thumb:hover {
-                transform: translate(-50%, -50%) scale(1.18);
-            }
-            .slider-thumb[data-dragging="true"], .slider-thumb:active {
-                cursor: grabbing;
-                transform: translate(-50%, -50%) scale(1.22);
-                box-shadow: 0 0 0 4px var(--accent-soft);
-            }
-            .slider__output {
-                font-size: 13px;
-                font-weight: 700;
-                color: var(--foreground);
-                min-width: 44px;
-                text-align: right;
-                font-variant-numeric: tabular-nums;
-            }
-        `;
+        `);
     }
-
-    function getEffectiveTheme(thm) {
+function getEffectiveTheme(thm) {
         const t = thm || settings.theme;
         if (t === 'auto') {
             try { return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark'; }
@@ -4370,6 +4982,21 @@
             }
             saveSettings();
             LOG('telemetry preset:', value);
+            if (reactSetSettings) reactSetSettings(cloneSettings(settings));
+            return;
+        }
+
+        if (key === 'extraSecondsRange') {
+            let min = Number(value && value.min);
+            let max = Number(value && value.max);
+            if (!isFinite(min) || min < 1) min = DEFAULT_SETTINGS.extraSecondsMin;
+            if (!isFinite(max) || max < 1) max = DEFAULT_SETTINGS.extraSecondsMax;
+            min = Math.round(min); max = Math.round(max);
+            if (min > max) { const t = min; min = max; max = t; }
+            settings.extraSecondsMin = min;
+            settings.extraSecondsMax = max;
+            saveSettings();
+            LOG('range set to:', settings.extraSecondsMin, '–', settings.extraSecondsMax);
             if (reactSetSettings) reactSetSettings(cloneSettings(settings));
             return;
         }
@@ -4428,12 +5055,25 @@
             case 'disableAutoFullscreen':
                 LOG('auto-fullscreen blocking ' + (value ? 'ENABLED' : 'DISABLED'));
                 break;
+            case 'spoofVisibility':
+                patchVisibilityProps();
+                installHasFocusPatch();
+                LOG('visibility spoofing ' + (value ? 'ENABLED' : 'DISABLED'));
+                break;
             case 'darkMode':
                 ensureDarkModeStyles();
                 applyDarkMode();
                 break;
             case 'logLevel':
                 LOG('log level set to:', value);
+                break;
+            case 'keybindAction':
+                if (value === 'open-modal') {
+                    settings.pillVisible = false;
+                } else if (value === 'toggle-pill') {
+                    settings.pillVisible = true;
+                }
+                LOG('keybind action set to:', value, '| pillVisible:', settings.pillVisible);
                 break;
         }
 
@@ -4457,184 +5097,1974 @@
         if (reactSetSettings) reactSetSettings(cloneSettings(settings));
     }
 
+    
     // ============================================================
-    // HEROUI v3 REACT COMPOUND COMPONENTS
+    // OFFICIAL KELVIN ZHANG GLISSE ENGINE (https://glisse.kelvinzhang.com/)
+    // Directly bundled from official npm package glisse@0.4.3
+    // Exports: Button, Glass, Input, Menu, SearchField, Slider, Switch, TabBar
+    // ============================================================
+var Glisse = (() => {
+  var __defProp = Object.defineProperty;
+  var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+  var __getOwnPropNames = Object.getOwnPropertyNames;
+  var __hasOwnProp = Object.prototype.hasOwnProperty;
+  var __export = (target, all) => {
+    for (var name in all)
+      __defProp(target, name, { get: all[name], enumerable: true });
+  };
+  var __copyProps = (to, from, except, desc) => {
+    if (from && typeof from === "object" || typeof from === "function") {
+      for (let key of __getOwnPropNames(from))
+        if (!__hasOwnProp.call(to, key) && key !== except)
+          __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+    }
+    return to;
+  };
+  var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+
+  // ../../../../../../private/tmp/glisse_pkg/entry.js
+  var entry_exports = {};
+  __export(entry_exports, {
+    Button: () => Button,
+    Glass: () => Glass,
+    Input: () => Input,
+    Menu: () => Menu,
+    SearchField: () => SearchField,
+    Slider: () => Slider,
+    Switch: () => Switch,
+    TabBar: () => TabBar
+  });
+
+  // ../../../../../../private/tmp/glisse_pkg/react-shim.js
+  var React = typeof window !== "undefined" && window.React ? window.React : typeof globalThis !== "undefined" && globalThis.React ? globalThis.React : {};
+  var forwardRef = React.forwardRef ? React.forwardRef.bind(React) : (fn) => fn;
+  var useCallback = (...args) => (window.React || React).useCallback(...args);
+  var useEffect = (...args) => (window.React || React).useEffect(...args);
+  var useImperativeHandle = (...args) => (window.React || React).useImperativeHandle(...args);
+  var useLayoutEffect = (...args) => (window.React || React).useLayoutEffect(...args);
+  var useRef = (...args) => (window.React || React).useRef(...args);
+  var useState = (...args) => (window.React || React).useState(...args);
+
+  // ../../../../../../private/tmp/glisse_pkg/jsx-shim.js
+  function jsx(type, props, key) {
+    const R = typeof window !== "undefined" && window.React ? window.React : globalThis.React;
+    if (!props) return R.createElement(type, key !== void 0 ? { key } : null);
+    const { children, ...rest } = props;
+    const finalProps = key !== void 0 ? { ...rest, key } : rest;
+    return R.createElement(type, finalProps, children);
+  }
+  function jsxs(type, props, key) {
+    const R = typeof window !== "undefined" && window.React ? window.React : globalThis.React;
+    if (!props) return R.createElement(type, key !== void 0 ? { key } : null);
+    const { children, ...rest } = props;
+    const finalProps = key !== void 0 ? { ...rest, key } : rest;
+    if (Array.isArray(children)) {
+      return R.createElement(type, finalProps, ...children);
+    }
+    return R.createElement(type, finalProps, children);
+  }
+
+  // ../../../../../../private/tmp/glisse_pkg/package/dist/index.js
+  var id = "glisse-styles";
+  function insertStyles(css) {
+    if (typeof document === "undefined" || document.getElementById(id)) return;
+    const style = document.createElement("style");
+    style.id = id;
+    style.textContent = css;
+    (document.head || document.documentElement).prepend(style);
+  }
+  var styles_default = ':where(:root,[data-theme=light]){--lg-foreground:#000000e0;--lg-muted:#3c3c4399;--lg-glass:#fff9;--lg-glass-active:#ececf0d9;--lg-edge:#00000014;--lg-drop:#0000000f;--lg-selection:#0000001a;--lg-lens:#ffffff4d;--lg-surface:#fafafcdb;--lg-surface-edge:#00000014;--lg-shadow:#1919231f;--lg-highlight:#3c3c4317;--lg-separator:#3c3c4326;--lg-destructive:#ff383c;--lg-track:#3b3b424d;--lg-rail:#0000001a;--lg-on:#34c759;--lg-fill:#08f;--lg-ring:#0006;--lg-ease:cubic-bezier(.25, .1, .25, 1)}:where([data-theme=dark]){--lg-foreground:#fff;--lg-muted:#ebebf599;--lg-glass:#2828289e;--lg-glass-active:#4646469e;--lg-edge:#ffffff14;--lg-drop:transparent;--lg-selection:#ffffff25;--lg-lens:#ffffff0e;--lg-surface:#1c1c1fdb;--lg-surface-edge:#ffffff21;--lg-shadow:#00000061;--lg-highlight:#ebebf521;--lg-separator:#ebebf529;--lg-destructive:#ff4245;--lg-track:#ebebf54d;--lg-rail:#ffffff1a;--lg-on:#30d158;--lg-fill:#0091ff;--lg-ring:#ffffff80}@media (prefers-color-scheme:dark){:where(:root:not([data-theme=light])){--lg-foreground:#fff;--lg-muted:#ebebf599;--lg-glass:#2828289e;--lg-glass-active:#4646469e;--lg-edge:#ffffff14;--lg-drop:transparent;--lg-selection:#ffffff25;--lg-lens:#ffffff0e;--lg-surface:#1c1c1fdb;--lg-surface-edge:#ffffff21;--lg-shadow:#00000061;--lg-highlight:#ebebf521;--lg-separator:#ebebf529;--lg-destructive:#ff4245;--lg-track:#ebebf54d;--lg-rail:#ffffff1a;--lg-on:#30d158;--lg-fill:#0091ff;--lg-ring:#ffffff80}}.lg-glass{background-color:var(--lg-glass);background-image:var(--lg-rim,none);-webkit-backdrop-filter:blur(var(--lg-blur,3px)) var(--lg-filter,saturate(1.5));backdrop-filter:blur(var(--lg-blur,3px)) var(--lg-filter,saturate(1.5));box-shadow:inset 0 0 0 .5px var(--lg-edge), 0 1px 3px var(--lg-drop);background-size:100% 100%;position:relative}.lg-glass:after{content:"";border-radius:inherit;pointer-events:none;background:radial-gradient(circle 240px at var(--lg-x,50%) var(--lg-y,50%), #ffffff09, #ffffff06 50%, transparent);opacity:0;transition:opacity .22s ease-in-out;position:absolute;inset:0}.lg-glass[data-pressed]:after{opacity:1;transition-duration:0s}.lg-glass[data-copy]{-webkit-backdrop-filter:none;backdrop-filter:none}.lg-glass-copy{transform-origin:0 0;pointer-events:none;margin:0;position:absolute;top:0;left:0;overflow:hidden}.lg-glass-copy>div{transform-origin:0 0;position:absolute;top:0;left:0}.lg-button{height:40px;color:var(--lg-foreground);font:inherit;cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;border:0;border-radius:20px;justify-content:center;align-items:center;gap:8px;padding:0 16px;font-size:14px;transition:background-color .2s;display:inline-flex}.lg-button[data-icon]{padding-left:12px}.lg-button[data-icon=only]{width:40px;padding:0}.lg-button>svg{flex:none;width:20px;height:20px}.lg-button:is(:active,[data-pressed]){background-color:var(--lg-glass-active);transition-duration:0s}@media (hover:hover) and (pointer:fine){.lg-button:hover{background-color:var(--lg-glass-active)}}.lg-button:disabled{background-color:var(--lg-glass);opacity:.35;cursor:default}.lg-button[data-destructive]:not([data-tint]){--lg-tint:var(--lg-destructive)}.lg-button:is([data-tint],[data-destructive]){color:var(--lg-tint)}.lg-button[data-variant=filled]{--lg-button-fill:var(--lg-tint,var(--lg-fill));color:#fff}.lg-button[data-variant=filled],.lg-button[data-variant=filled]:disabled{background-color:var(--lg-button-fill)}.lg-button[data-variant=filled]:is(:active,[data-pressed]){background-color:color-mix(in srgb, var(--lg-button-fill) 85%, #000)}@media (hover:hover) and (pointer:fine){.lg-button[data-variant=filled]:hover{background-color:color-mix(in srgb, var(--lg-button-fill) 88%, #fff)}.lg-button[data-variant=filled]:hover:is(:active,[data-pressed]){background-color:color-mix(in srgb, var(--lg-button-fill) 85%, #000)}}.lg-button:focus-visible,.lg-tab:focus-visible,.lg-switch:focus-visible,.lg-menu-item:focus-visible{outline:2px solid var(--lg-ring);outline-offset:2px}.lg-tab-bar{--lg-tab-width:84px;--lg-tab-height:32px;--lg-lens-grow-x:27px;--lg-lens-grow-y:20px;border-radius:calc(var(--lg-tab-height) / 2 + 4px);touch-action:pan-y;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;padding:4px;display:inline-flex;position:relative}.lg-tab-bar-glass{border-radius:inherit;pointer-events:none;position:absolute;inset:0}.lg-tab-bar-glass:before{content:"";border-radius:inherit;background:radial-gradient(circle 260px at var(--lg-x,20%) 50%, #ffffff17, #ffffff0b 60%, transparent);opacity:0;transition:opacity .16s;position:absolute;inset:0}.lg-tab-bar[data-lifted] .lg-tab-bar-glass:before{opacity:1;transition-duration:.12s}.lg-tab,.lg-tab-copy{width:var(--lg-tab-width);height:var(--lg-tab-height);font:inherit;flex:none;justify-content:center;align-items:center;font-size:14px;display:flex}.lg-tab{z-index:1;border-radius:calc(var(--lg-tab-height) / 2);color:var(--lg-muted);cursor:pointer;-webkit-touch-callout:none;background:0 0;border:0;padding:0;text-decoration:none;transition:color .2s;position:relative}.lg-tab:focus-visible{outline-offset:-2px}@media (hover:hover) and (pointer:fine){.lg-tab:hover{color:var(--lg-foreground)}}.lg-tab-lens,.lg-tab-tint{width:var(--lg-tab-width);height:var(--lg-tab-height);border-radius:calc(var(--lg-tab-height) / 2);pointer-events:none;transform:translateX(calc(var(--lg-tab-width) * var(--lg-index,0)));will-change:transform;transition:opacity .14s;position:absolute;top:4px;left:4px}.lg-tab-tint{z-index:1;color:var(--lg-foreground);overflow:hidden}.lg-tab-row{height:100%;transform:translateX(calc(var(--lg-tab-width) * var(--lg-index,0) * -1));transform-origin:0 0;will-change:transform;display:flex}.lg-tab-lens.lg-glass{z-index:2;-webkit-backdrop-filter:none;backdrop-filter:none;box-shadow:none;background-color:#0000;background-image:none;transition:opacity .14s,background-color .14s}.lg-tab-bar[data-lifted] .lg-tab-lens.lg-glass{background-color:var(--lg-lens);transition-duration:.1s}.lg-tab-lens:before{content:"";border-radius:inherit;background:var(--lg-selection);transition:opacity .14s;position:absolute;inset:0}.lg-tab-lens[data-pressed]:after{opacity:.2}.lg-tab-bar[data-lifted] .lg-tab-lens:before{opacity:0;transition-duration:.1s}.lg-tab-bar[data-refracting] .lg-tab-lens.lg-glass{background-image:var(--lg-rim,none);-webkit-backdrop-filter:var(--lg-filter,none);backdrop-filter:var(--lg-filter,none)}:is(.lg-tab-bar[data-hidden] :is(.lg-tab-lens,.lg-tab-tint),.lg-tab-bar:not([data-ready]):not(:has([data-selected])) :is(.lg-tab-lens,.lg-tab-tint)){opacity:0}.lg-input{box-sizing:border-box;width:100%;max-width:360px;height:40px;color:var(--lg-foreground);border-radius:20px;align-items:center;gap:10px;padding:0 14px;transition:background-color .2s;display:flex}.lg-input:focus-within{background-color:var(--lg-glass-active)}.lg-input input{min-width:0;height:100%;color:inherit;font:inherit;background:0 0;border:0;outline:0;flex:1;padding:0;font-size:14px}.lg-input input::placeholder{color:var(--lg-muted)}.lg-input input::-webkit-search-cancel-button{display:none}.lg-input-icon{width:16px;height:16px;color:var(--lg-muted);flex:none;place-items:center;display:grid}.lg-input-icon>svg{width:100%;height:100%}.lg-input-clear{width:32px;height:32px;color:var(--lg-muted);cursor:pointer;background:0 0;border:0;border-radius:50%;flex:none;place-items:center;margin-right:-8px;padding:0;display:grid}.lg-input-clear svg{width:14px;height:14px}.lg-input:has(input:disabled){opacity:.35}.lg-switch-thumb,.lg-slider-thumb{pointer-events:none;-webkit-backdrop-filter:blur(2px)brightness(1.15)saturate(1.5);backdrop-filter:blur(2px)brightness(1.15)saturate(1.5);border-radius:999px;position:absolute;box-shadow:0 6px 24px #0003,inset 0 0 0 1.5px #ffffff80,inset 0 2px 1px #ffffff73,inset 2px 7px 24px #00000017,inset -2px -7px 24px #ffffff29}.lg-thumb-face{border-radius:inherit;background:#fff;position:absolute;inset:0}.lg-switch{--lg-scale:.375;width:calc(160px * var(--lg-scale));height:calc(67px * var(--lg-scale));background:var(--lg-track);cursor:pointer;touch-action:pan-y;-webkit-tap-highlight-color:transparent;border:0;border-radius:999px;flex:none;padding:0;position:relative}.lg-switch:before{content:"";inset:min(0px, calc((67px * var(--lg-scale) - 44px) / 2)) -8px;position:absolute}.lg-switch-fill{border-radius:inherit;background:var(--lg-on);opacity:0;position:absolute;inset:0}.lg-switch-thumb{top:50%;left:calc(-21.95px * var(--lg-scale));width:calc(146px * var(--lg-scale));height:calc(92px * var(--lg-scale));transform:translateY(-50%)scale(.65)}.lg-switch[aria-checked=true] .lg-switch-fill{opacity:1}.lg-switch[aria-checked=true] .lg-switch-thumb{transform:translate(calc(57.9px * var(--lg-scale)), -50%) scale(.65)}.lg-switch:disabled{opacity:.35;cursor:default}.lg-slider{width:100%;height:40px;position:relative}.lg-slider-track{background:var(--lg-rail);pointer-events:none;border-radius:3px;height:6px;position:absolute;inset:17px 0 auto;overflow:hidden}.lg-slider-fill{background:var(--lg-fill);height:100%;transform:scaleX(var(--lg-progress));transform-origin:0;display:block}.lg-slider-thumb{top:0;left:calc((100% - 36px) * var(--lg-progress) - 12px);width:60px;height:40px;scale:.6}.lg-slider input{z-index:1;cursor:pointer;appearance:none;touch-action:pan-y;-webkit-tap-highlight-color:transparent;background:0 0;outline:none;width:100%;height:40px;margin:0;display:block;position:relative}.lg-slider input::-webkit-slider-runnable-track{background:0 0;height:6px}.lg-slider input::-webkit-slider-thumb{width:36px;height:40px;box-shadow:none;opacity:0;touch-action:none;appearance:none;background:0 0;border:0;margin-top:-17px}.lg-slider input::-moz-range-track{background:0 0;height:6px}.lg-slider input::-moz-range-thumb{width:36px;height:40px;box-shadow:none;opacity:0;background:0 0;border:0}.lg-slider:has(input:focus-visible) .lg-slider-thumb{outline:2px solid var(--lg-ring);outline-offset:3px}.lg-slider:has(input:disabled){opacity:.35}.lg-slider input:disabled{cursor:default}.lg-menu{display:inline-flex;position:relative}.lg-menu-card{z-index:10;box-sizing:border-box;width:200px;color:var(--lg-foreground);transform-origin:calc(100% - 20px) 20px;touch-action:none;-webkit-user-select:none;user-select:none;border-radius:20px;font-size:14px;position:absolute;top:0;right:0}.lg-menu-card[data-align=start]{transform-origin:20px 20px;left:0;right:auto}.lg-menu-card[data-phase=leaving]{pointer-events:none}.lg-menu-surface{border-radius:inherit;background:var(--lg-surface);-webkit-backdrop-filter:blur(22px)saturate(1.9);backdrop-filter:blur(22px)saturate(1.9);width:100%;height:100%;box-shadow:inset 0 0 0 .5px var(--lg-surface-edge), 0 12px 40px var(--lg-shadow);pointer-events:none;position:absolute;top:0;right:0}.lg-menu-card[data-align=start] .lg-menu-surface{left:0;right:auto}.lg-menu-glyph{pointer-events:none;place-items:center;width:40px;height:40px;display:grid;position:absolute;top:0;right:0}.lg-menu-card[data-align=start] .lg-menu-glyph{left:0;right:auto}.lg-menu-glyph>svg{width:20px;height:20px}.lg-menu-content{flex-direction:column;padding:6px;display:flex;position:relative}.lg-menu-card:after{content:"";border-radius:inherit;pointer-events:none;opacity:0;background:linear-gradient(135deg,#ffffff1c,#ffffff06);transition:opacity .12s ease-out;position:absolute;inset:0}.lg-menu-card[data-pressed]:after{opacity:1}.lg-menu-plate{background:var(--lg-highlight);opacity:0;pointer-events:none;border-radius:14px;transition:transform .1s cubic-bezier(.2,.8,.2,1),opacity 80ms ease-out;position:absolute;top:0;left:0}.lg-menu-item{z-index:1;min-height:32px;color:inherit;font:inherit;text-align:left;cursor:pointer;background:0 0;border:0;border-radius:14px;align-items:center;gap:10px;padding:6px 12px;display:flex;position:relative}.lg-menu-item>svg{flex:none;width:16px;height:16px}.lg-menu-item:focus-visible{outline-offset:-2px;background:var(--lg-highlight)}@media (hover:hover) and (pointer:fine){.lg-menu-item:hover:not(:disabled){background:var(--lg-highlight)}}.lg-menu-card[data-scrubbing] .lg-menu-item{background:0 0;outline:none}.lg-menu-item[data-destructive]{color:var(--lg-destructive)}.lg-menu-item:disabled{opacity:.38;cursor:default}.lg-menu-separator{border-top:.5px solid var(--lg-separator);flex:none;margin:7px 11px}@media (prefers-reduced-motion:reduce){.lg-menu-plate{transition:opacity 80ms ease-out}.lg-menu-card{animation:.1s ease-out lg-menu-fade}}@keyframes lg-menu-fade{0%{opacity:0}}';
+  function cx(...names) {
+    return names.filter(Boolean).join(" ");
+  }
+  var moving = /* @__PURE__ */ new Set();
+  var frame = 0;
+  var last = 0;
+  function advance(s, dt) {
+    const x = s.value - s.target;
+    const v = s.velocity;
+    const half = s.damping / 2;
+    const discriminant = half * half - s.stiffness;
+    if (Math.abs(discriminant) < 1e-4) {
+      const decay = Math.exp(-half * dt);
+      const b = v + half * x;
+      s.value = s.target + decay * (x + b * dt);
+      s.velocity = decay * (v - half * b * dt);
+    } else if (discriminant > 0) {
+      const root = Math.sqrt(discriminant);
+      const r1 = -half + root;
+      const r2 = -half - root;
+      const a = (v - r2 * x) / (r1 - r2);
+      const b = x - a;
+      s.value = s.target + a * Math.exp(r1 * dt) + b * Math.exp(r2 * dt);
+      s.velocity = a * r1 * Math.exp(r1 * dt) + b * r2 * Math.exp(r2 * dt);
+    } else {
+      const omega = Math.sqrt(-discriminant);
+      const decay = Math.exp(-half * dt);
+      const cos = Math.cos(omega * dt);
+      const sin = Math.sin(omega * dt);
+      s.value = s.target + decay * (x * cos + (v + half * x) / omega * sin);
+      s.velocity = decay * (v * cos - (half * v + s.stiffness * x) / omega * sin);
+    }
+  }
+  function tick(time) {
+    frame = 0;
+    const dt = Math.min(0.1, Math.max(0, (time - last) / 1e3));
+    last = time;
+    for (const s of moving) {
+      advance(s, dt);
+      if (Math.abs(s.value - s.target) < 1e-4 && Math.abs(s.velocity) < 1e-3) {
+        s.value = s.target;
+        s.velocity = 0;
+        moving.delete(s);
+      }
+      s.paint(s.value);
+    }
+    if (moving.size) frame = requestAnimationFrame(tick);
+  }
+  function prefersReducedMotion() {
+    return matchMedia("(prefers-reduced-motion: reduce)").matches;
+  }
+  function createSpring(value, stiffness, damping, paint) {
+    const s = {
+      value,
+      target: value,
+      velocity: 0,
+      stiffness,
+      damping,
+      paint
+    };
+    return {
+      paint: () => paint(s.value),
+      set(target, instant = false) {
+        s.target = target;
+        if (instant || document.hidden || prefersReducedMotion()) {
+          s.value = target;
+          s.velocity = 0;
+          moving.delete(s);
+          paint(target);
+          return;
+        }
+        moving.add(s);
+        if (!frame) {
+          last = Number(document.timeline?.currentTime ?? performance.now());
+          frame = requestAnimationFrame(tick);
+        }
+      },
+      tune(nextStiffness, nextDamping) {
+        s.stiffness = nextStiffness;
+        s.damping = nextDamping;
+      },
+      stop: () => {
+        moving.delete(s);
+      }
+    };
+  }
+  var POINTER = {
+    grow: 6,
+    press: [417.6, 29.2],
+    release: [230, 23.7]
+  };
+  var TOUCH = {
+    grow: 15,
+    press: [515, 27.3],
+    release: [250, 11.8]
+  };
+  function usePress(ref) {
+    useEffect(() => {
+      const el = ref.current;
+      if (!el) return;
+      const value = [
+        1,
+        1,
+        0,
+        0
+      ];
+      const paint = () => {
+        el.style.scale = `${value[0]} ${value[1]}`;
+        el.style.translate = `${value[2]}px ${value[3]}px`;
+      };
+      const springs = value.map((initial, i) => createSpring(initial, ...POINTER.release, (next) => {
+        value[i] = next;
+        paint();
+      }));
+      let pointer = null;
+      const target = (next, [stiffness, damping]) => {
+        springs.forEach((spring, i) => {
+          spring.tune(stiffness, damping);
+          spring.set(next[i] ?? 0);
+        });
+      };
+      const track = (event) => {
+        if (!pointer) return;
+        const { box, feel } = pointer;
+        el.style.setProperty("--lg-x", `${(event.clientX - box.left) / box.width * 100}%`);
+        el.style.setProperty("--lg-y", `${(event.clientY - box.top) / box.height * 100}%`);
+        const { width, height } = box;
+        const base = 1 + feel.grow / Math.max(width, height);
+        const aspect = width / height;
+        const dx = (event.clientX - pointer.x) / aspect;
+        const dy = event.clientY - pointer.y;
+        const length = Math.hypot(dx, dy);
+        if (!length) return target([
+          base,
+          base,
+          0,
+          0
+        ], feel.press);
+        const nx = dx / length;
+        const ny = dy / length;
+        const rubber = 1 - 1 / (1 + length / height / (5 * aspect));
+        const stretch = 1 + 6 / height * rubber * Math.abs(Math.abs(nx) - Math.abs(ny));
+        const horizontal = Math.abs(nx) > Math.abs(ny);
+        target([
+          base * (horizontal ? stretch : 1 / stretch),
+          base * (horizontal ? 1 / stretch : stretch),
+          nx * 8 * rubber,
+          ny * 8 * rubber
+        ], feel.press);
+      };
+      const move = (event) => {
+        if (event.pointerId === pointer?.id) track(event);
+      };
+      const end = (event) => {
+        if (event && event.pointerId !== pointer?.id) return;
+        const feel = pointer?.feel ?? POINTER;
+        pointer = null;
+        delete el.dataset.pressed;
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", end);
+        window.removeEventListener("pointercancel", end);
+        target([
+          1,
+          1,
+          0,
+          0
+        ], feel.release);
+      };
+      const down = (event) => {
+        if (!event.isPrimary || event.button !== 0 || pointer || el.matches(":disabled")) return;
+        pointer = {
+          id: event.pointerId,
+          x: event.clientX,
+          y: event.clientY,
+          box: el.getBoundingClientRect(),
+          feel: event.pointerType === "mouse" ? POINTER : TOUCH
+        };
+        el.dataset.pressed = "";
+        window.addEventListener("pointermove", move);
+        window.addEventListener("pointerup", end);
+        window.addEventListener("pointercancel", end);
+        track(event);
+      };
+      const reset = () => end();
+      el.addEventListener("pointerdown", down);
+      window.addEventListener("blur", reset);
+      return () => {
+        end();
+        springs.forEach((spring) => spring.stop());
+        el.removeEventListener("pointerdown", down);
+        window.removeEventListener("blur", reset);
+        el.style.removeProperty("scale");
+        el.style.removeProperty("translate");
+      };
+    }, [ref]);
+  }
+  var SVG = "http://www.w3.org/2000/svg";
+  var lenses = /* @__PURE__ */ new Map();
+  var defs;
+  var clamp$2 = (value, min, max) => Math.min(max, Math.max(min, value));
+  function svg(name, attributes) {
+    const element = document.createElementNS(SVG, name);
+    for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
+    return element;
+  }
+  function container() {
+    if (defs?.isConnected) return defs;
+    const root = svg("svg", {
+      width: 0,
+      height: 0,
+      "aria-hidden": "true"
+    });
+    root.style.cssText = "position:absolute;pointer-events:none;width:0;height:0;";
+    defs = svg("defs", {});
+    root.append(defs);
+    const target = (typeof uiShadowRoot !== "undefined" && uiShadowRoot) || document.body || document.documentElement;
+    if (target) target.append(root);
+    if (document.body && target !== document.body) {
+      try {
+        document.body.append(root.cloneNode(true));
+      } catch {}
+    }
+    return defs;
+  }
+  function profile(bezel, thickness) {
+    const samples = /* @__PURE__ */ new Float32Array(128);
+    let maximum = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const t = Math.max(1e-3, i / (samples.length - 1));
+      const surface = (1 - (1 - t) ** 4) ** 0.25;
+      const incident = Math.atan((1 - t) ** 3 / surface ** 3);
+      const refracted = Math.asin(Math.sin(incident) / 1.5);
+      samples[i] = Math.tan(incident - refracted) * (thickness + surface * bezel);
+      maximum = Math.max(maximum, samples[i]);
+    }
+    return {
+      samples,
+      maximum
+    };
+  }
+  function maps(width, height, radius, selection, shape) {
+    const density = Math.min(devicePixelRatio || 1, 2);
+    const bezel = shape.bezel ?? clamp$2(Math.min(width, height) * 0.12, 4, 10);
+    const { samples, maximum } = profile(bezel, shape.thickness ?? clamp$2(Math.min(width, height) * 0.2, 8, 24));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.ceil(width * density);
+    canvas.height = Math.ceil(height * density);
+    const context = canvas.getContext("2d");
+    const field = context.createImageData(canvas.width, canvas.height);
+    const shine = context.createImageData(canvas.width, canvas.height);
+    const magnify = shape.zoom > 1 ? context.createImageData(canvas.width, canvas.height) : void 0;
+    const reach = Math.max(width, height) / 2;
+    const direction = selection ? 1 : -1;
+    for (let y = 0; y < canvas.height; y++) for (let x = 0; x < canvas.width; x++) {
+      const px = (x + 0.5) * width / canvas.width - width / 2;
+      const py = (y + 0.5) * height / canvas.height - height / 2;
+      const qx = Math.abs(px) - (width / 2 - radius);
+      const qy = Math.abs(py) - (height / 2 - radius);
+      const ox = Math.max(qx, 0);
+      const oy = Math.max(qy, 0);
+      const length = Math.hypot(ox, oy);
+      const distance = radius - (length + Math.min(Math.max(qx, qy), 0));
+      const nx = length > 0 ? ox / length * Math.sign(px) : qx > qy ? Math.sign(px) : 0;
+      const ny = length > 0 ? oy / length * Math.sign(py) : qx > qy ? 0 : Math.sign(py);
+      let shift = 0;
+      if (distance >= 0 && distance < bezel) {
+        const sample = distance / bezel * (samples.length - 1);
+        const lower = Math.floor(sample);
+        const a = samples[lower];
+        shift = a + (samples[Math.min(lower + 1, samples.length - 1)] - a) * (sample - lower);
+      }
+      const i = (y * canvas.width + x) * 4;
+      field.data[i] = Math.round(127.5 + direction * nx * shift / maximum * 127.5);
+      field.data[i + 1] = Math.round(127.5 + direction * ny * shift / maximum * 127.5);
+      field.data[i + 2] = 128;
+      field.data[i + 3] = 255;
+      if (magnify) {
+        magnify.data[i] = Math.round(127.5 - px / reach * 127.5);
+        magnify.data[i + 1] = Math.round(127.5 - py / reach * 127.5);
+        magnify.data[i + 2] = 128;
+        magnify.data[i + 3] = 255;
+      }
+      const light = -(nx + ny) * Math.SQRT1_2;
+      const glint = Math.max(light, 0) ** 3;
+      const reflected = Math.max(-light, 0) ** 3;
+      shine.data[i] = shine.data[i + 1] = shine.data[i + 2] = 255;
+      let alpha = 0;
+      if (distance >= 0 && selection) {
+        const bands = [
+          0.18,
+          0.42,
+          0.66
+        ].map((centre) => Math.exp(-(((distance - centre) / 0.22) ** 2)));
+        const peak = Math.max(...bands);
+        alpha = peak * (0.06 + 0.8 * glint + 0.35 * reflected) * 0.85;
+        for (let channel = 0; channel < 3; channel++) shine.data[i + channel] = Math.round(255 * (0.65 + 0.35 * (peak ? bands[channel] / peak : 0)));
+      } else if (distance >= 0) {
+        const rim = Math.exp(-(((distance - 0.4) / 0.38) ** 2));
+        const bloom = Math.exp(-((distance / (bezel * 0.22)) ** 2));
+        alpha = rim * (0.045 + 0.52 * glint + 0.2 * reflected) + bloom * 0.02 * glint;
+      }
+      shine.data[i + 3] = Math.round(clamp$2(alpha, 0, 1) * 255);
+    }
+    context.putImageData(field, 0, 0);
+    const displacement = canvas.toDataURL();
+    context.putImageData(shine, 0, 0);
+    const highlight = canvas.toDataURL();
+    let zoom;
+    if (magnify) {
+      context.putImageData(magnify, 0, 0);
+      zoom = {
+        map: canvas.toDataURL(),
+        scale: 2 * reach * (1 - 1 / shape.zoom)
+      };
+    }
+    return {
+      displacement,
+      highlight,
+      zoom,
+      scale: maximum * 2 * shape.level
+    };
+  }
+  function lens(width, height, radius, selection, shape) {
+    const key = Object.values({
+      width,
+      height,
+      radius,
+      selection,
+      ...shape
+    }).join("-");
+    const cached = lenses.get(key);
+    if (cached) return cached;
+    const { displacement, highlight, zoom, scale } = maps(width, height, radius, selection, shape);
+    const id2 = `glisse-${lenses.size}`;
+    const box = {
+      x: 0,
+      y: 0,
+      width,
+      height
+    };
+    const filter = svg("filter", {
+      id: id2,
+      ...box,
+      filterUnits: "userSpaceOnUse",
+      primitiveUnits: "userSpaceOnUse",
+      "color-interpolation-filters": "sRGB"
+    });
+    filter.append(svg("feImage", {
+      href: displacement,
+      ...box,
+      preserveAspectRatio: "none",
+      result: "field"
+    }));
+    if (selection) {
+      for (const [name, factor, values] of [
+        [
+          "r",
+          1.035,
+          "1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0"
+        ],
+        [
+          "g",
+          1,
+          "0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0"
+        ],
+        [
+          "b",
+          0.965,
+          "0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 1 0"
+        ]
+      ]) filter.append(svg("feDisplacementMap", {
+        in: "SourceGraphic",
+        in2: "field",
+        scale: scale * factor,
+        xChannelSelector: "R",
+        yChannelSelector: "G",
+        result: `${name}-ray`
+      }), svg("feColorMatrix", {
+        in: `${name}-ray`,
+        type: "matrix",
+        values,
+        result: name
+      }));
+      filter.append(svg("feComposite", {
+        in: "r",
+        in2: "g",
+        operator: "arithmetic",
+        k2: 1,
+        k3: 1,
+        result: "rg"
+      }), svg("feComposite", {
+        in: "rg",
+        in2: "b",
+        operator: "arithmetic",
+        k2: 1,
+        k3: 1
+      }));
+    } else {
+      if (zoom) filter.append(svg("feImage", {
+        href: zoom.map,
+        ...box,
+        preserveAspectRatio: "none",
+        result: "zoom"
+      }), svg("feDisplacementMap", {
+        in: "SourceGraphic",
+        in2: "zoom",
+        scale: zoom.scale,
+        xChannelSelector: "R",
+        yChannelSelector: "G",
+        result: "magnified"
+      }));
+      filter.append(svg("feDisplacementMap", {
+        in: zoom ? "magnified" : "SourceGraphic",
+        in2: "field",
+        scale,
+        xChannelSelector: "R",
+        yChannelSelector: "G",
+        result: "bent"
+      }), svg("feGaussianBlur", {
+        in: "bent",
+        stdDeviation: 0.4,
+        result: "displaced"
+      }), svg("feColorMatrix", {
+        in: "displaced",
+        type: "saturate",
+        values: 1.5,
+        result: "face"
+      }));
+      if (shape.saturation > 1) {
+        const mask = svg("feComponentTransfer", {
+          in: "shine",
+          result: "mask"
+        });
+        mask.append(svg("feFuncA", {
+          type: "linear",
+          slope: 1.8
+        }));
+        filter.append(svg("feColorMatrix", {
+          in: "displaced",
+          type: "saturate",
+          values: shape.saturation,
+          result: "vivid"
+        }), svg("feImage", {
+          href: highlight,
+          ...box,
+          preserveAspectRatio: "none",
+          result: "shine"
+        }), mask, svg("feComposite", {
+          in: "vivid",
+          in2: "mask",
+          operator: "in",
+          result: "edge"
+        }), svg("feBlend", {
+          in: "edge",
+          in2: "face",
+          mode: "normal"
+        }));
+      }
+    }
+    container().append(filter);
+    const result = {
+      filter: `url("#${id2}")`,
+      rim: `url("${highlight}")`
+    };
+    lenses.set(key, result);
+    return result;
+  }
+  function fit(element, selection, filtered) {
+    const width = element.offsetWidth;
+    const height = element.offsetHeight;
+    if (!width || !height) return;
+    const style = getComputedStyle(element);
+    const corner = style.borderTopLeftRadius;
+    const radius = Math.min(width / 2, height / 2, corner.endsWith("%") ? Math.min(width, height) * parseFloat(corner) / 100 : parseFloat(corner));
+    const length = (name) => {
+      const value = parseFloat(style.getPropertyValue(name));
+      return Number.isFinite(value) ? value : void 0;
+    };
+    const { filter, rim } = lens(width, height, radius, selection, {
+      bezel: length("--lg-bezel"),
+      thickness: length("--lg-thickness"),
+      level: length("--lg-refraction") ?? 1,
+      zoom: Math.max(1, length("--lg-zoom") ?? 1),
+      saturation: Math.max(1, length("--lg-rim-saturation") ?? 1)
+    });
+    if (filtered) element.style.setProperty("--lg-filter", filter);
+    element.style.setProperty("--lg-rim", rim);
+  }
+  function whenIdle(callback) {
+    if ("requestIdleCallback" in window) {
+      const handle2 = requestIdleCallback(callback, { timeout: 500 });
+      return () => cancelIdleCallback(handle2);
+    }
+    const handle = setTimeout(callback, 50);
+    return () => clearTimeout(handle);
+  }
+  var refractsBackdrop = () => /Chrom(?:e|ium)\//.test(navigator.userAgent);
+  function refract(element, selection, filtered) {
+    let cancel;
+    const observer = new ResizeObserver(() => {
+      cancel?.();
+      cancel = whenIdle(() => fit(element, selection, filtered));
+    });
+    observer.observe(element);
+    return () => {
+      cancel?.();
+      observer.disconnect();
+      element.style.removeProperty("--lg-filter");
+      element.style.removeProperty("--lg-rim");
+    };
+  }
+  var MARK = "data-glisse-backdrop";
+  function visibleBox(element) {
+    let { left, top, right, bottom } = element.getBoundingClientRect();
+    for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (!/hidden|clip|auto|scroll/.test(`${style.overflow} ${style.overflowX} ${style.overflowY}`)) continue;
+      const clip = node.getBoundingClientRect();
+      left = Math.max(left, clip.left);
+      top = Math.max(top, clip.top);
+      right = Math.min(right, clip.right);
+      bottom = Math.min(bottom, clip.bottom);
+    }
+    return new DOMRect(left, top, Math.max(0, right - left), Math.max(0, bottom - top));
+  }
+  function findBackdrop(element) {
+    const box = element.getBoundingClientRect();
+    const behind = (candidate) => {
+      if (candidate.contains(element) || element.contains(candidate)) return false;
+      const other = visibleBox(candidate);
+      return other.left < box.right && other.right > box.left && other.top < box.bottom && other.bottom > box.top;
+    };
+    for (let node = element.parentElement || (element.getRootNode && element.getRootNode().host); node && node !== document.body; node = node.parentElement || (node.getRootNode && node.getRootNode().host)) {
+      if (node.querySelectorAll) {
+        const found = [...node.querySelectorAll(`[${MARK}]`)].find(behind);
+        if (found) return found;
+      }
+    }
+    if (typeof document !== "undefined" && document.querySelectorAll) {
+      const globalFound = [...document.querySelectorAll(`[${MARK}]`)].find(behind);
+      if (globalFound) return globalFound;
+    }
+    return null;
+  }
+  var STILL = /^(transition|animation|view-transition)/;
+  var PLACED = {
+    position: "absolute",
+    top: "0px",
+    left: "0px",
+    right: "auto",
+    bottom: "auto",
+    "margin-top": "0px",
+    "margin-right": "0px",
+    "margin-bottom": "0px",
+    "margin-left": "0px",
+    transform: "none",
+    translate: "none",
+    scale: "none",
+    rotate: "none"
+  };
+  var kebab = (name) => name.startsWith("--") ? name : name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
+  function inline(original, copy, root, names) {
+    const computed = getComputedStyle(original);
+    const write = (name) => {
+      if (STILL.test(name) || root && (name in PLACED || name === "width" || name === "height")) return;
+      const value = computed.getPropertyValue(name);
+      if (copy.style.getPropertyValue(name) !== value) copy.style.setProperty(name, value);
+    };
+    if (names) for (const name of names) write(name);
+    else for (let i = 0; i < computed.length; i++) write(computed[i]);
+    if (!root) return;
+    for (const [name, value] of Object.entries(PLACED)) copy.style.setProperty(name, value);
+    copy.style.width = `${original.offsetWidth}px`;
+    copy.style.height = `${original.offsetHeight}px`;
+  }
+  function copyOf(source) {
+    const root = source.cloneNode(true);
+    const originals = [source, ...source.querySelectorAll("*")];
+    const copies = [root, ...root.querySelectorAll("*")];
+    const pairs = /* @__PURE__ */ new Map();
+    originals.forEach((original, index) => {
+      const copy = copies[index];
+      if (!copy) return;
+      pairs.set(original, copy);
+      copy.removeAttribute("id");
+      if (copy instanceof HTMLImageElement) copy.loading = "eager";
+      copy.style.transition = copy.style.animation = "none";
+      copy.style.setProperty("view-transition-name", "none");
+      inline(original, copy, original === source);
+    });
+    root.removeAttribute(MARK);
+    return {
+      root,
+      pairs
+    };
+  }
+  var TIMING = /* @__PURE__ */ new Set([
+    "offset",
+    "computedOffset",
+    "easing",
+    "composite"
+  ]);
+  function animating(source) {
+    const found = /* @__PURE__ */ new Map();
+    if (typeof source.getAnimations !== "function") return found;
+    for (const animation of source.getAnimations({ subtree: true })) {
+      const effect = animation.effect;
+      if (!effect?.target || effect.pseudoElement) continue;
+      const names = found.get(effect.target) ?? /* @__PURE__ */ new Set();
+      if ("transitionProperty" in animation) names.add(String(animation.transitionProperty));
+      else for (const keyframe of effect.getKeyframes()) for (const key of Object.keys(keyframe)) if (!TIMING.has(key)) names.add(kebab(key));
+      found.set(effect.target, names);
+    }
+    return found;
+  }
+  var SOURCE = /* @__PURE__ */ new Set([
+    "src",
+    "srcset",
+    "sizes"
+  ]);
+  function copyBackdrop(element, source) {
+    const layer = document.createElement("div");
+    const frame2 = document.createElement("div");
+    layer.className = "lg-glass-copy";
+    layer.setAttribute("aria-hidden", "true");
+    layer.setAttribute("inert", "");
+    layer.append(frame2);
+    element.before(layer);
+    element.setAttribute("data-copy", "");
+    const style = getComputedStyle(element);
+    let styled = "";
+    const restyle = () => {
+      const next = [
+        `blur(${style.getPropertyValue("--lg-blur").trim() || "3px"}) ${style.getPropertyValue("--lg-filter").trim() || "saturate(1.5)"}`,
+        style.borderRadius,
+        style.opacity,
+        style.visibility
+      ];
+      if (next.join("|") === styled) return;
+      styled = next.join("|");
+      layer.style.filter = next[0];
+      layer.style.borderRadius = next[1];
+      layer.style.clipPath = `inset(0 round ${next[1]})`;
+      layer.style.opacity = next[2];
+      layer.style.visibility = next[3];
+    };
+    let placed = "";
+    let shift = {
+      x: 0,
+      y: 0
+    };
+    const align = () => {
+      const width = element.offsetWidth;
+      const height = element.offsetHeight;
+      if (!width || !height || !source.offsetWidth || !source.offsetHeight) {
+        layer.style.display = "none";
+        return;
+      }
+      layer.style.display = "";
+      const box = element.getBoundingClientRect();
+      const from = source.getBoundingClientRect();
+      const at = layer.getBoundingClientRect();
+      const sx = box.width / width;
+      const sy = box.height / height;
+      const x = box.left - (at.left - shift.x);
+      const y = box.top - (at.top - shift.y);
+      const next = [
+        width,
+        height,
+        `translate(${x}px, ${y}px) scale(${sx}, ${sy})`,
+        `translate(${(from.left - box.left) / sx}px, ${(from.top - box.top) / sy}px) scale(${from.width / source.offsetWidth / sx}, ${from.height / source.offsetHeight / sy})`
+      ].join("|");
+      if (next === placed) return;
+      placed = next;
+      shift = {
+        x,
+        y
+      };
+      layer.style.width = `${width}px`;
+      layer.style.height = `${height}px`;
+      layer.style.transform = `translate(${x}px, ${y}px) scale(${sx}, ${sy})`;
+      frame2.style.transform = next.split("|")[3];
+    };
+    let copy = copyOf(source);
+    frame2.append(copy.root);
+    let stopped = false;
+    const follow = () => {
+      for (const [original, target] of copy.pairs) inline(original, target, original === source);
+      placed = "";
+      align();
+    };
+    let refresh = 0;
+    let version = 0;
+    const recopy = () => {
+      refresh = 0;
+      const next = copyOf(source);
+      const id2 = ++version;
+      const images = [...next.root.querySelectorAll("img")];
+      if (next.root instanceof HTMLImageElement) images.push(next.root);
+      Promise.all(images.map((image) => typeof image.decode === "function" ? image.decode().catch(() => void 0) : void 0)).then(() => {
+        if (stopped || id2 !== version) return;
+        frame2.replaceChildren(next.root);
+        copy = next;
+        placed = "";
+        align();
+      });
+    };
+    const schedule = () => {
+      refresh ||= requestAnimationFrame(recopy);
+    };
+    let moving2 = /* @__PURE__ */ new Map();
+    const animate = () => {
+      const now = animating(source);
+      for (const [original, names] of new Map([...moving2, ...now])) {
+        const target = copy.pairs.get(original);
+        if (target) inline(original, target, original === source, names);
+      }
+      moving2 = now;
+    };
+    const moved = new MutationObserver(() => {
+      restyle();
+      align();
+    });
+    moved.observe(element, {
+      attributes: true,
+      attributeFilter: [
+        "style",
+        "class",
+        "disabled"
+      ]
+    });
+    const changed = new MutationObserver((records) => {
+      let content = false;
+      for (const record of records) {
+        const name = record.attributeName;
+        if (record.type !== "attributes" || SOURCE.has(name)) {
+          content = true;
+          continue;
+        }
+        const target = copy.pairs.get(record.target);
+        if (!target || name === "id" || name === "style" || name === MARK) continue;
+        const value = record.target.getAttribute(name);
+        if (value === null) target.removeAttribute(name);
+        else target.setAttribute(name, value);
+      }
+      if (content) schedule();
+      follow();
+    });
+    changed.observe(source, {
+      attributes: true,
+      childList: true,
+      characterData: true,
+      subtree: true
+    });
+    const context = new MutationObserver(follow);
+    for (let node = source.parentElement; node; node = node.parentElement) context.observe(node, { attributes: true });
+    const scheme = matchMedia("(prefers-color-scheme: dark)");
+    scheme.addEventListener("change", follow);
+    const resized = new ResizeObserver(follow);
+    resized.observe(source);
+    source.addEventListener("load", follow, true);
+    source.addEventListener("transitionend", follow);
+    document.addEventListener("scroll", align, {
+      capture: true,
+      passive: true
+    });
+    window.addEventListener("resize", align);
+    restyle();
+    align();
+    let tick2 = 0;
+    const loop = () => {
+      restyle();
+      animate();
+      align();
+      tick2 = requestAnimationFrame(loop);
+    };
+    tick2 = requestAnimationFrame(loop);
+    return () => {
+      stopped = true;
+      cancelAnimationFrame(tick2);
+      cancelAnimationFrame(refresh);
+      moved.disconnect();
+      changed.disconnect();
+      context.disconnect();
+      resized.disconnect();
+      scheme.removeEventListener("change", follow);
+      source.removeEventListener("load", follow, true);
+      source.removeEventListener("transitionend", follow);
+      document.removeEventListener("scroll", align, { capture: true });
+      window.removeEventListener("resize", align);
+      layer.remove();
+      element.removeAttribute("data-copy");
+    };
+  }
+  function useRefraction(ref, selection = false) {
+    useEffect(() => {
+      const element = ref.current;
+      if (!element) return;
+      if (refractsBackdrop()) return refract(element, selection, true);
+      const source = selection ? null : findBackdrop(element);
+      if (!source) return refract(element, selection, false);
+      const stop = copyBackdrop(element, source);
+      const unfit = refract(element, selection, true);
+      return () => {
+        unfit();
+        stop();
+      };
+    }, [ref, selection]);
+  }
+  var Button = /* @__PURE__ */ forwardRef(function Button2({ icon, variant = "glass", destructive, tint, children, className, style, type = "button", ...props }, forwardedRef) {
+    const ref = useRef(null);
+    useImperativeHandle(forwardedRef, () => ref.current);
+    usePress(ref);
+    useRefraction(ref);
+    return /* @__PURE__ */ jsxs("button", {
+      ref,
+      type,
+      className: cx("lg-glass lg-button", className),
+      "data-icon": icon == null ? void 0 : children == null ? "only" : "",
+      "data-variant": variant === "glass" ? void 0 : variant,
+      "data-destructive": destructive ? "" : void 0,
+      "data-tint": tint ? "" : void 0,
+      style: tint ? {
+        ...style,
+        "--lg-tint": tint
+      } : style,
+      ...props,
+      children: [icon, children]
+    });
+  });
+  var Glass = /* @__PURE__ */ forwardRef(function Glass2({ className, ...props }, forwardedRef) {
+    const ref = useRef(null);
+    useImperativeHandle(forwardedRef, () => ref.current);
+    useRefraction(ref);
+    return /* @__PURE__ */ jsx("div", {
+      ref,
+      className: cx("lg-glass", className),
+      ...props
+    });
+  });
+  function useControllable(value, defaultValue, onChange) {
+    const [uncontrolled, setUncontrolled] = useState(defaultValue);
+    const controlled = value !== void 0;
+    const handler = useRef(onChange);
+    useEffect(() => {
+      handler.current = onChange;
+    });
+    const set = useCallback((next) => {
+      if (!controlled) setUncontrolled(next);
+      handler.current?.(next);
+    }, [controlled]);
+    return [controlled ? value : uncontrolled, set];
+  }
+  var Input = /* @__PURE__ */ forwardRef(function Input2({ value: valueProp, defaultValue = "", onValueChange, icon, className, style, ...props }, forwardedRef) {
+    const rootRef = useRef(null);
+    const inputRef = useRef(null);
+    const [value, setValue] = useControllable(valueProp, defaultValue, onValueChange);
+    useImperativeHandle(forwardedRef, () => inputRef.current);
+    useRefraction(rootRef);
+    return /* @__PURE__ */ jsxs("div", {
+      ref: rootRef,
+      className: cx("lg-glass lg-input", className),
+      style,
+      onPointerDown: (event) => {
+        if (event.target !== inputRef.current) inputRef.current?.focus();
+      },
+      children: [
+        icon == null ? null : /* @__PURE__ */ jsx("span", {
+          className: "lg-input-icon",
+          children: icon
+        }),
+        /* @__PURE__ */ jsx("input", {
+          ref: inputRef,
+          value,
+          onChange: (event) => setValue(event.currentTarget.value),
+          ...props
+        }),
+        props.type === "search" && value && !props.disabled ? /* @__PURE__ */ jsx("button", {
+          type: "button",
+          className: "lg-input-clear",
+          "aria-label": "Clear",
+          onPointerDown: (event) => event.preventDefault(),
+          onClick: () => {
+            setValue("");
+            inputRef.current?.focus();
+          },
+          children: /* @__PURE__ */ jsx("svg", {
+            viewBox: "0 0 16 16",
+            fill: "none",
+            stroke: "currentColor",
+            strokeWidth: 1.5,
+            strokeLinecap: "round",
+            "aria-hidden": true,
+            children: /* @__PURE__ */ jsx("path", { d: "m4.5 4.5 7 7m0-7-7 7" })
+          })
+        }) : null
+      ]
+    });
+  });
+  var clamp$1 = (value) => Math.min(1, Math.max(0, value));
+  var resistance = (value) => Math.sign(value) * 7 * (1 - Math.exp(-Math.abs(value) * 0.12 / 7));
+  var ellipsis = /* @__PURE__ */ jsxs("svg", {
+    viewBox: "0 0 16 16",
+    fill: "currentColor",
+    "aria-hidden": true,
+    children: [
+      /* @__PURE__ */ jsx("circle", {
+        cx: "3",
+        cy: "8",
+        r: "1.4"
+      }),
+      /* @__PURE__ */ jsx("circle", {
+        cx: "8",
+        cy: "8",
+        r: "1.4"
+      }),
+      /* @__PURE__ */ jsx("circle", {
+        cx: "13",
+        cy: "8",
+        r: "1.4"
+      })
+    ]
+  });
+  function Menu({ items, "aria-label": label, icon = ellipsis, align = "end", className, style }) {
+    const [phase, setPhase] = useState("closed");
+    const triggerRef = useRef(null);
+    const cardRef = useRef(null);
+    const surfaceRef = useRef(null);
+    const glyphRef = useRef(null);
+    const contentRef = useRef(null);
+    const plateRef = useRef(null);
+    const morphRef = useRef(null);
+    const latest = useRef(items);
+    const mounted = phase !== "closed";
+    useEffect(() => {
+      latest.current = items;
+    });
+    useEffect(() => {
+      if (phase === "open") morphRef.current?.set(1);
+      if (phase === "leaving") morphRef.current?.set(0);
+    }, [phase]);
+    useEffect(() => {
+      if (!mounted) return;
+      const trigger = triggerRef.current;
+      const card = cardRef.current;
+      const surface = surfaceRef.current;
+      const glyph = glyphRef.current;
+      const content = contentRef.current;
+      const plate = plateRef.current;
+      const from = {
+        width: trigger.offsetWidth,
+        height: trigger.offsetHeight
+      };
+      const to = {
+        width: card.offsetWidth,
+        height: card.offsetHeight
+      };
+      const radius = parseFloat(getComputedStyle(surface).borderTopLeftRadius);
+      const trailing = card.dataset.align !== "start";
+      const origin = {
+        x: trailing ? to.width - from.width / 2 : from.width / 2,
+        y: from.height / 2
+      };
+      content.style.transformOrigin = `${origin.x}px ${origin.y}px`;
+      glyph.style.width = `${from.width}px`;
+      glyph.style.height = `${from.height}px`;
+      let leaving = false;
+      const shape = createSpring(0, 600, 46, (value) => {
+        const t = clamp$1(value);
+        const settled = t === 1;
+        const width = from.width + (to.width - from.width) * t;
+        const height = from.height + (to.height - from.height) * t;
+        const scale2 = 0.5 + 0.5 * t;
+        const local = (edge, centre) => centre + (edge - centre) / scale2;
+        const left = local(trailing ? to.width - width : 0, origin.x);
+        const right = local(trailing ? to.width : width, origin.x);
+        const bottom = local(height, origin.y);
+        const top = local(0, origin.y);
+        surface.style.width = settled ? "" : `${width}px`;
+        surface.style.height = settled ? "" : `${height}px`;
+        surface.style.opacity = String(clamp$1(t / 0.2));
+        trigger.style.opacity = t === 0 ? "" : String(1 - clamp$1(t / 0.2));
+        const drift = 0.3 * t;
+        const dx = ((trailing ? to.width - width / 2 : width / 2) - origin.x) * drift;
+        const dy = (height / 2 - origin.y) * drift;
+        glyph.style.opacity = String(1 - clamp$1(t / 0.45));
+        glyph.style.transform = `translate(${dx}px, ${dy}px) scale(${1 + 0.6 * t})`;
+        glyph.style.filter = `blur(${8 * t}px)`;
+        content.style.opacity = String(leaving ? clamp$1((t - 0.55) / 0.45) : clamp$1((t - 0.15) / 0.6));
+        content.style.transform = settled ? "" : `scale(${scale2})`;
+        content.style.filter = settled ? "" : `blur(${6 * (1 - t)}px)`;
+        content.style.clipPath = settled ? "" : `inset(${top}px ${to.width - right}px ${to.height - bottom}px ${left}px round ${radius / scale2}px)`;
+        if (leaving && value === 0) setPhase("closed");
+      });
+      const morph = {
+        ...shape,
+        set(target, instant) {
+          leaving = target === 0;
+          if (leaving) shape.tune(900, 57);
+          else shape.tune(600, 46);
+          shape.set(target, instant);
+        }
+      };
+      morphRef.current = morph;
+      shape.paint();
+      morph.set(1);
+      const rows = () => [...card.querySelectorAll(".lg-menu-item:not(:disabled)")];
+      rows()[0]?.focus({ preventScroll: true });
+      const offset = {
+        scale: 1,
+        x: 0,
+        y: 0
+      };
+      const paint = () => {
+        card.style.scale = String(offset.scale);
+        card.style.translate = `${offset.x}px ${offset.y}px`;
+      };
+      const scale = createSpring(1, 650, 36, (value) => {
+        offset.scale = value;
+        paint();
+      });
+      const x = createSpring(0, 600, 30, (value) => {
+        offset.x = value;
+        paint();
+      });
+      const y = createSpring(0, 600, 30, (value) => {
+        offset.y = value;
+        paint();
+      });
+      let gesture = null;
+      let current = null;
+      let suppressClickUntil = 0;
+      const close = (restoreFocus = true) => {
+        setPhase("leaving");
+        if (restoreFocus) triggerRef.current?.focus({ preventScroll: true });
+      };
+      const highlight = (row) => {
+        if (current === row) return;
+        const first = !current;
+        current = row;
+        if (!row) {
+          delete card.dataset.scrubbing;
+          plate.style.opacity = "0";
+          return;
+        }
+        card.dataset.scrubbing = "";
+        plate.style.width = `${row.offsetWidth}px`;
+        plate.style.height = `${row.offsetHeight}px`;
+        if (first) plate.style.transition = "none";
+        plate.style.transform = `translate(${row.offsetLeft}px, ${row.offsetTop}px)`;
+        plate.style.opacity = "1";
+        if (first) {
+          plate.offsetWidth;
+          plate.style.transition = "";
+        }
+      };
+      let selectHandled = false;
+      const rowAt = (clientX, clientY) => {
+        const root = (card && card.getRootNode) ? card.getRootNode() : document;
+        const target = (root && root.elementFromPoint) ? root.elementFromPoint(clientX, clientY) : document.elementFromPoint(clientX, clientY);
+        const row = target?.closest(".lg-menu-item");
+        return row && !row.disabled && card.contains(row) ? row : null;
+      };
+      const down = (event) => {
+        if (!event.isPrimary || event.button !== 0) return;
+        gesture = {
+          id: event.pointerId,
+          x: event.clientX,
+          y: event.clientY
+        };
+        card.setPointerCapture(event.pointerId);
+        card.dataset.pressed = "";
+        scale.set(1 + 5 / Math.max(card.offsetWidth, card.offsetHeight, 200));
+        highlight(rowAt(event.clientX, event.clientY));
+      };
+      const move = (event) => {
+        if (!gesture) {
+          const row = event.pointerType === "mouse" ? rowAt(event.clientX, event.clientY) : null;
+          if (row) highlight(row);
+          return;
+        }
+        if (event.pointerId !== gesture.id) return;
+        highlight(rowAt(event.clientX, event.clientY));
+        x.set(resistance(event.clientX - gesture.x), true);
+        y.set(resistance(event.clientY - gesture.y), true);
+      };
+      const end = (event) => {
+        if (event.pointerId !== gesture?.id) return;
+        const chosen = event.type === "pointerup" ? rowAt(event.clientX, event.clientY) : null;
+        highlight(null);
+        gesture = null;
+        delete card.dataset.pressed;
+        scale.set(1);
+        x.set(0);
+        y.set(0);
+        suppressClickUntil = performance.now() + 500;
+        if (chosen) {
+          selectHandled = true;
+          const item = latest.current[Number(chosen.dataset.index)];
+          if (item && item !== "separator") {
+            close();
+            item.onSelect?.();
+          }
+        }
+      };
+      const leave = (event) => {
+        if (!gesture && event.pointerType === "mouse") highlight(null);
+      };
+      const click = (event) => {
+        if (selectHandled) {
+          selectHandled = false;
+          return;
+        }
+        const row = event.target.closest(".lg-menu-item");
+        if (!row) return;
+        const item = latest.current[Number(row.dataset.index)];
+        if (!item || item === "separator") return;
+        close();
+        item.onSelect?.();
+      };
+      const key = (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          close();
+        } else if (event.key === "Tab") close(false);
+        else if ([
+          "ArrowDown",
+          "ArrowUp",
+          "Home",
+          "End"
+        ].includes(event.key)) {
+          event.preventDefault();
+          if (!gesture) highlight(null);
+          const list = rows();
+          const index = list.indexOf(document.activeElement);
+          list[event.key === "Home" ? 0 : event.key === "End" ? list.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + list.length) % list.length]?.focus();
+        }
+      };
+      const outside = (event) => {
+        const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
+        if (card && path.includes(card)) return;
+        if (triggerRef.current && path.includes(triggerRef.current)) return;
+        close(false);
+      };
+      card.addEventListener("pointerdown", down);
+      card.addEventListener("pointermove", move);
+      card.addEventListener("pointerleave", leave);
+      card.addEventListener("pointerup", end);
+      card.addEventListener("pointercancel", end);
+      card.addEventListener("lostpointercapture", end);
+      card.addEventListener("click", click);
+      card.addEventListener("keydown", key);
+      document.addEventListener("pointerdown", outside, true);
+      return () => {
+        [
+          shape,
+          scale,
+          x,
+          y
+        ].forEach((spring) => spring.stop());
+        morphRef.current = null;
+        trigger.style.opacity = "";
+        card.removeEventListener("pointerdown", down);
+        card.removeEventListener("pointermove", move);
+        card.removeEventListener("pointerleave", leave);
+        card.removeEventListener("pointerup", end);
+        card.removeEventListener("pointercancel", end);
+        card.removeEventListener("lostpointercapture", end);
+        card.removeEventListener("click", click);
+        card.removeEventListener("keydown", key);
+        document.removeEventListener("pointerdown", outside, true);
+      };
+    }, [mounted]);
+    const open = phase === "open";
+    return /* @__PURE__ */ jsxs("div", {
+      className: cx("lg-menu", className, open && "lg-menu--open", mounted && "lg-menu--active"),
+      "data-phase": phase,
+      "data-open": open ? "true" : undefined,
+      style,
+      children: [/* @__PURE__ */ jsx(Button, {
+        ref: triggerRef,
+        icon,
+        "aria-label": label,
+        "aria-haspopup": "menu",
+        "aria-expanded": open,
+        onClick: () => setPhase(open ? "leaving" : "open")
+      }), mounted ? /* @__PURE__ */ jsxs("div", {
+        ref: cardRef,
+        role: "menu",
+        "aria-label": label,
+        className: "lg-menu-card",
+        "data-phase": phase,
+        "data-align": align,
+        children: [
+          /* @__PURE__ */ jsx("span", {
+            ref: surfaceRef,
+            className: "lg-menu-surface",
+            "aria-hidden": true
+          }),
+          /* @__PURE__ */ jsx("span", {
+            ref: glyphRef,
+            className: "lg-menu-glyph",
+            "aria-hidden": true,
+            children: icon
+          }),
+          /* @__PURE__ */ jsxs("div", {
+            ref: contentRef,
+            role: "none",
+            className: "lg-menu-content",
+            children: [/* @__PURE__ */ jsx("span", {
+              ref: plateRef,
+              className: "lg-menu-plate",
+              "aria-hidden": true
+            }), items.map((item, index) => item === "separator" ? /* @__PURE__ */ jsx("div", {
+              role: "separator",
+              className: "lg-menu-separator"
+            }, index) : /* @__PURE__ */ jsxs("button", {
+              type: "button",
+              role: "menuitem",
+              className: "lg-menu-item",
+              "data-index": index,
+              "data-destructive": item.destructive ? "" : void 0,
+              disabled: item.disabled,
+              onClick: (e) => {
+                e.stopPropagation();
+                close();
+                item.onSelect?.();
+              },
+              children: [item.icon, item.label]
+            }, index))]
+          })
+        ]
+      }) : null]
+    });
+  }
+  var magnifier = /* @__PURE__ */ jsxs("svg", {
+    viewBox: "0 0 16 16",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.5,
+    strokeLinecap: "round",
+    "aria-hidden": true,
+    children: [/* @__PURE__ */ jsx("circle", {
+      cx: "7",
+      cy: "7",
+      r: "4.75"
+    }), /* @__PURE__ */ jsx("path", { d: "m10.5 10.5 3.25 3.25" })]
+  });
+  var SearchField = /* @__PURE__ */ forwardRef(function SearchField2({ icon = magnifier, placeholder = "Search", ...props }, ref) {
+    return /* @__PURE__ */ jsx(Input, {
+      ref,
+      type: "search",
+      icon,
+      placeholder,
+      ...props
+    });
+  });
+  var Slider = /* @__PURE__ */ forwardRef(function Slider2({ value: valueProp, defaultValue, onValueChange, min = 0, max = 100, step = 1, className, style, ...props }, forwardedRef) {
+    const inputRef = useRef(null);
+    const thumbRef = useRef(null);
+    const faceRef = useRef(null);
+    const [value, setValue] = useControllable(valueProp, defaultValue ?? min, onValueChange);
+    const progress = max > min ? Math.min(1, Math.max(0, (value - min) / (max - min))) : 0;
+    useImperativeHandle(forwardedRef, () => inputRef.current);
+    useEffect(() => {
+      const input = inputRef.current;
+      const thumb = thumbRef.current;
+      const face = faceRef.current;
+      const lift = createSpring(0, 2e3, 80, (amount) => {
+        thumb.style.scale = String(0.6 + 0.4 * amount);
+        face.style.opacity = String(1 - 0.85 * Math.min(1, Math.max(0, amount)));
+      });
+      const hold = () => {
+        if (!input.disabled) lift.set(1);
+      };
+      const release = () => lift.set(0);
+      const ends = [
+        "pointerup",
+        "pointercancel",
+        "lostpointercapture",
+        "blur"
+      ];
+      input.addEventListener("pointerdown", hold);
+      ends.forEach((type) => input.addEventListener(type, release));
+      window.addEventListener("pointerup", release);
+      return () => {
+        lift.stop();
+        input.removeEventListener("pointerdown", hold);
+        ends.forEach((type) => input.removeEventListener(type, release));
+        window.removeEventListener("pointerup", release);
+      };
+    }, []);
+    return /* @__PURE__ */ jsxs("div", {
+      className: cx("lg-slider", className),
+      style: {
+        ...style,
+        "--lg-progress": progress
+      },
+      children: [
+        /* @__PURE__ */ jsx("span", {
+          className: "lg-slider-track",
+          "aria-hidden": true,
+          children: /* @__PURE__ */ jsx("span", { className: "lg-slider-fill" })
+        }),
+        /* @__PURE__ */ jsx("span", {
+          ref: thumbRef,
+          className: "lg-slider-thumb",
+          "aria-hidden": true,
+          children: /* @__PURE__ */ jsx("span", {
+            ref: faceRef,
+            className: "lg-thumb-face"
+          })
+        }),
+        /* @__PURE__ */ jsx("input", {
+          ref: inputRef,
+          type: "range",
+          min,
+          max,
+          step,
+          value,
+          onChange: (event) => setValue(event.currentTarget.valueAsNumber),
+          ...props
+        })
+      ]
+    });
+  });
+  var held = (at, moved) => moved || performance.now() - at >= 150;
+  var TRAVEL = 21.7125;
+  var unit = (value) => Math.min(1, Math.max(0, value));
+  var Switch = /* @__PURE__ */ forwardRef(function Switch2({ checked: checkedProp, defaultChecked = false, onCheckedChange, className, ...props }, forwardedRef) {
+    const ref = useRef(null);
+    const fillRef = useRef(null);
+    const thumbRef = useRef(null);
+    const faceRef = useRef(null);
+    const [checked, setChecked] = useControllable(checkedProp, defaultChecked, onCheckedChange);
+    const travel = TRAVEL;
+    const latest = useRef({
+      checked,
+      setChecked,
+      travel
+    });
+    const springs = useRef(null);
+    useImperativeHandle(forwardedRef, () => ref.current);
+    useEffect(() => {
+      latest.current = {
+        checked,
+        setChecked,
+        travel
+      };
+      springs.current?.position.set(checked ? 1 : 0);
+      springs.current?.color.set(checked ? 1 : 0);
+    }, [
+      checked,
+      setChecked,
+      travel
+    ]);
+    useEffect(() => {
+      springs.current?.position.paint();
+    }, [travel]);
+    useEffect(() => {
+      const el = ref.current;
+      const fill = fillRef.current;
+      const thumb = thumbRef.current;
+      const face = faceRef.current;
+      let x = 0;
+      let scale = 0.65;
+      const paint = () => {
+        thumb.style.transform = `translate(${x}px, -50%) scale(${scale})`;
+      };
+      const initial = latest.current.checked ? 1 : 0;
+      const position = createSpring(initial, 1e3, 80, (value) => {
+        x = value * latest.current.travel;
+        paint();
+      });
+      const color = createSpring(initial, 1e3, 80, (value) => {
+        fill.style.opacity = String(unit(value));
+      });
+      const lift = createSpring(0, 2e3, 80, (value) => {
+        scale = 0.65 + 0.25 * value;
+        face.style.opacity = String(1 - 0.85 * unit(value));
+        paint();
+      });
+      springs.current = {
+        position,
+        color
+      };
+      position.paint();
+      color.paint();
+      lift.paint();
+      let gesture = null;
+      let ignoreClick = false;
+      const sync = () => {
+        position.set(latest.current.checked ? 1 : 0);
+        color.set(latest.current.checked ? 1 : 0);
+      };
+      const settle = (next) => {
+        const old = gesture;
+        gesture = null;
+        lift.set(0);
+        if (old && el.hasPointerCapture(old.id)) el.releasePointerCapture(old.id);
+        if (next === void 0 || next === latest.current.checked) return sync();
+        latest.current.setChecked(next);
+        requestAnimationFrame(sync);
+      };
+      const down = (event) => {
+        if (!event.isPrimary || event.button !== 0 || el.disabled) return;
+        event.preventDefault();
+        ignoreClick = false;
+        gesture = {
+          id: event.pointerId,
+          x: event.clientX,
+          y: event.clientY,
+          from: latest.current.checked ? 1 : 0,
+          moved: false,
+          at: performance.now(),
+          box: el.getBoundingClientRect()
+        };
+        el.setPointerCapture(event.pointerId);
+        lift.set(1);
+      };
+      const move = (event) => {
+        if (event.pointerId !== gesture?.id) return;
+        const dx = event.clientX - gesture.x;
+        const dy = Math.abs(event.clientY - gesture.y);
+        if (!held(gesture.at, gesture.moved) && dy > 10 && dy > Math.abs(dx) + 4) {
+          ignoreClick = true;
+          return settle();
+        }
+        if (!gesture.moved && Math.abs(dx) < 4) return;
+        gesture.moved = true;
+        const value = gesture.from + dx / latest.current.travel;
+        const overshoot = value < 0 ? value : value > 1 ? value - 1 : 0;
+        position.set(unit(value) + overshoot / 22);
+        color.set(value > 0.5 ? 1 : 0);
+      };
+      const up = (event) => {
+        if (event.pointerId !== gesture?.id) return;
+        ignoreClick = true;
+        const { from, x: x2, moved, box } = gesture;
+        const value = from + (event.clientX - x2) / latest.current.travel;
+        const near = event.clientY >= box.top - 24 && event.clientY <= box.bottom + 24;
+        settle(moved ? value > 0.5 : near ? !latest.current.checked : void 0);
+      };
+      const keep = (event) => {
+        if (gesture && event.cancelable && held(gesture.at, gesture.moved)) event.preventDefault();
+      };
+      const cancel = () => {
+        if (!gesture) return;
+        ignoreClick = true;
+        settle();
+      };
+      const click = () => {
+        if (ignoreClick) ignoreClick = false;
+        else if (!el.disabled) latest.current.setChecked(!latest.current.checked);
+      };
+      el.addEventListener("pointerdown", down);
+      el.addEventListener("pointermove", move);
+      el.addEventListener("pointerup", up);
+      el.addEventListener("pointercancel", cancel);
+      el.addEventListener("lostpointercapture", cancel);
+      el.addEventListener("touchmove", keep, { passive: false });
+      el.addEventListener("click", click);
+      return () => {
+        springs.current = null;
+        [
+          position,
+          color,
+          lift
+        ].forEach((spring) => spring.stop());
+        el.removeEventListener("pointerdown", down);
+        el.removeEventListener("pointermove", move);
+        el.removeEventListener("pointerup", up);
+        el.removeEventListener("pointercancel", cancel);
+        el.removeEventListener("lostpointercapture", cancel);
+        el.removeEventListener("touchmove", keep);
+        el.removeEventListener("click", click);
+      };
+    }, []);
+    return /* @__PURE__ */ jsxs("button", {
+      ref,
+      type: "button",
+      role: "switch",
+      "aria-checked": checked,
+      className: cx("lg-switch", className),
+      ...props,
+      children: [/* @__PURE__ */ jsx("span", {
+        ref: fillRef,
+        className: "lg-switch-fill",
+        "aria-hidden": true
+      }), /* @__PURE__ */ jsx("span", {
+        ref: thumbRef,
+        className: "lg-switch-thumb",
+        "aria-hidden": true,
+        children: /* @__PURE__ */ jsx("span", {
+          ref: faceRef,
+          className: "lg-thumb-face"
+        })
+      })]
+    });
+  });
+  var clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+  var keys = [
+    "ArrowLeft",
+    "ArrowRight",
+    "Home",
+    "End"
+  ];
+  var REST = [
+    1024,
+    58.9,
+    676,
+    47.8
+  ];
+  var DRAG = [
+    2500,
+    94,
+    576,
+    44.2
+  ];
+  function attach({ bar, glass, lens: lens2, tint, row }, select) {
+    const tabs = [...bar.querySelectorAll(".lg-tab")];
+    let slot = 0;
+    let height = 0;
+    let growX = 16;
+    let growY = 12;
+    let active = -1;
+    let shown = false;
+    let settleFrame = 0;
+    let gesture = null;
+    const state = {
+      x: 0,
+      lift: 0
+    };
+    const measure = () => {
+      const style = getComputedStyle(bar);
+      slot = (bar.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)) / tabs.length;
+      height = lens2.offsetHeight;
+      growX = parseFloat(style.getPropertyValue("--lg-lens-grow-x")) || 0;
+      growY = parseFloat(style.getPropertyValue("--lg-lens-grow-y")) || 0;
+    };
+    const paint = () => {
+      const { x: x2, lift: lift2 } = state;
+      const sx = 1 + growX / slot * lift2;
+      const sy = 1 + growY / height * lift2;
+      lens2.style.transform = tint.style.transform = `translateX(${x2}px) scale(${sx}, ${sy})`;
+      row.style.transform = `scale(${1 / sx}, ${1 / sy}) translate(${-x2 + (sx - 1) * slot / 2}px, ${(sy - 1) * height / 2}px)`;
+      if (!gesture && lift2 < 0.01) delete bar.dataset.refracting;
+    };
+    const x = createSpring(0, REST[0], REST[1], (value) => {
+      state.x = value;
+      paint();
+    });
+    const lift = createSpring(0, REST[2], REST[3], (value) => {
+      state.lift = value;
+      paint();
+    });
+    const move = (target, lifted, instant = false) => {
+      const [slideStiffness, slideDamping, liftStiffness, liftDamping] = gesture ? DRAG : REST;
+      x.tune(slideStiffness, slideDamping);
+      lift.tune(liftStiffness, liftDamping);
+      x.set(target, instant);
+      lift.set(lifted ? 1 : 0, instant);
+    };
+    const settle = (instant = false) => {
+      if (gesture) return;
+      const show = active >= 0;
+      if (show) delete bar.dataset.hidden;
+      else bar.dataset.hidden = "";
+      if (show) move(active * slot, false, instant || !shown);
+      shown = show;
+    };
+    const position = (event) => clamp(gesture.anchor + event.clientX - gesture.x, 0, slot * (tabs.length - 1));
+    const light = (event, box) => {
+      glass.style.setProperty("--lg-x", `${clamp((event.clientX - box.left) / box.width * 100, 0, 100)}%`);
+      lens2.style.setProperty("--lg-x", `${clamp((event.clientX - box.left - 4 - state.x) / slot * 100, 0, 100)}%`);
+    };
+    const release = () => {
+      const old = gesture;
+      gesture = null;
+      delete bar.dataset.lifted;
+      delete lens2.dataset.pressed;
+      if (old && bar.hasPointerCapture(old.id)) bar.releasePointerCapture(old.id);
+      return old;
+    };
+    let suppressClick = false;
+    const onPointerDown = (event) => {
+      const tab = event.target.closest(".lg-tab");
+      if (!event.isPrimary || event.button !== 0 || gesture || !tab) return;
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      cancelAnimationFrame(settleFrame);
+      settleFrame = 0;
+      measure();
+      const box = bar.getBoundingClientRect();
+      gesture = {
+        id: event.pointerId,
+        x: event.clientX,
+        anchor: tabs.indexOf(tab) * slot,
+        moved: false,
+        box,
+        at: performance.now()
+      };
+      suppressClick = false;
+      bar.dataset.lifted = "";
+      bar.dataset.refracting = "";
+      delete bar.dataset.hidden;
+      lens2.dataset.pressed = "";
+      light(event, box);
+      move(gesture.anchor, true, !shown);
+      shown = true;
+    };
+    const onPointerMove = (event) => {
+      if (event.pointerId !== gesture?.id) return;
+      if (!gesture.moved && Math.abs(event.clientX - gesture.x) > 6) {
+        gesture.moved = true;
+        bar.setPointerCapture(event.pointerId);
+      }
+      if (gesture.moved) move(position(event), true);
+      light(event, gesture.box);
+    };
+    const onPointerEnd = (event) => {
+      if (event.pointerId !== gesture?.id) return;
+      if (event.type === "lostpointercapture" && event.target !== bar) return;
+      const index = Math.round(position(event) / slot);
+      const { moved, box } = release();
+      const near = event.clientY >= box.top - 24 && event.clientY <= box.bottom + 24;
+      if (event.type === "pointerup" && (moved || near)) {
+        suppressClick = true;
+        settleFrame = requestAnimationFrame(() => {
+          settleFrame = 0;
+          settle();
+        });
+        tabs[index]?.click();
+      } else {
+        suppressClick = moved;
+        settle();
+      }
+    };
+    const onTouchMove = (event) => {
+      if (gesture && event.cancelable && held(gesture.at, gesture.moved)) event.preventDefault();
+    };
+    const onClick = (event) => {
+      if (event.isTrusted && suppressClick && event.detail !== 0) {
+        suppressClick = false;
+        event.preventDefault();
+        return;
+      }
+      const tab = event.target.closest(".lg-tab");
+      if (!tab || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      const index = tabs.indexOf(tab);
+      if (tab instanceof HTMLAnchorElement) {
+        active = index;
+        settle();
+      }
+      select(index);
+    };
+    const onKeyDown = (event) => {
+      const tab = event.target.closest(".lg-tab");
+      if (!tab || tab instanceof HTMLAnchorElement || !keys.includes(event.key)) return;
+      event.preventDefault();
+      const current = tabs.indexOf(tab);
+      const index = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (current + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length;
+      select(index);
+      tabs[index]?.focus();
+    };
+    const reset = () => {
+      cancelAnimationFrame(settleFrame);
+      settleFrame = 0;
+      release();
+      settle(true);
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) reset();
+    };
+    const observer = new ResizeObserver(() => {
+      measure();
+      if (!gesture) settle(true);
+    });
+    measure();
+    bar.dataset.ready = "";
+    bar.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerEnd);
+    window.addEventListener("pointercancel", onPointerEnd);
+    bar.addEventListener("lostpointercapture", onPointerEnd);
+    bar.addEventListener("touchmove", onTouchMove, { passive: false });
+    bar.addEventListener("click", onClick, true);
+    bar.addEventListener("keydown", onKeyDown);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("blur", reset);
+    observer.observe(bar);
+    return {
+      setActive(index) {
+        cancelAnimationFrame(settleFrame);
+        settleFrame = 0;
+        active = index;
+        settle();
+      },
+      destroy() {
+        cancelAnimationFrame(settleFrame);
+        x.stop();
+        lift.stop();
+        observer.disconnect();
+        for (const key of [
+          "ready",
+          "hidden",
+          "lifted",
+          "refracting"
+        ]) delete bar.dataset[key];
+        bar.removeEventListener("pointerdown", onPointerDown);
+        window.removeEventListener("pointermove", onPointerMove);
+        window.removeEventListener("pointerup", onPointerEnd);
+        window.removeEventListener("pointercancel", onPointerEnd);
+        bar.removeEventListener("lostpointercapture", onPointerEnd);
+        bar.removeEventListener("touchmove", onTouchMove);
+        bar.removeEventListener("click", onClick, true);
+        bar.removeEventListener("keydown", onKeyDown);
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+        window.removeEventListener("blur", reset);
+      }
+    };
+  }
+  function TabBar({ items, value: valueProp, defaultValue = null, onValueChange, link: Link = "a", className, style, ...props }) {
+    const barRef = useRef(null);
+    const glassRef = useRef(null);
+    const lensRef = useRef(null);
+    const tintRef = useRef(null);
+    const rowRef = useRef(null);
+    const controller = useRef(null);
+    const [value, setValue] = useControllable(valueProp, defaultValue, onValueChange);
+    const selected = items.findIndex((item) => item.value === value);
+    const latest = useRef({
+      items,
+      selected,
+      setValue
+    });
+    const signature = items.map((item) => item.value).join("\n");
+    const navigation = items.every((item) => item.href !== void 0);
+    useRefraction(glassRef);
+    useRefraction(lensRef, true);
+    useEffect(() => {
+      latest.current = {
+        items,
+        selected,
+        setValue
+      };
+    });
+    useEffect(() => {
+      const instance = attach({
+        bar: barRef.current,
+        glass: glassRef.current,
+        lens: lensRef.current,
+        tint: tintRef.current,
+        row: rowRef.current
+      }, (index) => {
+        const item = latest.current.items[index];
+        if (item) latest.current.setValue(item.value);
+      });
+      instance.setActive(latest.current.selected);
+      controller.current = instance;
+      return () => {
+        instance.destroy();
+        controller.current = null;
+      };
+    }, [signature]);
+    useLayoutEffect(() => {
+      controller.current?.setActive(selected);
+    }, [selected]);
+    return /* @__PURE__ */ jsxs("div", {
+      ref: barRef,
+      role: navigation ? "navigation" : "tablist",
+      className: cx("lg-tab-bar", className),
+      style: {
+        ...style,
+        "--lg-index": Math.max(selected, 0),
+        "--lg-tabs": items.length
+      },
+      ...props,
+      children: [
+        /* @__PURE__ */ jsx("span", {
+          ref: glassRef,
+          className: "lg-glass lg-tab-bar-glass",
+          "aria-hidden": true
+        }),
+        items.map((item, index) => item.href !== void 0 ? /* @__PURE__ */ jsx(Link, {
+          href: item.href,
+          className: "lg-tab",
+          "data-selected": index === selected ? "" : void 0,
+          "aria-current": index === selected ? "page" : void 0,
+          draggable: false,
+          children: item.label
+        }, item.value) : /* @__PURE__ */ jsx("button", {
+          type: "button",
+          role: "tab",
+          className: "lg-tab",
+          "data-selected": index === selected ? "" : void 0,
+          "aria-selected": index === selected,
+          tabIndex: index === selected || selected < 0 && index === 0 ? 0 : -1,
+          children: item.label
+        }, item.value)),
+        /* @__PURE__ */ jsx("span", {
+          ref: tintRef,
+          className: "lg-tab-tint",
+          "aria-hidden": true,
+          children: /* @__PURE__ */ jsx("span", {
+            ref: rowRef,
+            className: "lg-tab-row",
+            children: items.map((item) => /* @__PURE__ */ jsx("span", {
+              className: "lg-tab-copy",
+              children: item.label
+            }, item.value))
+          })
+        }),
+        /* @__PURE__ */ jsx("span", {
+          ref: lensRef,
+          className: "lg-glass lg-tab-lens",
+          "aria-hidden": true
+        })
+      ]
+    });
+  }
+  insertStyles(styles_default);
+  return __toCommonJS(entry_exports);
+})();
+
+
+// ============================================================
+    // REACT COMPONENTS POWERED BY GLISSE (https://glisse.kelvinzhang.com/)
     // ============================================================
     const html = (typeof htm !== 'undefined' && typeof React !== 'undefined')
         ? htm.bind(React.createElement)
         : null;
 
-    // ============================================================
-    // HEROUI V3 BUTTON & BUTTON GROUP COMPONENTS
-    // Documentation: https://heroui.com/docs/react/components/button
-    // ============================================================
-    const Spinner = ({ size = 'sm', color = 'current', className = '' }) => {
-        const px = size === 'sm' ? 14 : size === 'lg' ? 20 : 16;
-        return html`
-            <span className=${`button__spinner ${className}`} data-slot="spinner" style=${{ display: 'inline-flex', width: `${px}px`, height: `${px}px` }}>
-                <svg width=${px} height=${px} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" style=${{ color: color === 'current' ? 'currentColor' : color }}>
-                    <path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48l2.83-2.83" opacity="0.3" />
-                    <path d="M12 2a10 10 0 0 1 10 10" />
-                </svg>
-            </span>
-        `;
-    };
-
-    const Button = React.memo(({
-        variant = 'primary',
-        size = 'md',
-        fullWidth = false,
-        isDisabled = false,
-        disabled = false,
-        isPending = false,
-        isIconOnly = false,
-        onPress,
-        onClick,
-        className = '',
-        title = '',
-        style = {},
-        slot = '',
-        type = 'button',
-        children,
-        ...restProps
-    }) => {
-        const effectiveDisabled = Boolean(isDisabled || disabled);
-
-        const handlePress = (e) => {
-            if (effectiveDisabled || isPending) {
-                e.preventDefault();
-                return;
-            }
-            if (onPress) onPress(e);
-            else if (onClick) onClick(e);
-        };
-
-        const classes = [
-            'button',
-            `button--${variant}`,
-            `button--${size}`,
-            fullWidth ? 'button--full-width' : '',
-            isIconOnly ? 'button--icon-only' : '',
-            className
-        ].filter(Boolean).join(' ');
-
-        const content = typeof children === 'function' ? children({
-            isPending,
-            isDisabled: effectiveDisabled,
-        }) : children;
-
-        return html`
-            <button
-                type=${type}
-                className=${classes}
-                title=${title}
-                disabled=${effectiveDisabled}
-                data-slot="button"
-                slot=${slot || undefined}
-                data-pending=${isPending ? 'true' : undefined}
-                aria-disabled=${effectiveDisabled ? 'true' : undefined}
-                onClick=${handlePress}
-                style=${style}
-                ...${restProps}
-            >
-                ${isPending && (typeof children !== 'function') ? html`
-                    <${Spinner} size=${size === 'lg' ? 'md' : 'sm'} color="current" />
-                ` : null}
-                ${content}
-            </button>
-        `;
-    });
-
-    const ButtonGroup = ({ orientation = 'horizontal', fullWidth = false, size = 'md', className = '', children }) => html`
-        <div 
-            className=${`button-group button-group--${orientation} ${fullWidth ? 'button-group--full-width' : ''} ${className}`}
-            role="group"
-            data-slot="button-group"
-        >
-            ${children}
-        </div>
-    `;
-    ButtonGroup.Separator = () => html`<span className="button-group__separator" aria-hidden="true"></span>`;
-
-    // --- Modal Compound Component (HeroUI v3) ---
+    // Modal Compound Component (Glisse Liquid Glass Window)
     const Modal = ({ isOpen, isClosing, onClose, children }) => {
         if (!isOpen && !isClosing) return null;
         return children;
     };
-    Modal.Backdrop = ({ isClosing, onClose, children }) => html`
+    Modal.Backdrop = ({ isClosing, onClose, isDraggable, children }) => html`
         <div 
             id="__ul-settings-overlay"
-            className=${`modal__backdrop modal__backdrop--blur ${isClosing ? 'modal__backdrop--closing' : ''}`}
+            data-glisse-backdrop=""
+            className=${`modal__backdrop ${isClosing ? 'modal__backdrop--closing' : ''} ${isDraggable ? 'modal__backdrop--draggable' : ''}`}
             onClick=${(e) => {
-                if (e.target && e.target.id === '__ul-settings-overlay') onClose();
+                if (!isDraggable && e.target && e.target.id === '__ul-settings-overlay') onClose();
             }}
         >
             ${children}
         </div>
     `;
-    Modal.Container = ({ children }) => html`
-        <div className="modal__container" data-placement="center">${children}</div>
+    Modal.Container = ({ isDraggable, children }) => html`
+        <div className=${`modal__container ${isDraggable ? 'modal__container--draggable' : ''}`}>
+            ${children}
+        </div>
     `;
-    Modal.Dialog = ({ children }) => html`
+    Modal.Dialog = ({ isDraggable, style, dialogRef, children }) => html`
         <div 
-            className="modal__dialog modal__dialog--lg modal__dialog--scroll-inside" 
+            ref=${dialogRef}
+            className=${`modal__dialog ${isDraggable ? 'modal__dialog--draggable' : ''}`} 
             role="dialog" 
-            aria-modal="true"
+            aria-modal=${isDraggable ? 'false' : 'true'}
+            style=${style}
             onClick=${(e) => e.stopPropagation()}
         >
             ${children}
         </div>
     `;
-    Modal.Header = ({ children }) => html`<header className="modal__header">${children}</header>`;
-    Modal.Brand = ({ children }) => html`<div className="modal__brand">${children}</div>`;
-    Modal.Icon = ({ children }) => html`<div className="modal__icon">${children}</div>`;
-    Modal.Heading = ({ children }) => html`<div className="modal__title-box"><h2 className="modal__heading">${children}</h2></div>`;
-    Modal.CloseTrigger = ({ onPress }) => html`
-        <${Button} 
-            type="button" 
-            variant="ghost" 
-            size="sm" 
-            isIconOnly 
-            className="modal__close-trigger" 
-            onPress=${onPress} 
-            title="Close (Esc)"
-            aria-label="Close modal"
-        >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <line x1="18" y1="6" x2="6" y2="18"></line>
-                <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
-        <//>
-    `;
-    Modal.Footer = ({ children }) => html`<footer className="modal__footer">${children}</footer>`;
-    Modal.Body = ({ children }) => html`<div className="modal__body modal__body--scroll-inside">${children}</div>`;
-
-    // --- Tabs Compound Component (HeroUI v3) ---
-    const Tabs = ({ children }) => html`<div className="tabs tabs--secondary">${children}</div>`;
-    Tabs.ListContainer = ({ children }) => html`<div className="tabs__list-container">${children}</div>`;
-    Tabs.List = ({ innerRef, children }) => html`<div className="tabs__list" role="tablist" ref=${innerRef}>${children}</div>`;
-    Tabs.Tab = ({ id, isSelected, onPress, innerRef, children }) => html`
-        <button 
-            type="button" 
-            className="tabs__tab" 
-            role="tab" 
-            data-tab=${id} 
-            data-selected=${isSelected ? 'true' : 'false'}
-            onClick=${onPress}
-            ref=${innerRef}
+    Modal.Header = ({ isDraggable, isDragging, onPointerDown, children }) => html`
+        <header 
+            className=${`modal__header ${isDraggable ? 'modal__header--draggable' : ''} ${isDragging ? 'modal__header--dragging' : ''}`}
+            onPointerDown=${onPointerDown}
         >
             ${children}
-        </button>
+        </header>
     `;
-    Tabs.Indicator = ({ style }) => html`<div className="tabs__indicator" style=${style}></div>`;
-    Tabs.Panel = React.memo(({ id, activeTab, direction, children }) => {
+    Modal.Icon = ({ children }) => html`<div className="modal__icon">${children}</div>`;
+    Modal.Heading = ({ children }) => html`<div className="modal__title-box"><h2 className="modal__heading">${children}</h2></div>`;
+    Modal.Body = ({ children }) => html`
+        <div className="modal__body">
+            ${children}
+        </div>
+    `;
+
+    // Tabs Compound Component
+    const Tabs = ({ children }) => html`<div className="tabs">${children}</div>`;
+    Tabs.Panel = React.memo(({ id, activeTab, children }) => {
         const isActive = id === activeTab;
         return html`
             <div 
                 className="tabs__panel" 
                 data-tab=${id} 
                 data-active=${isActive ? 'true' : undefined}
-                data-direction=${direction}
                 style=${isActive ? {} : { display: 'none' }}
             >
                 ${children}
@@ -4642,200 +7072,114 @@
         `;
     });
 
-    // --- Switch Compound Component (HeroUI v3) ---
-    const Switch = React.memo(({ isSelected, onChange, size = 'md', isDisabled = false, className = '', children, onClick }) => {
-        const toggle = (e) => {
-            if (isDisabled) return;
-            if (e) e.stopPropagation();
-            if (onClick) onClick(e);
-            if (onChange) onChange(!isSelected);
+    // Switch Row Component with Glisse Liquid Glass Switch
+    const Switch = React.memo(({ isSelected, onChange, disabled, isDisabled, size = 'md', className = '', children, onClick }) => {
+        const effectiveChecked = Boolean(isSelected);
+        const effectiveDisabled = Boolean(disabled || isDisabled);
+
+        const handleToggle = (nextVal) => {
+            if (effectiveDisabled) return;
+            if (onChange) onChange(typeof nextVal === 'boolean' ? nextVal : !effectiveChecked);
         };
-        const onKeyDown = (e) => {
-            if (isDisabled) return;
-            if (e.key === ' ' || e.key === 'Enter') {
-                e.preventDefault();
-                toggle(e);
-            }
-        };
+
         return html`
             <div 
-                className=${`switch switch--${size} ${className}`.trim()} 
-                role="switch" 
-                tabIndex=${isDisabled ? '-1' : '0'}
-                data-selected=${isSelected ? 'true' : 'false'}
-                data-disabled=${isDisabled ? 'true' : undefined}
-                aria-checked=${isSelected ? 'true' : 'false'}
-                aria-disabled=${isDisabled ? 'true' : undefined}
-                onClick=${toggle}
-                onKeyDown=${onKeyDown}
+                className=${`field-switch-row ${className}`.trim()} 
+                data-selected=${effectiveChecked ? 'true' : 'false'}
+                data-disabled=${effectiveDisabled ? 'true' : undefined}
+                onClick=${(e) => {
+                    if (onClick) onClick(e);
+                    else handleToggle(!effectiveChecked);
+                }}
             >
-                ${children}
+                <div className="field-switch-content">
+                    ${children}
+                </div>
+                <div onClick=${(e) => e.stopPropagation()} style=${{ display: 'inline-flex', flexShrink: 0 }}>
+                    <${Glisse.Switch}
+                        checked=${effectiveChecked}
+                        onCheckedChange=${handleToggle}
+                        disabled=${effectiveDisabled}
+                    />
+                </div>
             </div>
         `;
     });
-    Switch.Control = ({ children }) => html`<div className="switch__control">${children || html`<div className="switch__thumb"></div>`}</div>`;
-    Switch.Thumb = ({ children }) => html`<div className="switch__thumb">${children}</div>`;
-    Switch.Content = ({ children }) => html`<div className="switch__content">${children}</div>`;
     Switch.Label = ({ children }) => html`<div data-slot="label">${children}</div>`;
     Switch.Description = ({ children }) => html`<div data-slot="description">${children}</div>`;
 
-    // --- Card Compound Component (HeroUI v3) ---
+    // FieldRow Component (Clean Uniform Box)
+    const FieldRow = React.memo(({ className = '', style = {}, onClick, children, ...restProps }) => html`
+        <div
+            className=${`field-row ${className}`.trim()}
+            style=${style}
+            onClick=${onClick}
+            ...${restProps}
+        >
+            ${children}
+        </div>
+    `);
+
+    // Card Compound Component (Clean Uniform Card)
     const Card = React.memo(({ variant = 'secondary', className = '', children }) => html`
-        <div className=${`card card--${variant} ${className}`}>${children}</div>
+        <div className=${`card card--${variant} ${className}`.trim()}>${children}</div>
     `);
     Card.Header = ({ className = '', children }) => html`<div className=${`card__header ${className}`.trim()}>${children}</div>`;
     Card.Title = ({ className = '', children }) => html`<div className=${`card__title ${className}`.trim()}>${children}</div>`;
     Card.Description = ({ className = '', children }) => html`<div className=${`card__description ${className}`.trim()}>${children}</div>`;
     Card.Content = ({ className = '', children }) => html`<div className=${`card__content ${className}`.trim()}>${children}</div>`;
 
-    // --- Badge Component (HeroUI v3) ---
+    // Badge Component
     const Badge = React.memo(({ size = 'sm', variant = 'primary', color = '', className = '', children }) => html`
         <span className=${`badge badge--${size} badge--${variant} ${color ? `badge--${color}` : ''} ${className}`}>
             ${children}
         </span>
     `);
 
-    // --- Dropdown Compound Component (HeroUI v3) ---
-    const DropdownContext = (typeof React !== 'undefined') ? React.createContext(null) : null;
+    // GlisseSelect Component (Powered by official Kelvin Zhang Glisse.Menu)
+    const GlisseSelect = React.memo(({ options, selectedKey, onSelectionChange, ariaLabel = "Options", align = "end" }) => {
+        const selectedOption = (options && options.find(o => o.id === selectedKey)) || (options && options[0]) || { label: '' };
+        const triggerIcon = html`
+            <span className="lg-select-trigger-content">
+                <span className="lg-select-current-label">${selectedOption.label}</span>
+                <svg className="lg-select-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="m6 9 6 6 6-6"/>
+                </svg>
+            </span>
+        `;
 
-    const Dropdown = React.memo(({ selectedKey, onSelectionChange, className = '', children }) => {
-        const [isOpen, setIsOpen] = React.useState(false);
-        const dropdownRef = React.useRef(null);
-
-        React.useEffect(() => {
-            if (!isOpen) return;
-            const handleDocClick = (e) => {
-                if (!dropdownRef.current) return;
-                const path = typeof e.composedPath === 'function' ? e.composedPath() : null;
-                const clickedInside = path
-                    ? path.includes(dropdownRef.current)
-                    : dropdownRef.current.contains(e.target);
-                if (!clickedInside) {
-                    setIsOpen(false);
+        const menuItems = (options || []).map((opt) => {
+            const isSelected = opt.id === selectedKey;
+            return {
+                label: html`
+                    <span className="lg-select-item-inner">
+                        <span className="lg-select-item-text">
+                            <span className="lg-select-item-title">${opt.label}</span>
+                            ${opt.desc ? html`<span className="lg-select-item-desc">${opt.desc}</span>` : null}
+                        </span>
+                        ${isSelected ? html`
+                            <svg className="lg-select-item-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                <polyline points="20 6 9 17 4 12"></polyline>
+                            </svg>
+                        ` : null}
+                    </span>
+                `,
+                onSelect: () => {
+                    if (onSelectionChange) onSelectionChange(opt.id);
                 }
             };
-            window.addEventListener('click', handleDocClick, true);
-            return () => window.removeEventListener('click', handleDocClick, true);
-        }, [isOpen]);
-
-        const contextValue = React.useMemo(() => ({
-            isOpen,
-            setIsOpen,
-            selectedKey,
-            onSelectionChange: (key) => {
-                if (onSelectionChange) onSelectionChange(key);
-                setIsOpen(false);
-            }
-        }), [isOpen, selectedKey, onSelectionChange]);
+        });
 
         return html`
-            <div ref=${dropdownRef} className=${`dropdown ${className}`} data-open=${isOpen ? 'true' : 'false'}>
-                <${DropdownContext.Provider} value=${contextValue}>
-                    ${children}
-                <//>
-            </div>
+            <${Glisse.Menu}
+                className="lg-menu-select"
+                items=${menuItems}
+                aria-label=${ariaLabel}
+                icon=${triggerIcon}
+                align=${align}
+            />
         `;
     });
-
-    Dropdown.Trigger = ({ children }) => {
-        const ctx = React.useContext(DropdownContext);
-        return html`
-            <div 
-                className="dropdown__trigger-wrapper"
-                onClick=${(e) => {
-                    e.stopPropagation();
-                    if (ctx) ctx.setIsOpen(!ctx.isOpen);
-                }}
-            >
-                ${children}
-            </div>
-        `;
-    };
-
-    Dropdown.Popover = ({ children }) => {
-        const ctx = React.useContext(DropdownContext);
-        if (!ctx || !ctx.isOpen) return null;
-        return html`
-            <div className="dropdown__popover" onClick=${(e) => e.stopPropagation()}>
-                ${children}
-            </div>
-        `;
-    };
-
-    Dropdown.Menu = ({ children }) => html`<div className="dropdown__menu" role="menu">${children}</div>`;
-
-    Dropdown.Item = React.memo(({ id, variant, children }) => {
-        const ctx = React.useContext(DropdownContext);
-        const isSelected = ctx && ctx.selectedKey === id;
-        return html`
-            <div 
-                className=${`dropdown__item ${variant === 'danger' ? 'dropdown__item--danger' : ''}`}
-                role="menuitem"
-                data-selected=${isSelected ? 'true' : 'false'}
-                onClick=${() => {
-                    if (ctx && ctx.onSelectionChange) ctx.onSelectionChange(id);
-                }}
-            >
-                <div className="dropdown__item-content">${children}</div>
-                ${isSelected ? html`<span className="dropdown__item-indicator">✓</span>` : null}
-            </div>
-        `;
-    });
-    Dropdown.Item.Label = ({ children }) => html`<div className="dropdown__item-label">${children}</div>`;
-    Dropdown.Item.Description = ({ children }) => html`<div className="dropdown__item-description">${children}</div>`;
-
-    // --- TagGroup Compound Component (HeroUI v3) ---
-    const TagGroupContext = (typeof React !== 'undefined') ? React.createContext(null) : null;
-
-    const TagGroup = React.memo(({ ariaLabel, selectionMode = 'single', selectedKeys, onSelectionChange, className = '', children }) => {
-        const contextValue = React.useMemo(() => ({
-            selectedKeys: selectedKeys || [],
-            selectionMode,
-            onSelect: (id) => {
-                if (onSelectionChange) onSelectionChange(id);
-            }
-        }), [selectedKeys, selectionMode, onSelectionChange]);
-
-        return html`
-            <div className=${`tag-group ${className}`.trim()} role="group" aria-label=${ariaLabel}>
-                <${TagGroupContext.Provider} value=${contextValue}>
-                    ${children}
-                <//>
-            </div>
-        `;
-    });
-    TagGroup.Label = ({ className = '', children }) => html`<div className=${`tag-group__label ${className}`.trim()}>${children}</div>`;
-    TagGroup.List = ({ className = '', children }) => html`<div className=${`tag-group__list ${className}`.trim()}>${children}</div>`;
-
-    const Tag = React.memo(({ id, onPress, onClick, className = '', children }) => {
-        const ctx = React.useContext(TagGroupContext);
-        const isSelected = ctx ? ctx.selectedKeys.includes(id) : false;
-        return html`
-            <div 
-                className=${`tag ${className}`.trim()} 
-                role="button"
-                tabIndex="0"
-                data-id=${id}
-                data-selected=${isSelected ? 'true' : 'false'}
-                onClick=${() => {
-                    if (onPress) onPress(id);
-                    else if (onClick) onClick(id);
-                    else if (ctx) ctx.onSelect(id);
-                }}
-                onKeyDown=${(e) => {
-                    if (e.key === ' ' || e.key === 'Enter') {
-                        e.preventDefault();
-                        if (onPress) onPress(id);
-                        else if (onClick) onClick(id);
-                        else if (ctx) ctx.onSelect(id);
-                    }
-                }}
-            >
-                ${children}
-            </div>
-        `;
-    });
-    TagGroup.Tag = Tag;
 
     const PRESET_OPTIONS = [
         { id: 'off', label: 'Off', desc: 'Allows all telemetry traffic without blocking' },
@@ -4859,9 +7203,9 @@
     ];
 
     const THEME_OPTIONS = [
-        { id: 'dark', label: 'Dark', desc: 'HeroUI high-contrast dark theme' },
-        { id: 'light', label: 'Light', desc: 'HeroUI clean light theme' },
-        { id: 'auto', label: 'Auto (System)', desc: 'Matches system dark/light preference' },
+        { id: 'dark', label: 'Dark', desc: 'Apple deep translucent dark glass' },
+        { id: 'light', label: 'Light', desc: 'Apple pure frosted light glass' },
+        { id: 'auto', label: 'Auto (System)', desc: 'Matches macOS / iOS system dark or light preference' },
     ];
 
     const LOG_LEVEL_OPTIONS = [
@@ -4870,9 +7214,12 @@
         { id: 'verbose', label: 'Verbose', desc: 'Full network packets and grouped reports' },
     ];
 
-    // --- Slider Compound Component (HeroUI v3) ---
-    const SliderContext = (typeof React !== 'undefined') ? React.createContext(null) : null;
+    const KEYBIND_ACTION_OPTIONS = [
+        { id: 'toggle-pill', label: 'Toggle Floating Button', desc: 'Closes open settings first, then hides/shows the floating button' },
+        { id: 'open-modal',  label: 'Open Settings Directly',  desc: 'Opens the Control Panel directly without showing the button' },
+    ];
 
+    // Glisse Slider Wrapper
     const Slider = React.memo(({
         value,
         defaultValue = 0,
@@ -4880,232 +7227,60 @@
         maxValue = 100,
         step = 1,
         isDisabled = false,
+        disabled = false,
         onChange,
         className = '',
         children,
     }) => {
-        const [internalValue, setInternalValue] = React.useState(typeof value !== 'undefined' ? value : defaultValue);
-        const [isDragging, setIsDragging] = React.useState(false);
-        const trackRef = React.useRef(null);
-        const isDraggingRef = React.useRef(false);
-        const latestValRef = React.useRef(internalValue);
-        const dragCleanupRef = React.useRef(null);
-
-        React.useEffect(() => () => {
-            if (dragCleanupRef.current) dragCleanupRef.current();
-        }, []);
-
-        // Keep internal value in sync with external value when not dragging
-        React.useEffect(() => {
-            if (!isDraggingRef.current && typeof value !== 'undefined') {
-                setInternalValue(value);
-                latestValRef.current = value;
-            }
-        }, [value]);
-
-        const curVal = isDragging ? internalValue : (typeof value !== 'undefined' ? value : internalValue);
-        const percentage = Math.max(0, Math.min(100, ((curVal - minValue) / (maxValue - minValue)) * 100));
-
-        const triggerChange = React.useCallback((nextVal, commit = false) => {
-            const clamped = Math.max(minValue, Math.min(maxValue, parseFloat(nextVal.toFixed(4))));
-            latestValRef.current = clamped;
-            setInternalValue(clamped);
-            if (commit && onChange) {
-                onChange(clamped);
-            }
-        }, [minValue, maxValue, onChange]);
-
-        const handleKeyDown = React.useCallback((e) => {
-            if (isDisabled) return;
-            let next = null;
-            if (e.key === 'ArrowRight' || e.key === 'ArrowUp') next = curVal + step;
-            else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') next = curVal - step;
-            else if (e.key === 'Home') next = minValue;
-            else if (e.key === 'End') next = maxValue;
-            if (next !== null) {
-                e.preventDefault();
-                triggerChange(next, true);
-            }
-        }, [isDisabled, curVal, step, minValue, maxValue, triggerChange]);
-
-        const handlePointerDown = React.useCallback((e) => {
-            if (isDisabled || !trackRef.current) return;
-            e.preventDefault();
-            if (dragCleanupRef.current) dragCleanupRef.current();
-            isDraggingRef.current = true;
-            setIsDragging(true);
-
-            // Cache bounding rect ONCE on pointerdown to prevent layout reflows during move
-            const rect = trackRef.current.getBoundingClientRect();
-            const width = rect.width;
-            const left = rect.left;
-
-            const calcValFromClientX = (clientX) => {
-                if (width <= 0) return minValue;
-                const pos = Math.max(0, Math.min(1, (clientX - left) / width));
-                let raw = minValue + pos * (maxValue - minValue);
-                if (step) {
-                    raw = Math.round((raw - minValue) / step) * step + minValue;
-                }
-                return Math.max(minValue, Math.min(maxValue, parseFloat(raw.toFixed(4))));
-            };
-
-            const initialVal = calcValFromClientX(e.clientX);
-            triggerChange(initialVal, false);
-
-            let rafId = null;
-            let latestClientX = e.clientX;
-
-            const onMove = (ev) => {
-                latestClientX = ev.clientX;
-                if (rafId) return;
-                rafId = requestAnimationFrame(() => {
-                    rafId = null;
-                    if (!isDraggingRef.current) return;
-                    const nextVal = calcValFromClientX(latestClientX);
-                    triggerChange(nextVal, false);
-                    // Live DOM fast-path preview on floating pill without whole-app React re-renders
-                    try {
-                        const pillEl = (uiShadowRoot && uiShadowRoot.getElementById('__ul-pill')) || document.getElementById('__ul-pill');
-                        if (pillEl) pillEl.style.opacity = String(nextVal);
-                    } catch {}
-                });
-            };
-
-            const cleanupListeners = () => {
-                if (rafId) {
-                    cancelAnimationFrame(rafId);
-                    rafId = null;
-                }
-                isDraggingRef.current = false;
-                window.removeEventListener('pointermove', onMove);
-                window.removeEventListener('pointerup', onUp);
-                window.removeEventListener('pointercancel', onUp);
-                dragCleanupRef.current = null;
-            };
-
-            const onUp = (ev) => {
-                cleanupListeners();
-                setIsDragging(false);
-                const finalX = (ev && typeof ev.clientX === 'number') ? ev.clientX : latestClientX;
-                const finalVal = calcValFromClientX(finalX);
-                triggerChange(finalVal, true);
-            };
-
-            dragCleanupRef.current = cleanupListeners;
-            window.addEventListener('pointermove', onMove, { passive: true });
-            window.addEventListener('pointerup', onUp, { passive: true });
-            window.addEventListener('pointercancel', onUp, { passive: true });
-        }, [isDisabled, minValue, maxValue, step, triggerChange]);
-
-        const contextValue = React.useMemo(() => ({
-            value: curVal,
-            minValue,
-            maxValue,
-            percentage,
-            isDragging,
-            isDisabled,
-            trackRef,
-            handlePointerDown,
-            handleKeyDown,
-        }), [curVal, minValue, maxValue, percentage, isDragging, isDisabled, handlePointerDown, handleKeyDown]);
+        const curVal = typeof value !== 'undefined' ? value : defaultValue;
+        const effectiveDisabled = Boolean(isDisabled || disabled);
 
         return html`
-            <div 
-                className=${`slider ${className}`.trim()}
-                data-disabled=${isDisabled ? 'true' : undefined}
-                data-dragging=${isDragging ? 'true' : undefined}
-            >
-                <${SliderContext.Provider} value=${contextValue}>
-                    ${children}
-                <//>
+            <div className=${`field-slider-wrapper ${className}`.trim()} data-disabled=${effectiveDisabled ? 'true' : undefined}>
+                <${Glisse.Slider}
+                    value=${curVal}
+                    min=${minValue}
+                    max=${maxValue}
+                    step=${step}
+                    disabled=${effectiveDisabled}
+                    onValueChange=${(val) => {
+                        if (onChange) onChange(val);
+                        try {
+                            const pillEl = (uiShadowRoot && uiShadowRoot.getElementById('__ul-pill')) || document.getElementById('__ul-pill');
+                            if (pillEl) pillEl.style.opacity = String(val);
+                        } catch {}
+                    }}
+                />
+                <span className="slider__output">
+                    ${Math.round((curVal <= 1 && maxValue <= 1) ? curVal * 100 : curVal)}%
+                </span>
             </div>
         `;
     });
 
-    Slider.Output = ({ className = '', children }) => {
-        const ctx = React.useContext(SliderContext);
-        const val = ctx ? ctx.value : 0;
-        const display = typeof children === 'function'
-            ? children(val)
-            : (children || `${Math.round(ctx ? (ctx.value <= 1 && ctx.maxValue <= 1 ? ctx.value * 100 : ctx.percentage) : 0)}%`);
-        return html`
-            <output className=${`slider__output ${className}`.trim()}>
-                ${display}
-            </output>
-        `;
-    };
-
-    Slider.Track = ({ className = '', children }) => {
-        const ctx = React.useContext(SliderContext);
-        return html`
-            <div 
-                ref=${ctx ? ctx.trackRef : null}
-                className=${`slider-track ${className}`.trim()}
-                onPointerDown=${ctx ? ctx.handlePointerDown : null}
-            >
-                ${children}
-            </div>
-        `;
-    };
-
-    Slider.Fill = ({ className = '' }) => {
-        const ctx = React.useContext(SliderContext);
-        const width = ctx ? `${ctx.percentage}%` : '0%';
-        return html`<div className=${`slider-fill ${className}`.trim()} style=${{ width }}></div>`;
-    };
-
-    Slider.Thumb = ({ className = '' }) => {
-        const ctx = React.useContext(SliderContext);
-        const left = ctx ? `${ctx.percentage}%` : '0%';
-        return html`
-            <div 
-                className=${`slider-thumb ${className}`.trim()}
-                role="slider"
-                tabIndex="0"
-                aria-valuenow=${ctx ? ctx.value : 0}
-                aria-valuemin=${ctx ? ctx.minValue : 0}
-                aria-valuemax=${ctx ? ctx.maxValue : 100}
-                data-dragging=${ctx && ctx.isDragging ? 'true' : undefined}
-                onKeyDown=${ctx ? ctx.handleKeyDown : null}
-                style=${{ left }}
-            ></div>
-        `;
-    };
-
-    // --- ServiceTile Component (HeroUI v3 Switch) ---
+    // ServiceTile with Glisse Liquid Glass Switch
     const ServiceTile = React.memo(({ serviceKey, service, isChecked, onToggle }) => {
-        const handleToggle = React.useCallback((e) => {
-            if (e && e.stopPropagation) e.stopPropagation();
-            if (onToggle) onToggle(serviceKey);
-        }, [onToggle, serviceKey]);
-
         return html`
             <div 
                 className="service-tile"
-                data-service=${serviceKey}
                 data-checked=${isChecked ? 'true' : 'false'}
-                title=${service.hosts.join(', ')}
-                onClick=${handleToggle}
+                onClick=${() => onToggle(serviceKey)}
             >
-                <span className="service-tile__label">${service.label}</span>
-                <${Switch} 
-                    isSelected=${isChecked} 
-                    onChange=${handleToggle}
-                    size="sm"
-                    className="service-tile__switch"
-                >
-                    <${Switch.Control}>
-                        <${Switch.Thumb} />
-                    <//>
-                <//>
+                <span className="service-tile__label" title=${service.label}>
+                    ${service.label}
+                </span>
+                <div onClick=${(e) => e.stopPropagation()} style=${{ display: 'inline-flex', flexShrink: 0 }}>
+                    <${Glisse.Switch}
+                        checked=${isChecked}
+                        onCheckedChange=${() => onToggle(serviceKey)}
+                    />
+                </div>
             </div>
         `;
     });
 
-    // --- StatusPill Component (Floating UI) ---
     const StatusPill = React.memo(({ currentSettings, currentStats, accumulatedBonus, onToggleBoost, onOpenSettings }) => {
-        if (!currentSettings.pillVisible) return null;
+        if (currentSettings.keybindAction === 'open-modal' || !currentSettings.pillVisible) return null;
         const mode = currentSettings.pillMode || 'minimal';
         const isMinimal = mode === 'minimal';
         const isCompact = mode === 'compact';
@@ -5116,6 +7291,16 @@
         const pillStyle = Object.assign({}, pos, {
             opacity: String(currentSettings.pillOpacity),
             display: 'flex',
+            width: isMinimal ? '44px' : 'auto',
+            height: isMinimal ? '44px' : '38px',
+            borderRadius: isMinimal ? '22px' : '19px',
+            background: isMinimal ? 'none' : undefined,
+            '--lg-blur': '1px',
+            '--lg-bezel': isMinimal ? '10px' : '8px',
+            '--lg-thickness': isMinimal ? '18px' : '14px',
+            '--lg-zoom': 1.02,
+            '--lg-rim-saturation': 1.6,
+            '--lg-refraction': 1.05,
         });
 
         const rangeLabel = currentSettings.extraSecondsMin === currentSettings.extraSecondsMax
@@ -5123,12 +7308,13 @@
             : `+${currentSettings.extraSecondsMin}–${currentSettings.extraSecondsMax}s`;
 
         const kbText = formatKeybind(currentSettings.uiToggleKeybind);
+        const actionDesc = currentSettings.keybindAction === 'open-modal' ? 'open/close settings' : 'hide/show';
         const tooltip = isMinimal
             ? `UpLearn Control Panel (${kbText}) | Boost: ${enabled ? 'ON' : 'OFF'}`
-            : `Click badge: toggle time boost | Click gear: Control Panel | ${kbText}: hide/show`;
+            : `Click badge: toggle time boost | Click gear: Control Panel | ${kbText}: ${actionDesc}`;
 
         return html`
-            <div 
+            <${Glisse.Glass} 
                 id="__ul-pill"
                 className=${`heroui-pill ${isMinimal ? 'heroui-pill--minimal' : ''}`}
                 data-mode=${mode}
@@ -5178,18 +7364,17 @@
                         onOpenSettings();
                     }}
                 >
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                    <svg width=${isMinimal ? "20" : "18"} height=${isMinimal ? "20" : "18"} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                         <circle cx="12" cy="12" r="3"></circle>
                         <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
                     </svg>
                     <span className="heroui-pill__indicator-dot" style=${{ display: enabled ? 'block' : 'none' }}></span>
                 </button>
-            </div>
+            <//>
         `;
     });
 
-    // --- SettingsModal Component (HeroUI v3 Dialog) ---
-    // --- SettingsModal Component & Isolated Memoized Tabs ---
+    // TelemetryTab
     const TelemetryTab = React.memo(({
         currentSettings,
         onUpdateSetting,
@@ -5228,21 +7413,16 @@
 
         const handleEnableAllServices = useCallback(() => {
             const updated = {};
-            for (const k in TELEMETRY_SERVICES) {
-                updated[k] = true;
-            }
+            for (const k in TELEMETRY_SERVICES) updated[k] = true;
             onUpdateSetting('telemetryServices', updated);
         }, [onUpdateSetting]);
 
         const handleDisableAllServices = useCallback(() => {
             const updated = {};
-            for (const k in TELEMETRY_SERVICES) {
-                updated[k] = false;
-            }
+            for (const k in TELEMETRY_SERVICES) updated[k] = false;
             onUpdateSetting('telemetryServices', updated);
         }, [onUpdateSetting]);
 
-        // Memoized switch handlers
         const updatePreset = useCallback((val) => onUpdateSetting('telemetryPreset', val), [onUpdateSetting]);
         const updateLogImproper = useCallback((v) => onUpdateSetting('blockLogImproperUse', v), [onUpdateSetting]);
         const updateBlockDom = useCallback((v) => onUpdateSetting('blockDomElements', v), [onUpdateSetting]);
@@ -5255,153 +7435,88 @@
         return html`
             <div className="grid-2col">
                 <div className="col-stack">
-                    <${Card} className="card--compact">
+                    <${Card}>
                         <${Card.Header}>
                             <${Card.Title}>
-                                <span>Blocking Preset</span>
-                                <${Badge} variant="soft" color="accent">Smart Filters<//>
+                                <span>Core Telemetry Intercepts</span>
+                                <${Badge} variant="soft" color="accent">Protection Active<//>
                             <//>
-                            <${Card.Description}>Pick a ready-made preset or customize your active blockers.<//>
+                            <${Card.Description}>Configure network intercepts, telemetry blocking presets, and client-side privacy cloaks.<//>
                         <//>
                         <${Card.Content}>
-                            <div className="field-row">
+                            <${FieldRow}>
                                 <label>Active Preset
                                     <small>Off · Simple (LogImproperUse only) · Harsh (Block all) · Custom</small>
                                 </label>
-                                <${Dropdown} 
+                                <${GlisseSelect} 
+                                    options=${PRESET_OPTIONS}
                                     selectedKey=${currentSettings.telemetryPreset}
                                     onSelectionChange=${updatePreset}
-                                >
-                                    <${Dropdown.Trigger}>
-                                        <${Button} variant="secondary" className="dropdown__trigger-btn">
-                                            <span>${PRESET_OPTIONS.find(o => o.id === currentSettings.telemetryPreset)?.label || 'Custom'}</span>
-                                            <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                                        <//>
-                                    <//>
-                                    <${Dropdown.Popover}>
-                                        <${Dropdown.Menu}>
-                                            ${PRESET_OPTIONS.map(opt => html`
-                                                <${Dropdown.Item} id=${opt.id} key=${opt.id}>
-                                                    <${Dropdown.Item.Label}>${opt.label}<//>
-                                                    <${Dropdown.Item.Description}>${opt.desc}<//>
-                                                <//>
-                                            `)}
-                                        <//>
-                                    <//>
-                                <//>
-                            </div>
-                        <//>
-                    <//>
+                                    ariaLabel="Active Preset"
+                                />
+                            <//>
 
-                    <${Card} className="card--compact">
-                        <${Card.Header}>
-                            <${Card.Title}>Core Protection Toggles<//>
-                            <${Card.Description}>Fine-grained control over network intercepts and client spoofing.<//>
-                        <//>
-                        <${Card.Content} className="core-toggles-list">
                             <${Switch} 
-                                size="sm"
                                 isSelected=${currentSettings.blockLogImproperUse}
                                 onChange=${updateLogImproper}
                             >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Block LogImproperUse requests<//>
-                                    <${Switch.Description}>Silently drops UpLearn improper-use telemetry sent to API<//>
-                                <//>
+                                <${Switch.Label}>Block LogImproperUse requests<//>
+                                <${Switch.Description}>Silently drops UpLearn improper-use telemetry sent to API<//>
                             <//>
 
                             <${Switch} 
-                                size="sm"
-                                isSelected=${currentSettings.blockDomElements}
-                                onChange=${updateBlockDom}
-                            >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Block DOM telemetry injection<//>
-                                    <${Switch.Description}>Hooks script/iframe src and purges blocked tracker nodes<//>
-                                <//>
-                            <//>
-
-                            <${Switch} 
-                                size="sm"
-                                isSelected=${currentSettings.blockWebSockets}
-                                onChange=${updateBlockWs}
-                            >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Block telemetry WebSockets<//>
-                                    <${Switch.Description}>Terminates analytics & Intercom WebSocket connections<//>
-                                <//>
-                            <//>
-
-                            <${Switch} 
-                                size="sm"
-                                isSelected=${currentSettings.blockSendBeacon}
-                                onChange=${updateBlockBeacon}
-                            >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Block telemetry sendBeacon<//>
-                                    <${Switch.Description}>Drops background beacon-style telemetry packets<//>
-                                <//>
-                            <//>
-
-                            <${Switch} 
-                                size="sm"
-                                isSelected=${currentSettings.spoofVisibility}
-                                onChange=${updateSpoofVis}
-                            >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Spoof visibility & focus<//>
-                                    <${Switch.Description}>Ensures page always believes it is focused & visible<//>
-                                <//>
-                            <//>
-
-                            <${Switch} 
-                                size="sm"
-                                isSelected=${currentSettings.suppressConsoleNoise}
-                                onChange=${updateSuppressNoise}
-                            >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Suppress site's console noise<//>
-                                    <${Switch.Description}>Mutes [J-ERROR], Jitsu send errors, and blocked-host spam<//>
-                                <//>
-                            <//>
-
-                            <${Switch} 
-                                size="sm"
                                 isSelected=${currentSettings.suppressJitsu}
                                 onChange=${updateSuppressJitsu}
                             >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Suppress Jitsu telemetry<//>
-                                    <${Switch.Description}>Checked: blocks jitsu.uplearn.co.uk. Unchecked: logs inspected packets.<//>
-                                <//>
+                                <${Switch.Label}>Suppress Jitsu telemetry<//>
+                                <${Switch.Description}>Checked: blocks jitsu.uplearn.co.uk. Unchecked: logs inspected packets.<//>
+                            <//>
+
+                            <${Switch} 
+                                isSelected=${currentSettings.blockWebSockets}
+                                onChange=${updateBlockWs}
+                            >
+                                <${Switch.Label}>Block telemetry WebSockets<//>
+                                <${Switch.Description}>Terminates analytics & Intercom WebSocket connections<//>
+                            <//>
+
+                            <${Switch} 
+                                isSelected=${currentSettings.blockSendBeacon}
+                                onChange=${updateBlockBeacon}
+                            >
+                                <${Switch.Label}>Block telemetry sendBeacon<//>
+                                <${Switch.Description}>Drops background beacon-style telemetry packets<//>
+                            <//>
+
+                            <${Switch} 
+                                isSelected=${currentSettings.blockDomElements}
+                                onChange=${updateBlockDom}
+                            >
+                                <${Switch.Label}>Block DOM telemetry injection<//>
+                                <${Switch.Description}>Hooks script/iframe src and purges blocked tracker nodes<//>
+                            <//>
+
+                            <${Switch} 
+                                isSelected=${currentSettings.spoofVisibility}
+                                onChange=${updateSpoofVis}
+                            >
+                                <${Switch.Label}>Spoof visibility & focus<//>
+                                <${Switch.Description}>Ensures page always believes it is focused & visible<//>
+                            <//>
+
+                            <${Switch} 
+                                isSelected=${currentSettings.suppressConsoleNoise}
+                                onChange=${updateSuppressNoise}
+                            >
+                                <${Switch.Label}>Suppress site's console noise<//>
+                                <${Switch.Description}>Mutes [J-ERROR], Jitsu send errors, and blocked-host spam<//>
                             <//>
                         <//>
                     <//>
                 </div>
 
                 <div className="col-stack">
-                    <${Card} className="card--compact">
+                    <${Card}>
                         <${Card.Header}>
                             <${Card.Title}>
                                 <span>Third-Party Telemetry Services</span>
@@ -5410,27 +7525,21 @@
                             <${Card.Description}>Toggle individual analytics trackers. Changes auto-switch preset to Custom.<//>
                         <//>
                         <${Card.Content}>
-                            <div className="services-search-bar">
-                                <input 
-                                    type="text" 
-                                    className="services-search-input" 
-                                    placeholder="Search service name or hostname…"
+                            <div className="services-toolbar">
+                                <${Glisse.SearchField} 
                                     value=${servicesFilter}
-                                    onInput=${(e) => setServicesFilter(e.target.value)}
+                                    onValueChange=${setServicesFilter}
+                                    placeholder="Search services…"
+                                    className="services-search-field"
                                 />
-                                <${Button} variant="secondary" size="sm" onPress=${handleEnableAllServices}>
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                                        <polyline points="20 6 9 17 4 12"></polyline>
-                                    </svg>
-                                    <span>Enable All</span>
-                                <//>
-                                <${Button} variant="outline" size="sm" onPress=${handleDisableAllServices}>
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                                        <line x1="18" y1="6" x2="6" y2="18"></line>
-                                        <line x1="6" y1="6" x2="18" y2="18"></line>
-                                    </svg>
-                                    <span>Disable All</span>
-                                <//>
+                                <div className="services-actions">
+                                    <${Glisse.Button} variant="glass" onClick=${handleEnableAllServices} className="services-action-btn">
+                                        Enable All
+                                    <//>
+                                    <${Glisse.Button} variant="glass" onClick=${handleDisableAllServices} className="services-action-btn">
+                                        Disable All
+                                    <//>
+                                </div>
                             </div>
                             <div className="services-grid">
                                 ${filteredServicesList.map(({ key, svc, checked }) => html`
@@ -5450,12 +7559,15 @@
         `;
     });
 
+    // TimeBoostTab
     const TimeBoostTab = React.memo(({
         currentSettings,
         accumulatedBonus,
         onUpdateSetting,
+        onAddManualBonus,
+        onClearBonus,
     }) => {
-        const { useState, useEffect, useCallback, useMemo } = React;
+        const { useState, useEffect, useCallback } = React;
         const [minStr, setMinStr] = useState(() => String(currentSettings.extraSecondsMin));
         const [maxStr, setMaxStr] = useState(() => String(currentSettings.extraSecondsMax));
 
@@ -5469,15 +7581,21 @@
 
         const commitMin = useCallback(() => {
             const val = parseInt(minStr, 10);
-            if (!isNaN(val) && val >= 1) onUpdateSetting('extraSecondsMin', val);
-            else setMinStr(String(currentSettings.extraSecondsMin));
-        }, [minStr, currentSettings.extraSecondsMin, onUpdateSetting]);
+            if (!isNaN(val) && val >= 1) {
+                onUpdateSetting('extraSecondsRange', { min: val, max: currentSettings.extraSecondsMax });
+            } else {
+                setMinStr(String(currentSettings.extraSecondsMin));
+            }
+        }, [minStr, currentSettings.extraSecondsMin, currentSettings.extraSecondsMax, onUpdateSetting]);
 
         const commitMax = useCallback(() => {
             const val = parseInt(maxStr, 10);
-            if (!isNaN(val) && val >= 1) onUpdateSetting('extraSecondsMax', val);
-            else setMaxStr(String(currentSettings.extraSecondsMax));
-        }, [maxStr, currentSettings.extraSecondsMax, onUpdateSetting]);
+            if (!isNaN(val) && val >= 1) {
+                onUpdateSetting('extraSecondsRange', { min: currentSettings.extraSecondsMin, max: val });
+            } else {
+                setMaxStr(String(currentSettings.extraSecondsMax));
+            }
+        }, [maxStr, currentSettings.extraSecondsMin, currentSettings.extraSecondsMax, onUpdateSetting]);
 
         const updateTimeBoost = useCallback((v) => onUpdateSetting('timeBoostEnabled', v), [onUpdateSetting]);
         const updateManualBtn = useCallback((v) => onUpdateSetting('manualTimeButtonEnabled', v), [onUpdateSetting]);
@@ -5486,24 +7604,16 @@
         const updateAutoSkipVideo = useCallback((v) => onUpdateSetting('autoSkipVideoEnabled', v), [onUpdateSetting]);
         const updateAddVideoDuration = useCallback((v) => onUpdateSetting('addVideoDurationToTimeSpent', v), [onUpdateSetting]);
 
-        const selectedRangeKeys = useMemo(() => {
-            const match = QUICK_RANGE_PRESETS.find(
-                p => p.min === currentSettings.extraSecondsMin && p.max === currentSettings.extraSecondsMax
-            );
-            return match ? [match.label] : [];
-        }, [currentSettings.extraSecondsMin, currentSettings.extraSecondsMax]);
-
-        const handleRangePresetChange = useCallback((label) => {
-            const p = QUICK_RANGE_PRESETS.find(item => item.label === label);
-            if (p) {
-                onUpdateSetting('extraSecondsMin', p.min);
-                onUpdateSetting('extraSecondsMax', p.max);
-            }
+        const handleRangePresetChange = useCallback((preset) => {
+            if (!preset) return;
+            setMinStr(String(preset.min));
+            setMaxStr(String(preset.max));
+            onUpdateSetting('extraSecondsRange', { min: preset.min, max: preset.max });
         }, [onUpdateSetting]);
 
         const rangeHint = (currentSettings.extraSecondsMin === currentSettings.extraSecondsMax)
-            ? `Every question receives +${currentSettings.extraSecondsMin}s.`
-            : `Each question rolls random +${currentSettings.extraSecondsMin}–${currentSettings.extraSecondsMax}s.`;
+            ? `Every question receives +${currentSettings.extraSecondsMin}s bonus.`
+            : `Each question rolls a random +${currentSettings.extraSecondsMin}–${currentSettings.extraSecondsMax}s bonus.`;
 
         return html`
             <div className="grid-2col">
@@ -5511,80 +7621,72 @@
                     <${Card}>
                         <${Card.Header}>
                             <${Card.Title}>
-                                <span>Master Booster Switch</span>
-                                <${Badge} variant="soft" color="success">TimeSpent<//>
+                                <span>Question Time Boost</span>
+                                <${Badge} variant="soft" color=${currentSettings.timeBoostEnabled ? 'success' : 'default'}>
+                                    ${currentSettings.timeBoostEnabled ? 'Active' : 'Paused'}
+                                <//>
                             <//>
-                            <${Card.Description}>Automatically adds extra time spent to quiz submissions and group summaries.<//>
+                            <${Card.Description}>Automatically injects extra time spent into question submissions and quiz completions.<//>
                         <//>
                         <${Card.Content}>
                             <${Switch} 
                                 isSelected=${currentSettings.timeBoostEnabled}
                                 onChange=${updateTimeBoost}
                             >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Enable time boost<//>
-                                    <${Switch.Description}>Injects calculated time bonuses into AnswerProgressQuizQuestion API calls<//>
-                                <//>
+                                <${Switch.Label}>Enable question time boost<//>
+                                <${Switch.Description}>Injects calculated time bonuses into question answering and quiz completion API calls<//>
                             <//>
-                        <//>
-                    <//>
 
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>Random Duration Range<//>
-                            <${Card.Description}>${rangeHint}<//>
-                        <//>
-                        <${Card.Content}>
-                            <div className="field-row">
+                            <${FieldRow}>
                                 <label>Extra Seconds Range
-                                    <small>Minimum and maximum extra seconds added per question</small>
+                                    <small>${rangeHint}</small>
                                 </label>
                                 <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    <input 
+                                    <${Glisse.Input} 
                                         type="number" 
-                                        className="input" 
-                                        style=${{ width: '78px', textAlign: 'center' }} 
+                                        style=${{ width: '88px', height: '34px' }} 
                                         min="1" 
                                         max="3600"
                                         value=${minStr}
-                                        onInput=${(e) => setMinStr(e.target.value)}
+                                        onValueChange=${setMinStr}
                                         onBlur=${commitMin}
                                         onKeyDown=${(e) => { if (e.key === 'Enter') commitMin(); }}
                                     />
-                                    <span style=${{ color: 'var(--muted)', fontWeight: 600 }}>to</span>
-                                    <input 
+                                    <span style=${{ color: 'var(--lg-muted)', fontWeight: 600 }}>to</span>
+                                    <${Glisse.Input} 
                                         type="number" 
-                                        className="input" 
-                                        style=${{ width: '78px', textAlign: 'center' }} 
+                                        style=${{ width: '88px', height: '34px' }} 
                                         min="1" 
                                         max="3600"
                                         value=${maxStr}
-                                        onInput=${(e) => setMaxStr(e.target.value)}
+                                        onValueChange=${setMaxStr}
                                         onBlur=${commitMax}
                                         onKeyDown=${(e) => { if (e.key === 'Enter') commitMax(); }}
                                     />
-                                    <span style=${{ color: 'var(--muted)', fontWeight: 600 }}>s</span>
+                                    <span style=${{ color: 'var(--lg-muted)', fontWeight: 600 }}>s</span>
                                 </div>
-                            </div>
+                            <//>
 
-                            <div style=${{ marginTop: '8px' }}>
-                                <${TagGroup} 
-                                    ariaLabel="Quick Range Presets" 
-                                    selectedKeys=${selectedRangeKeys}
-                                    onSelectionChange=${handleRangePresetChange}
-                                >
-                                    <${TagGroup.Label}>Quick Range Presets<//>
-                                    <${TagGroup.List}>
-                                        ${QUICK_RANGE_PRESETS.map((p, idx) => html`
-                                            <${Tag} id=${p.label} key=${idx}>
-                                                <span>${p.label}</span>
+                            <div className="field-box" style=${{ padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                                <div style=${{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
+                                    <span style=${{ fontSize: '13px', fontWeight: 590, color: 'var(--lg-foreground)' }}>Quick Range Presets</span>
+                                    <span style=${{ fontSize: '11px', color: 'var(--lg-muted)' }}>Tap to apply duration</span>
+                                </div>
+                                <div style=${{ display: 'flex', flexWrap: 'wrap', gap: '8px', width: '100%' }}>
+                                    ${QUICK_RANGE_PRESETS.map((p, idx) => {
+                                        const isSelected = p.min === currentSettings.extraSecondsMin && p.max === currentSettings.extraSecondsMax;
+                                        return html`
+                                            <${Glisse.Button}
+                                                key=${idx}
+                                                variant=${isSelected ? 'filled' : 'glass'}
+                                                onClick=${() => handleRangePresetChange(p)}
+                                                style=${{ height: '30px', padding: '0 13px', fontSize: '12px', borderRadius: '9999px', fontWeight: isSelected ? 600 : 500 }}
+                                            >
+                                                ${p.label}
                                             <//>
-                                        `)}
-                                    <//>
-                                <//>
+                                        `;
+                                    })}
+                                </div>
                             </div>
                         <//>
                     <//>
@@ -5592,52 +7694,27 @@
                     <${Card}>
                         <${Card.Header}>
                             <${Card.Title}>
-                                <span>Video Automation & Completion</span>
-                                <${Badge} variant="soft" color=${(currentSettings.fullVideoWatchedEnabled || currentSettings.autoSkipVideoEnabled || currentSettings.addVideoDurationToTimeSpent) ? 'success' : 'default'}>Videos<//>
+                                <span>Interactive Quiz Page Button</span>
+                                <${Badge} variant="soft" color=${currentSettings.manualTimeButtonEnabled ? 'accent' : 'default'}>Quiz Button<//>
                             <//>
-                            <${Card.Description}>Automate video lesson playback, skip to questions, and ensure full duration credits.<//>
+                            <${Card.Description}>Injects an interactive "+Add time" button right next to UpLearn's submit button.<//>
                         <//>
-                        <${Card.Content} className="core-toggles-list">
+                        <${Card.Content}>
                             <${Switch} 
-                                size="sm"
-                                isSelected=${currentSettings.fullVideoWatchedEnabled}
-                                onChange=${updateFullVideo}
+                                isSelected=${currentSettings.manualTimeButtonEnabled}
+                                onChange=${updateManualBtn}
                             >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Always mark videos as fully watched (100%)<//>
-                                    <${Switch.Description}>Sets percentWatched to 1 on CompleteVideoLesson mutations so every video registers as fully completed<//>
-                                <//>
+                                <${Switch.Label}>Enable question page "+Add time" button<//>
+                                <${Switch.Description}>Displays button next to Submit on question pages. Click to enter custom seconds (e.g. 120 or 2m).<//>
                             <//>
 
                             <${Switch} 
-                                size="sm"
-                                isSelected=${currentSettings.autoSkipVideoEnabled}
-                                onChange=${updateAutoSkipVideo}
+                                isSelected=${currentSettings.manualTimeStacksWithAuto}
+                                onChange=${updateManualStack}
+                                isDisabled=${!currentSettings.manualTimeButtonEnabled}
                             >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Auto-skip video to questions / completion<//>
-                                    <${Switch.Description}>Automatically seeks directly to in-video quiz questions, or fast-forwards to the end if there are no questions<//>
-                                <//>
-                            <//>
-
-                            <${Switch} 
-                                size="sm"
-                                isSelected=${currentSettings.addVideoDurationToTimeSpent}
-                                onChange=${updateAddVideoDuration}
-                            >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Add video duration to study time<//>
-                                    <${Switch.Description}>Adds the video's full length to CompleteVideoLesson timeSpent so you get full study time credit<//>
-                                <//>
+                                <${Switch.Label}>Manual time stacks with auto-boost<//>
+                                <${Switch.Description}>Checked: manual extra adds on top of auto-boost. Unchecked: manual extra replaces auto-boost for that submission.<//>
                             <//>
                         <//>
                     <//>
@@ -5647,63 +7724,86 @@
                     <${Card}>
                         <${Card.Header}>
                             <${Card.Title}>
-                                <span>Inline "Add Time" Button</span>
-                                <${Badge} variant="soft" color=${currentSettings.manualTimeButtonEnabled ? 'success' : 'default'}>Interactive<//>
+                                <span>Video Lesson Automation</span>
+                                <${Badge} variant="soft" color=${(currentSettings.fullVideoWatchedEnabled || currentSettings.autoSkipVideoEnabled || currentSettings.addVideoDurationToTimeSpent) ? 'success' : 'default'}>Video Auto<//>
                             <//>
-                            <${Card.Description}>Adds an interactive button beside the question Submit button.<//>
+                            <${Card.Description}>Automate video lesson playback, skip straight to completion, and credit full duration.<//>
                         <//>
-                        <${Card.Content} className="core-toggles-list">
+                        <${Card.Content}>
                             <${Switch} 
-                                size="sm"
-                                isSelected=${currentSettings.manualTimeButtonEnabled}
-                                onChange=${updateManualBtn}
+                                isSelected=${currentSettings.fullVideoWatchedEnabled}
+                                onChange=${updateFullVideo}
                             >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Show "Add time" button<//>
-                                    <${Switch.Description}>Adds a button right of "Submit". Click to enter seconds; Enter or blur commits.<//>
-                                <//>
+                                <${Switch.Label}>Always mark videos as fully watched (100%)<//>
+                                <${Switch.Description}>Sets percentWatched to 1 on CompleteVideoLesson mutations so every video registers as fully completed<//>
                             <//>
 
                             <${Switch} 
-                                size="sm"
-                                isSelected=${currentSettings.manualTimeStacksWithAuto}
-                                onChange=${updateManualStack}
+                                isSelected=${currentSettings.autoSkipVideoEnabled}
+                                onChange=${updateAutoSkipVideo}
                             >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Stack with automatic boost<//>
-                                    <${Switch.Description}>If enabled, adds manual time on top of random range boost (instead of setting the exact bonus)<//>
-                                <//>
+                                <${Switch.Label}>Auto-skip video (skips to 1s before end)<//>
+                                <${Switch.Description}>Automatically seeks straight to 1 second before the end so it completes immediately<//>
                             <//>
 
-                            <div style=${{ padding: '10px 12px', background: 'var(--surface)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', fontSize: '12px', color: 'var(--muted)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                <span>Accepted formats:</span>
-                                <span style=${{ fontWeight: 600, color: 'var(--foreground)' }}>120 · 1:30 · 2m 30s · PT45S</span>
-                            </div>
+                            <${Switch} 
+                                isSelected=${currentSettings.addVideoDurationToTimeSpent}
+                                onChange=${updateAddVideoDuration}
+                            >
+                                <${Switch.Label}>Add video duration to timeSpent<//>
+                                <${Switch.Description}>In CompleteVideoLesson payload, rewrites timeSpent to equal full duration (e.g. 17m33s = PT1053S)<//>
+                            <//>
                         <//>
                     <//>
 
                     <${Card}>
                         <${Card.Header}>
                             <${Card.Title}>
-                                <span>Boost Automation Insights</span>
-                                <${Badge} variant="soft" color="accent">Active Session<//>
+                                <span>Live Session Bonus Activity</span>
+                                <${Badge} variant="soft" color=${accumulatedBonus > 0 ? "accent" : "default"}>
+                                    ${accumulatedBonus > 0 ? `+${accumulatedBonus}s Active` : '0s Pending'}
+                                <//>
                             <//>
-                            <${Card.Description}>How UpLearn measures engagement and how the booster works.<//>
+                            <${Card.Description}>Real-time quiz bonus accumulated in this session to inject into UpLearn summaries.<//>
                         <//>
                         <${Card.Content}>
-                            <div style=${{ fontSize: '12.5px', color: 'var(--muted)', lineHeight: '1.6' }}>
-                                UpLearn logs seconds spent on each quiz question and sums them upon finishing a lesson or group. When active, every answered question receives a bonus (randomized or manually entered), maintaining realistic, organic engagement scores without tripping detection heuristics.
-                            </div>
-                            <div style=${{ marginTop: '8px', padding: '12px 14px', background: 'var(--surface)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                <span style=${{ fontSize: '12.5px', fontWeight: 500, color: 'var(--foreground)' }}>Cumulative Session Bonus</span>
-                                <span style=${{ fontSize: '14px', fontWeight: 700, color: 'var(--accent)' }}>+${accumulatedBonus}s</span>
-                            </div>
+                            <${FieldRow}>
+                                <label>Accumulated Time Bonus
+                                    <small>Currently queued bonus to be credited on submission</small>
+                                </label>
+                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                    <span style=${{ fontSize: '15px', fontWeight: 700, color: 'var(--accent, var(--lg-fill))', fontVariantNumeric: 'tabular-nums' }}>
+                                        +${accumulatedBonus}s
+                                    </span>
+                                </div>
+                            <//>
+                            <${FieldRow}>
+                                <label>Manual Session Boost
+                                    <small>Quickly queue additional bonus seconds or clear pending bonus</small>
+                                </label>
+                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+                                    <${Glisse.Button} 
+                                        variant="glass" 
+                                        onClick=${() => onAddManualBonus && onAddManualBonus(30)}
+                                    >
+                                        +30s
+                                    <//>
+                                    <${Glisse.Button} 
+                                        variant="glass" 
+                                        onClick=${() => onAddManualBonus && onAddManualBonus(60)}
+                                    >
+                                        +60s
+                                    <//>
+                                    <${Glisse.Button} 
+                                        variant="glass" 
+                                        destructive
+                                        onClick=${onClearBonus}
+                                        title="Clear accumulated bonus"
+                                    >
+                                        Clear
+                                    <//>
+                                </div>
+                            <//>
                         <//>
                     <//>
                 </div>
@@ -5715,14 +7815,23 @@
         return html`
             <div 
                 className="color-swatch"
+                data-active=${isSelected ? 'true' : 'false'}
                 style=${{ backgroundColor: color.hex }}
                 title=${color.name}
-                data-active=${isSelected ? 'true' : 'false'}
                 onClick=${() => onSelect(color.hex)}
-            ></div>
+            >
+                ${isSelected ? html`
+                    <span style=${{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#ffffff' }}>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="20 6 9 17 4 12"></polyline>
+                        </svg>
+                    </span>
+                ` : null}
+            </div>
         `;
     });
 
+    // PreferencesTab
     const PreferencesTab = React.memo(({
         currentSettings,
         isCapturingKeybind,
@@ -5737,167 +7846,49 @@
         const updatePillOpacity = useCallback((val) => onUpdateSetting('pillOpacity', val), [onUpdateSetting]);
         const updateDisableAutoFullscreen = useCallback((val) => onUpdateSetting('disableAutoFullscreen', val), [onUpdateSetting]);
         const updateDarkMode = useCallback((val) => onUpdateSetting('darkMode', val), [onUpdateSetting]);
+        const updateDraggableUI = useCallback((val) => onUpdateSetting('draggableUI', val), [onUpdateSetting]);
         const updateTheme = useCallback((val) => onUpdateSetting('theme', val), [onUpdateSetting]);
         const updateAccentColor = useCallback((val) => onUpdateSetting('accentColor', val), [onUpdateSetting]);
+        const updateKeybindAction = useCallback((val) => onUpdateSetting('keybindAction', val), [onUpdateSetting]);
         const updateLogLevel = useCallback((val) => onUpdateSetting('logLevel', val), [onUpdateSetting]);
+
+        const isOpenModalAction = currentSettings.keybindAction === 'open-modal';
 
         return html`
             <div className="grid-2col">
                 <div className="col-stack">
                     <${Card}>
                         <${Card.Header}>
-                            <${Card.Title}>Status Pill Appearance & Detail<//>
-                            <${Card.Description}>Control how much information shows on the floating pill and how it shapes itself.<//>
-                        <//>
-                        <${Card.Content}>
-                            <div className="field-row">
-                                <label>Pill Information Display
-                                    <small>Select how much info is displayed. The pill dynamically adapts its shape.</small>
-                                </label>
-                                <${Dropdown} 
-                                    selectedKey=${currentSettings.pillMode}
-                                    onSelectionChange=${updatePillMode}
-                                >
-                                    <${Dropdown.Trigger}>
-                                        <${Button} variant="secondary" className="dropdown__trigger-btn">
-                                            <span>${PILL_MODE_OPTIONS.find(o => o.id === currentSettings.pillMode)?.label || currentSettings.pillMode}</span>
-                                            <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                                        <//>
-                                    <//>
-                                    <${Dropdown.Popover}>
-                                        <${Dropdown.Menu}>
-                                            ${PILL_MODE_OPTIONS.map(opt => html`
-                                                <${Dropdown.Item} id=${opt.id} key=${opt.id}>
-                                                    <${Dropdown.Item.Label}>${opt.label}<//>
-                                                    <${Dropdown.Item.Description}>${opt.desc}<//>
-                                                <//>
-                                            `)}
-                                        <//>
-                                    <//>
-                                <//>
-                            </div>
-
-                            <div className="field-row">
-                                <label>Pill Dock Position
-                                    <small>Corner of the screen where the status pill floats</small>
-                                </label>
-                                <${Dropdown} 
-                                    selectedKey=${currentSettings.pillPosition}
-                                    onSelectionChange=${updatePillPosition}
-                                >
-                                    <${Dropdown.Trigger}>
-                                        <${Button} variant="secondary" className="dropdown__trigger-btn">
-                                            <span>${PILL_POS_OPTIONS.find(o => o.id === currentSettings.pillPosition)?.label || currentSettings.pillPosition}</span>
-                                            <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                                        <//>
-                                    <//>
-                                    <${Dropdown.Popover}>
-                                        <${Dropdown.Menu}>
-                                            ${PILL_POS_OPTIONS.map(opt => html`
-                                                <${Dropdown.Item} id=${opt.id} key=${opt.id}>
-                                                    <${Dropdown.Item.Label}>${opt.label}<//>
-                                                    <${Dropdown.Item.Description}>${opt.desc}<//>
-                                                <//>
-                                            `)}
-                                        <//>
-                                    <//>
-                                <//>
-                            </div>
-
-                            <div className="field-row">
-                                <label>Pill Opacity
-                                    <small>Adjust background transparency</small>
-                                </label>
-                                <${Slider} 
-                                    value=${currentSettings.pillOpacity}
-                                    minValue=${0.2}
-                                    maxValue=${1}
-                                    step=${0.05}
-                                    onChange=${updatePillOpacity}
-                                    className="slider--inline"
-                                >
-                                    <${Slider.Track}>
-                                        <${Slider.Fill} />
-                                        <${Slider.Thumb} />
-                                    <//>
-                                    <${Slider.Output}>
-                                        ${Math.round(currentSettings.pillOpacity * 100)}%
-                                    <//>
-                                <//>
-                            </div>
-                        <//>
-                    <//>
-
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>Page Experience<//>
-                            <${Card.Description}>Quality of life tweaks for the UpLearn learning environment.<//>
+                            <${Card.Title}>
+                                <span>Control Panel Window & Theme</span>
+                                <${Badge} variant="soft" color="accent">Visuals<//>
+                            <//>
+                            <${Card.Description}>Configure floating window mode, color theme, and liquid glass refraction.<//>
                         <//>
                         <${Card.Content}>
                             <${Switch} 
-                                isSelected=${currentSettings.disableAutoFullscreen}
-                                onChange=${updateDisableAutoFullscreen}
+                                isSelected=${currentSettings.draggableUI}
+                                onChange=${updateDraggableUI}
                             >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>Disable auto fullscreen<//>
-                                    <${Switch.Description}>Blocks the website from silently forcing fullscreen mode<//>
-                                <//>
+                                <${Switch.Label}>Draggable Glass Window<//>
+                                <${Switch.Description}>Float the Control Panel as a movable window with liquid glass refraction over the page<//>
                             <//>
 
-                            <${Switch} 
-                                isSelected=${currentSettings.darkMode}
-                                onChange=${updateDarkMode}
-                            >
-                                <${Switch.Control}>
-                                    <${Switch.Thumb} />
-                                <//>
-                                <${Switch.Content}>
-                                    <${Switch.Label}>UpLearn Dark Mode<//>
-                                    <${Switch.Description}>Soft high-contrast dark theme across all lesson and quiz pages<//>
-                                <//>
-                            <//>
-                        <//>
-                    <//>
-                </div>
-
-                <div className="col-stack">
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>Theme & Accent Color<//>
-                            <${Card.Description}>Customize color palette and visual styling.<//>
-                        <//>
-                        <${Card.Content}>
-                            <div className="field-row">
-                                <label>Control Panel Theme</label>
-                                <${Dropdown} 
+                            <${FieldRow}>
+                                <label>Control Panel Theme
+                                    <small>Translucent dark, frosted light, or system matching</small>
+                                </label>
+                                <${GlisseSelect} 
+                                    options=${THEME_OPTIONS}
                                     selectedKey=${currentSettings.theme}
                                     onSelectionChange=${updateTheme}
-                                >
-                                    <${Dropdown.Trigger}>
-                                        <${Button} variant="secondary" className="dropdown__trigger-btn">
-                                            <span>${THEME_OPTIONS.find(o => o.id === currentSettings.theme)?.label || currentSettings.theme}</span>
-                                            <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                                        <//>
-                                    <//>
-                                    <${Dropdown.Popover}>
-                                        <${Dropdown.Menu}>
-                                            ${THEME_OPTIONS.map(opt => html`
-                                                <${Dropdown.Item} id=${opt.id} key=${opt.id}>
-                                                    <${Dropdown.Item.Label}>${opt.label}<//>
-                                                    <${Dropdown.Item.Description}>${opt.desc}<//>
-                                                <//>
-                                            `)}
-                                        <//>
-                                    <//>
-                                <//>
-                            </div>
+                                    ariaLabel="Control Panel Theme"
+                                />
+                            <//>
 
-                            <div className="field-row">
+                            <${FieldRow}>
                                 <label>Theme Accent Color
-                                    <small>Primary color for switches, active badges, and highlights</small>
+                                    <small>Primary tint for switches, badges, and controls</small>
                                 </label>
                                 <div style=${{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                                     <div className="color-swatches">
@@ -5910,91 +7901,191 @@
                                             />
                                         `)}
                                     </div>
-                                    <input 
-                                        type="color" 
-                                        style=${{ width: '36px', height: '28px', border: '1px solid var(--border)', borderRadius: '6px', background: 'transparent', cursor: 'pointer', padding: '1px' }}
-                                        value=${currentSettings.accentColor}
-                                        onChange=${(e) => updateAccentColor(e.target.value)}
-                                    />
+                                    <label title="Custom hex color" style=${{
+                                        width: '26px',
+                                        height: '26px',
+                                        borderRadius: '50%',
+                                        background: 'conic-gradient(from 180deg at 50% 50%, #FF0000 0deg, #FFA500 60deg, #FFFF00 120deg, #008000 180deg, #0000FF 240deg, #EE82EE 300deg, #FF0000 360deg)',
+                                        display: 'inline-flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        cursor: 'pointer',
+                                        boxShadow: '0 2px 6px rgba(0, 0, 0, 0.2)',
+                                        position: 'relative',
+                                        overflow: 'hidden',
+                                        flexShrink: 0
+                                    }}>
+                                        <input 
+                                            type="color" 
+                                            style=${{ opacity: 0, position: 'absolute', inset: 0, width: '100%', height: '100%', cursor: 'pointer' }}
+                                            value=${currentSettings.accentColor}
+                                            onChange=${(e) => updateAccentColor(e.target.value)}
+                                        />
+                                    </label>
                                 </div>
-                            </div>
+                            <//>
                         <//>
                     <//>
 
                     <${Card}>
                         <${Card.Header}>
-                            <${Card.Title}>Shortcuts & Logging<//>
-                            <${Card.Description}>Configure hotkeys and developer diagnostics.<//>
+                            <${Card.Title}>
+                                <span>UpLearn Webpage Tweaks</span>
+                                <${Badge} variant="soft" color="accent">Page Tweaks<//>
+                            <//>
+                            <${Card.Description}>Enhance your UpLearn browsing experience with soft dark mode and screen controls.<//>
                         <//>
                         <${Card.Content}>
-                            <div className="field-row">
-                                <label>Toggle-Pill Keybind
-                                    <small>Global keyboard shortcut to show or hide the pill</small>
+                            <${Switch} 
+                                isSelected=${currentSettings.darkMode}
+                                onChange=${updateDarkMode}
+                            >
+                                <${Switch.Label}>UpLearn Soft Dark Mode<//>
+                                <${Switch.Description}>Soft high-contrast dark theme across all lesson and quiz pages<//>
+                            <//>
+
+                            <${Switch} 
+                                isSelected=${currentSettings.disableAutoFullscreen}
+                                onChange=${updateDisableAutoFullscreen}
+                            >
+                                <${Switch.Label}>Prevent auto fullscreen<//>
+                                <${Switch.Description}>Blocks the website from silently forcing fullscreen mode<//>
+                            <//>
+                        <//>
+                    <//>
+                </div>
+
+                <div className="col-stack">
+                    <${Card}>
+                        <${Card.Header}>
+                            <${Card.Title}>
+                                <span>Hotkeys & Floating Status Button</span>
+                                <${Badge} variant="soft" color="accent">Shortcuts<//>
+                            <//>
+                            <${Card.Description}>Configure keyboard triggers and floating island button behavior.<//>
+                        <//>
+                        <${Card.Content}>
+                            <${FieldRow}>
+                                <label>Keybind Action
+                                    <small>Behavior when pressing your global keyboard shortcut</small>
                                 </label>
-                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    <${Button} 
-                                        variant="secondary" 
-                                        size="sm"
-                                        className=${isCapturingKeybind ? 'button--capturing' : ''}
-                                        onPress=${onStartCaptureKeybind}
+                                <${GlisseSelect} 
+                                    options=${KEYBIND_ACTION_OPTIONS}
+                                    selectedKey=${currentSettings.keybindAction || 'toggle-pill'}
+                                    onSelectionChange=${updateKeybindAction}
+                                    ariaLabel="Keybind Action"
+                                />
+                            <//>
+
+                            <${FieldRow}>
+                                <label>Global Shortcut Keybind
+                                    <small>${isOpenModalAction ? 'Keyboard shortcut to directly open or close the Control Panel' : 'Keyboard shortcut to show or hide the floating status pill'}</small>
+                                </label>
+                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+                                    <${Glisse.Button} 
+                                        variant="glass" 
+                                        className=${isCapturingKeybind ? 'keybind-btn keybind-btn--capturing' : 'keybind-btn'}
+                                        onClick=${onStartCaptureKeybind}
+                                        title="Click to record new keybind"
                                     >
                                         ${isCapturingKeybind ? 'Press any key…' : formatKeybind(currentSettings.uiToggleKeybind)}
                                     <//>
-                                    <${Button} 
-                                        variant="outline" 
-                                        size="sm"
-                                        isIconOnly
+                                    <${Glisse.Button} 
+                                        variant="glass" 
+                                        data-icon="only"
                                         title="Clear keybind"
                                         aria-label="Clear keybind"
-                                        onPress=${onClearKeybind}
+                                        onClick=${onClearKeybind}
                                     >
                                         ✕
                                     <//>
                                 </div>
-                            </div>
+                            <//>
 
-                            <div className="field-row">
+                            ${isOpenModalAction ? html`
+                                <div className="field-callout" style=${{ margin: '4px 0' }}>
+                                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style=${{ flexShrink: 0 }}>
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                        <line x1="12" y1="16" x2="12" y2="12"></line>
+                                        <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                                    </svg>
+                                    <span>Floating button is hidden because Keybind Action is set to "Open Settings Directly". Press your shortcut to toggle settings.</span>
+                                </div>
+                            ` : html`
+                                <${FieldRow}>
+                                    <label>Pill Information Display
+                                        <small>Select how much info is displayed on the floating pill</small>
+                                    </label>
+                                    <${GlisseSelect} 
+                                        options=${PILL_MODE_OPTIONS}
+                                        selectedKey=${currentSettings.pillMode}
+                                        onSelectionChange=${updatePillMode}
+                                        ariaLabel="Pill Information Display"
+                                    />
+                                <//>
+
+                                <${FieldRow}>
+                                    <label>Pill Dock Position
+                                        <small>Corner of the screen where the status pill floats</small>
+                                    </label>
+                                    <${GlisseSelect} 
+                                        options=${PILL_POS_OPTIONS}
+                                        selectedKey=${currentSettings.pillPosition}
+                                        onSelectionChange=${updatePillPosition}
+                                        ariaLabel="Pill Dock Position"
+                                    />
+                                <//>
+
+                                <${FieldRow}>
+                                    <label>Pill Opacity
+                                        <small>Adjust background transparency</small>
+                                    </label>
+                                    <${Slider} 
+                                        value=${currentSettings.pillOpacity}
+                                        minValue=${0.2}
+                                        maxValue=${1}
+                                        step=${0.05}
+                                        onChange=${updatePillOpacity}
+                                    />
+                                <//>
+                            `}
+                        <//>
+                    <//>
+
+                    <${Card}>
+                        <${Card.Header}>
+                            <${Card.Title}>
+                                <span>Diagnostics & Maintenance</span>
+                                <${Badge} variant="soft" color="accent">System<//>
+                            <//>
+                            <${Card.Description}>Developer console diagnostics and factory settings reset.<//>
+                        <//>
+                        <${Card.Content}>
+                            <${FieldRow}>
                                 <label>Console Logging Level
                                     <small>Verbose inspects bodies and prints grouped block reports</small>
                                 </label>
-                                <${Dropdown} 
+                                <${GlisseSelect} 
+                                    options=${LOG_LEVEL_OPTIONS}
                                     selectedKey=${currentSettings.logLevel}
                                     onSelectionChange=${updateLogLevel}
-                                >
-                                    <${Dropdown.Trigger}>
-                                        <${Button} variant="secondary" className="dropdown__trigger-btn">
-                                            <span>${LOG_LEVEL_OPTIONS.find(o => o.id === currentSettings.logLevel)?.label || currentSettings.logLevel}</span>
-                                            <svg className="dropdown__trigger-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                                        <//>
-                                    <//>
-                                    <${Dropdown.Popover}>
-                                        <${Dropdown.Menu}>
-                                            ${LOG_LEVEL_OPTIONS.map(opt => html`
-                                                <${Dropdown.Item} id=${opt.id} key=${opt.id}>
-                                                    <${Dropdown.Item.Label}>${opt.label}<//>
-                                                    <${Dropdown.Item.Description}>${opt.desc}<//>
-                                                <//>
-                                            `)}
-                                        <//>
-                                    <//>
-                                <//>
-                            </div>
+                                    ariaLabel="Console Logging Level"
+                                />
+                            <//>
 
-                            <div style=${{ marginTop: '6px', paddingTop: '12px', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                            <${FieldRow} className="field-row--danger" style=${{ marginTop: '2px' }}>
                                 <div>
-                                    <div style=${{ fontSize: '12.5px', fontWeight: 600, color: 'var(--foreground)' }}>Reset All Preferences</div>
-                                    <div style=${{ fontSize: '11px', color: 'var(--muted)' }}>Restore all settings & services to factory defaults</div>
+                                    <div style=${{ fontSize: '13px', fontWeight: 600, color: 'var(--lg-foreground)' }}>Reset All Preferences</div>
+                                    <div style=${{ fontSize: '11.5px', color: 'var(--lg-muted)', marginTop: '2px' }}>Restore all settings & services to factory defaults</div>
                                 </div>
-                                <${Button} variant="danger-soft" size="sm" onPress=${onResetAllSettings}>
-                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                                        <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
-                                        <path d="M21 3v5h-5"></path>
-                                        <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
-                                        <path d="M8 16H3v5"></path>
-                                    </svg>
+                                <${Glisse.Button} 
+                                    variant="glass" 
+                                    destructive 
+                                    onClick=${onResetAllSettings}
+                                >
                                     <span>Reset All Settings</span>
                                 <//>
-                            </div>
+                            <//>
                         <//>
                     <//>
                 </div>
@@ -6002,6 +8093,7 @@
         `;
     });
 
+    // StatsTab
     const StatsTab = React.memo(({
         accumulatedBonus,
         onResetStats,
@@ -6012,31 +8104,10 @@
 
         useEffect(() => {
             if (!isActive) return;
-            const update = () => {
-                setTabStats((prev) => {
-                    if (
-                        prev.apiPosts === stats.apiPosts &&
-                        prev.seen === stats.seen &&
-                        prev.boosted === stats.boosted &&
-                        prev.blocked === stats.blocked &&
-                        prev.groupExtra === stats.groupExtra &&
-                        prev.fullscreenBlocked === stats.fullscreenBlocked &&
-                        prev.consoleSuppressed === stats.consoleSuppressed &&
-                        prev.logImproperUseBlocked === stats.logImproperUseBlocked &&
-                        prev.jitsuPackets === stats.jitsuPackets &&
-                        prev.manualBoosted === (stats.manualBoosted || 0) &&
-                        prev.videosMaxed === (stats.videosMaxed || 0) &&
-                        prev.videosSkipped === (stats.videosSkipped || 0) &&
-                        prev.videoTimeAdded === (stats.videoTimeAdded || 0)
-                    ) {
-                        return prev;
-                    }
-                    return Object.assign({}, stats);
-                });
-            };
-            update();
-            const timer = setInterval(update, 800);
-            return () => clearInterval(timer);
+            setTabStats(Object.assign({}, stats));
+            return subscribeStats((st) => {
+                setTabStats(Object.assign({}, st));
+            });
         }, [isActive]);
 
         const handleReset = useCallback(() => {
@@ -6047,86 +8118,101 @@
         return html`
             <${Card}>
                 <${Card.Header}>
-                    <${Card.Title}>
-                        <span>Session Telemetry & Boost Activity</span>
-                        <${Badge} variant="soft" color="accent">Real-Time<//>
-                    <//>
-                    <${Card.Description}>Live metric counters accumulated in this browser session.<//>
+                    <div style=${{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
+                        <div>
+                            <${Card.Title}>
+                                <span>Session Activity & Shields</span>
+                                <${Badge} variant="soft" color="accent">Real-Time<//>
+                            <//>
+                            <${Card.Description}>Live metric counters accumulated in this browser session.<//>
+                        </div>
+                        <${Glisse.Button} variant="glass" onClick=${handleReset}>
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style=${{ marginRight: '5px' }}>
+                                <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
+                                <path d="M21 3v5h-5"/>
+                                <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>
+                                <path d="M3 21v-5h5"/>
+                            </svg>
+                            <span>Clear Session Metrics</span>
+                        <//>
+                    </div>
                 <//>
                 <${Card.Content}>
-                    <div className="stats-grid">
-                        <div className="stat-card">
-                            <span className="stat-card__label">Blocked</span>
-                            <span className="stat-card__value">${tabStats.blocked}</span>
+                    <div style=${{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                        <div>
+                            <div style=${{ fontSize: '12px', fontWeight: 600, color: 'var(--lg-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' }}>
+                                🛡 Privacy & Telemetry Shields
+                            </div>
+                            <div className="stats-grid">
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Trackers Blocked</span>
+                                    <span className="stat-card__value">${tabStats.blocked}</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Improper Use</span>
+                                    <span className="stat-card__value">${tabStats.logImproperUseBlocked}</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Jitsu Packets</span>
+                                    <span className="stat-card__value">${tabStats.jitsuPackets}</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">FS Blocked</span>
+                                    <span className="stat-card__value">${tabStats.fullscreenBlocked}</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Console Muted</span>
+                                    <span className="stat-card__value">${tabStats.consoleSuppressed}</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">API Posts</span>
+                                    <span className="stat-card__value">${tabStats.apiPosts}</span>
+                                </div>
+                            </div>
                         </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">Boosted Qs</span>
-                            <span className="stat-card__value">${tabStats.boosted}</span>
-                        </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">Videos 100%</span>
-                            <span className="stat-card__value">${tabStats.videosMaxed || 0}</span>
-                        </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">Videos Skipped</span>
-                            <span className="stat-card__value">${tabStats.videosSkipped || 0}</span>
-                        </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">Video Time Added</span>
-                            <span className="stat-card__value">+${formatSeconds(tabStats.videoTimeAdded || 0)}</span>
-                        </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">Manual Boosts</span>
-                            <span className="stat-card__value">${tabStats.manualBoosted || 0}</span>
-                        </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">Improper Use</span>
-                            <span className="stat-card__value">${tabStats.logImproperUseBlocked}</span>
-                        </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">Jitsu Packets</span>
-                            <span className="stat-card__value">${tabStats.jitsuPackets}</span>
-                        </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">Pending Bonus</span>
-                            <span className="stat-card__value">${accumulatedBonus}s</span>
-                        </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">Group Bonus</span>
-                            <span className="stat-card__value">${tabStats.groupExtra}s</span>
-                        </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">FS Blocked</span>
-                            <span className="stat-card__value">${tabStats.fullscreenBlocked}</span>
-                        </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">Console Muted</span>
-                            <span className="stat-card__value">${tabStats.consoleSuppressed}</span>
-                        </div>
-                        <div className="stat-card">
-                            <span className="stat-card__label">API Posts</span>
-                            <span className="stat-card__value">${tabStats.apiPosts}</span>
-                        </div>
-                    </div>
 
-                    <div style=${{ marginTop: '16px', display: 'flex', justifyContent: 'flex-end' }}>
-                        <${Button} variant="secondary" size="sm" onPress=${handleReset}>
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                                <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
-                                <path d="M21 3v5h-5"></path>
-                                <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
-                                <path d="M8 16H3v5"></path>
-                            </svg>
-                            <span>Reset Session Statistics</span>
-                        <//>
+                        <div>
+                            <div style=${{ fontSize: '12px', fontWeight: 600, color: 'var(--lg-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' }}>
+                                ⚡ Time Boost & Video Automation
+                            </div>
+                            <div className="stats-grid">
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Boosted Qs</span>
+                                    <span className="stat-card__value">${tabStats.boosted}</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Pending Bonus</span>
+                                    <span className="stat-card__value">${accumulatedBonus}s</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Group Bonus</span>
+                                    <span className="stat-card__value">${tabStats.groupExtra}s</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Manual Boosts</span>
+                                    <span className="stat-card__value">${tabStats.manualBoosted || 0}</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Videos 100%</span>
+                                    <span className="stat-card__value">${tabStats.videosMaxed || 0}</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Videos Skipped</span>
+                                    <span className="stat-card__value">${tabStats.videosSkipped || 0}</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Video Time Added</span>
+                                    <span className="stat-card__value">+${formatSeconds(tabStats.videoTimeAdded || 0)}</span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 <//>
             <//>
         `;
     });
 
-    const TAB_KEYS = ['telemetry', 'timeboost', 'preferences', 'stats'];
-
+    // Glisse SettingsModal (No traffic lights, authentic Glisse TabBar & Buttons)
     const SettingsModal = React.memo(({
         isOpen,
         isClosing,
@@ -6139,82 +8225,217 @@
         onUpdateSetting,
         onResetAllSettings,
         onResetStats,
+        onAddManualBonus,
+        onClearBonus,
     }) => {
-        const { useState, useMemo, useCallback } = React;
+        const { useState, useEffect, useRef, useCallback } = React;
         const [activeTab, setActiveTab] = useState('telemetry');
-        const [tabDirection, setTabDirection] = useState('forward');
         const [visitedTabs, setVisitedTabs] = useState(() => new Set(['telemetry']));
 
-        const selectedTabKeys = useMemo(() => [activeTab], [activeTab]);
+        const isDraggable = Boolean(currentSettings && currentSettings.draggableUI);
+
+        const [pos, setPos] = useState(() => {
+            try {
+                const saved = localStorage.getItem('__ul_win_pos');
+                if (saved) {
+                    const p = JSON.parse(saved);
+                    if (typeof p.x === 'number' && typeof p.y === 'number') {
+                        const w = Math.min(920, window.innerWidth * 0.92);
+                        const h = Math.min(680, window.innerHeight * 0.86);
+                        const maxX = Math.max(10, window.innerWidth - w - 10);
+                        const maxY = Math.max(10, window.innerHeight - h - 10);
+                        return {
+                            x: Math.min(Math.max(10, Math.round(p.x)), maxX),
+                            y: Math.min(Math.max(10, Math.round(p.y)), maxY),
+                        };
+                    }
+                }
+            } catch {}
+            const w = Math.min(920, window.innerWidth * 0.92);
+            const h = Math.min(680, window.innerHeight * 0.86);
+            return {
+                x: Math.max(10, Math.round((window.innerWidth - w) / 2)),
+                y: Math.max(10, Math.round((window.innerHeight - h) / 2)),
+            };
+        });
+
+        const [isDragging, setIsDragging] = useState(false);
+        const dragRef = useRef(null);
+        const dialogRef = useRef(null);
+
+        // Clamping on viewport resize
+        useEffect(() => {
+            if (!isDraggable) return;
+            const handleResize = () => {
+                setPos((prev) => {
+                    const w = Math.min(920, window.innerWidth * 0.92);
+                    const h = Math.min(680, window.innerHeight * 0.86);
+                    const maxX = Math.max(10, window.innerWidth - w - 10);
+                    const maxY = Math.max(10, window.innerHeight - h - 10);
+                    const nextX = Math.min(Math.max(10, prev.x), maxX);
+                    const nextY = Math.min(Math.max(10, prev.y), maxY);
+                    if (nextX !== prev.x || nextY !== prev.y) {
+                        return { x: nextX, y: nextY };
+                    }
+                    return prev;
+                });
+            };
+            window.addEventListener('resize', handleResize);
+            return () => window.removeEventListener('resize', handleResize);
+        }, [isDraggable]);
+
+        const handleHeaderPointerDown = useCallback((e) => {
+            if (!isDraggable) return;
+            if (e.button !== 0) return; // Left click only
+            const target = e.target;
+            if (target && target.closest && target.closest('button, a, input, select, textarea, .lg-tab, .lg-tab-bar, .lg-button')) {
+                return;
+            }
+            e.preventDefault();
+
+            const dialogEl = dialogRef.current;
+            const dialogRect = dialogEl ? dialogEl.getBoundingClientRect() : null;
+            const curW = dialogRect ? dialogRect.width : Math.min(920, window.innerWidth * 0.92);
+            const curH = dialogRect ? dialogRect.height : Math.min(680, window.innerHeight * 0.86);
+
+            dragRef.current = {
+                startX: e.clientX,
+                startY: e.clientY,
+                initX: pos.x,
+                initY: pos.y,
+                dialogW: curW,
+                dialogH: curH,
+            };
+            setIsDragging(true);
+
+            const onPointerMove = (moveEvt) => {
+                if (!dragRef.current) return;
+                const dx = moveEvt.clientX - dragRef.current.startX;
+                const dy = moveEvt.clientY - dragRef.current.startY;
+                const maxX = Math.max(10, window.innerWidth - dragRef.current.dialogW - 10);
+                const maxY = Math.max(10, window.innerHeight - dragRef.current.dialogH - 10);
+                const nextX = Math.min(Math.max(10, Math.round(dragRef.current.initX + dx)), maxX);
+                const nextY = Math.min(Math.max(10, Math.round(dragRef.current.initY + dy)), maxY);
+                setPos({ x: nextX, y: nextY });
+            };
+
+            const onPointerUp = (upEvt) => {
+                window.removeEventListener('pointermove', onPointerMove);
+                window.removeEventListener('pointerup', onPointerUp);
+                window.removeEventListener('pointercancel', onPointerUp);
+                setIsDragging(false);
+                if (dragRef.current) {
+                    const dx = upEvt.clientX - dragRef.current.startX;
+                    const dy = upEvt.clientY - dragRef.current.startY;
+                    const maxX = Math.max(10, window.innerWidth - dragRef.current.dialogW - 10);
+                    const maxY = Math.max(10, window.innerHeight - dragRef.current.dialogH - 10);
+                    const finalX = Math.min(Math.max(10, Math.round(dragRef.current.initX + dx)), maxX);
+                    const finalY = Math.min(Math.max(10, Math.round(dragRef.current.initY + dy)), maxY);
+                    try {
+                        localStorage.setItem('__ul_win_pos', JSON.stringify({ x: finalX, y: finalY }));
+                    } catch {}
+                    dragRef.current = null;
+                }
+            };
+
+            window.addEventListener('pointermove', onPointerMove, { passive: true });
+            window.addEventListener('pointerup', onPointerUp);
+            window.addEventListener('pointercancel', onPointerUp);
+        }, [isDraggable, pos]);
 
         const handleTabClick = useCallback((targetTab) => {
-            setActiveTab((prevTab) => {
-                if (targetTab === prevTab) return prevTab;
-                const curIdx = TAB_KEYS.indexOf(prevTab);
-                const targetIdx = TAB_KEYS.indexOf(targetTab);
-                setTabDirection(targetIdx > curIdx ? 'forward' : 'backward');
-                setVisitedTabs((prev) => {
-                    if (prev.has(targetTab)) return prev;
-                    const next = new Set(prev);
-                    next.add(targetTab);
-                    return next;
-                });
-                return targetTab;
+            setActiveTab(targetTab);
+            setVisitedTabs((prev) => {
+                if (prev.has(targetTab)) return prev;
+                const next = new Set(prev);
+                next.add(targetTab);
+                return next;
             });
         }, []);
 
         if (!isOpen && !isClosing) return null;
 
+        const tabItems = [
+            { value: 'telemetry', label: '🛡 Telemetry' },
+            { value: 'timeboost', label: '⏱ Time Boost' },
+            { value: 'preferences', label: '🎨 Preferences' },
+            { value: 'stats', label: '📊 Statistics' },
+        ];
+
+        const dialogStyle = isDraggable ? {
+            left: `${pos.x}px`,
+            top: `${pos.y}px`,
+        } : {};
+
         return html`
             <${Modal} isOpen=${isOpen} isClosing=${isClosing} onClose=${onClose}>
-                <${Modal.Backdrop} isClosing=${isClosing} onClose=${onClose}>
-                    <${Modal.Container}>
-                        <${Modal.Dialog}>
+                <${Modal.Backdrop} isClosing=${isClosing} onClose=${onClose} isDraggable=${isDraggable}>
+                    <${Modal.Container} isDraggable=${isDraggable}>
+                        <${Modal.Dialog} 
+                            isDraggable=${isDraggable}
+                            dialogRef=${dialogRef}
+                            style=${dialogStyle}
+                        >
                             
-                            <!-- Header -->
-                            <${Modal.Header}>
-                                <div className="modal__header-top">
-                                    <${Modal.Brand}>
-                                        <${Modal.Icon}>
-                                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                                                <circle cx="12" cy="12" r="3"></circle>
-                                                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                                            </svg>
-                                        <//>
-                                        <${Modal.Heading}>UpLearn Control Panel<//>
+                            <!-- Glisse Header with Title, TabBar & Close Button -->
+                            <${Modal.Header}
+                                isDraggable=${isDraggable}
+                                isDragging=${isDragging}
+                                onPointerDown=${handleHeaderPointerDown}
+                            >
+                                <div className="modal__brand">
+                                    <${Modal.Icon}>
+                                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                            <circle cx="12" cy="12" r="3"></circle>
+                                            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                                        </svg>
                                     <//>
-                                    <${Modal.CloseTrigger} onPress=${onClose} />
+                                    <div>
+                                        <${Modal.Heading}>UpLearn Control Panel<//>
+                                        ${isDraggable ? html`
+                                            <div style=${{ fontSize: '10.5px', color: 'var(--lg-muted)', display: 'flex', alignItems: 'center', gap: '4px', marginTop: '1px' }}>
+                                                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                                    <polyline points="5 9 2 12 5 15"></polyline>
+                                                    <polyline points="9 5 12 2 15 5"></polyline>
+                                                    <polyline points="15 19 12 22 9 19"></polyline>
+                                                    <polyline points="19 9 22 12 19 15"></polyline>
+                                                    <line x1="2" y1="12" x2="22" y2="12"></line>
+                                                    <line x1="12" y1="2" x2="12" y2="22"></line>
+                                                </svg>
+                                                <span>Draggable Liquid Glass</span>
+                                            </div>
+                                        ` : null}
+                                    </div>
                                 </div>
 
-                                <!-- Tabs Navigation via TagGroup -->
-                                <${TagGroup} 
-                                    ariaLabel="Panel Navigation"
-                                    selectionMode="single"
-                                    selectedKeys=${selectedTabKeys}
-                                    onSelectionChange=${handleTabClick}
-                                    className="modal__tab-group"
+                                <div className="modal__header-nav">
+                                    <${Glisse.TabBar} 
+                                        items=${tabItems}
+                                        value=${activeTab}
+                                        onValueChange=${handleTabClick}
+                                        style=${{ '--lg-tab-width': '124px', '--lg-tab-height': '34px' }}
+                                    />
+                                </div>
+
+                                <${Glisse.Button} 
+                                    variant="glass" 
+                                    data-icon="only"
+                                    onClick=${onClose} 
+                                    title="Close (Esc)"
+                                    aria-label="Close modal"
+                                    style=${{ width: '36px', height: '36px', padding: 0 }}
                                 >
-                                    <${TagGroup.List} className="modal__tab-tags">
-                                        <${Tag} id="telemetry">
-                                            <span>🛡 Telemetry</span>
-                                        <//>
-                                        <${Tag} id="timeboost">
-                                            <span>⏱ Time Boost</span>
-                                        <//>
-                                        <${Tag} id="preferences">
-                                            <span>🎨 Preferences</span>
-                                        <//>
-                                        <${Tag} id="stats">
-                                            <span>📊 Statistics</span>
-                                        <//>
-                                    <//>
+                                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                                    </svg>
                                 <//>
                             <//>
 
                             <!-- Body -->
                             <${Modal.Body}>
                                 ${visitedTabs.has('telemetry') && html`
-                                    <${Tabs.Panel} id="telemetry" activeTab=${activeTab} direction=${tabDirection}>
+                                    <${Tabs.Panel} id="telemetry" activeTab=${activeTab}>
                                         <${TelemetryTab} 
                                             currentSettings=${currentSettings}
                                             onUpdateSetting=${onUpdateSetting}
@@ -6222,16 +8443,18 @@
                                     <//>
                                 `}
                                 ${visitedTabs.has('timeboost') && html`
-                                    <${Tabs.Panel} id="timeboost" activeTab=${activeTab} direction=${tabDirection}>
+                                    <${Tabs.Panel} id="timeboost" activeTab=${activeTab}>
                                         <${TimeBoostTab} 
                                             currentSettings=${currentSettings}
                                             accumulatedBonus=${accumulatedBonus}
                                             onUpdateSetting=${onUpdateSetting}
+                                            onAddManualBonus=${onAddManualBonus}
+                                            onClearBonus=${onClearBonus}
                                         />
                                     <//>
                                 `}
                                 ${visitedTabs.has('preferences') && html`
-                                    <${Tabs.Panel} id="preferences" activeTab=${activeTab} direction=${tabDirection}>
+                                    <${Tabs.Panel} id="preferences" activeTab=${activeTab}>
                                         <${PreferencesTab} 
                                             currentSettings=${currentSettings}
                                             isCapturingKeybind=${isCapturingKeybind}
@@ -6243,7 +8466,7 @@
                                     <//>
                                 `}
                                 ${visitedTabs.has('stats') && html`
-                                    <${Tabs.Panel} id="stats" activeTab=${activeTab} direction=${tabDirection}>
+                                    <${Tabs.Panel} id="stats" activeTab=${activeTab}>
                                         <${StatsTab} 
                                             accumulatedBonus=${accumulatedBonus}
                                             onResetStats=${onResetStats}
@@ -6251,12 +8474,6 @@
                                         />
                                     <//>
                                 `}
-                            <//>
-
-                            <!-- Modal Footer with HeroUI v3 Actions -->
-                            <${Modal.Footer}>
-                                <${Button} variant="secondary" size="sm" onPress=${onClose}>Close<//>
-                                <${Button} variant="primary" size="sm" onPress=${onClose}>Done<//>
                             <//>
 
                         <//>
@@ -6273,6 +8490,7 @@
         stats.jitsuPackets = 0; stats.manualBoosted = 0; stats.videosMaxed = 0;
         stats.videosSkipped = 0; stats.videoTimeAdded = 0;
         accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
+        notifyStatsChange();
         if (reactSetStats) {
             reactSetStats(Object.assign({}, stats, { accumulated: 0 }));
         }
@@ -6309,16 +8527,16 @@
                 if ((!modalStateRef.current.open && !isModalOpenGlobal) || modalStateRef.current.closing) {
                     return;
                 }
+                modalStateRef.current.open = false;
+                modalStateRef.current.closing = true;
+                isModalOpenGlobal = false;
                 if (closeTimerRef.current) {
                     clearTimeout(closeTimerRef.current);
                 }
-                modalStateRef.current.closing = true;
                 setIsClosing(true);
                 closeTimerRef.current = setTimeout(() => {
                     closeTimerRef.current = null;
-                    modalStateRef.current.open = false;
                     modalStateRef.current.closing = false;
-                    isModalOpenGlobal = false;
                     setIsModalOpen(false);
                     setIsClosing(false);
                 }, 190);
@@ -6347,21 +8565,12 @@
             };
         }, [setModalOpenState]);
 
-        // Real-time live stats update interval for StatusPill (only re-renders when blocked or boosted changes; StatsTab manages its own tabStats)
+        // Real-time reactive live stats subscription for StatusPill (zero polling)
         useEffect(() => {
-            const interval = setInterval(() => {
-                setAppStats((prev) => {
-                    if (
-                        prev.blocked === stats.blocked &&
-                        prev.boosted === stats.boosted
-                    ) {
-                        return prev; // exact same reference => React bails out of re-rendering!
-                    }
-                    return Object.assign({}, stats);
-                });
-                setAccumulatedBonus((prev) => (prev === accumulatedExtraSeconds ? prev : accumulatedExtraSeconds));
-            }, 800);
-            return () => clearInterval(interval);
+            return subscribeStats((st) => {
+                setAppStats(Object.assign({}, st));
+                setAccumulatedBonus(accumulatedExtraSeconds);
+            });
         }, []);
 
         const handleCloseModal = useCallback(() => {
@@ -6369,7 +8578,11 @@
         }, [setModalOpenState]);
 
         const handleOpenSettings = useCallback(() => {
-            setModalOpenState(true);
+            if (isModalOpenGlobal) {
+                setModalOpenState(false);
+            } else {
+                setModalOpenState(true);
+            }
         }, [setModalOpenState]);
 
         const handleToggleBoost = useCallback(() => {
@@ -6410,6 +8623,27 @@
         const handleResetStats = useCallback(() => {
             resetAllStats();
             LOG('stats reset');
+        }, []);
+
+        const handleAddManualBonus = useCallback((sec) => {
+            accumulatedExtraSeconds += sec;
+            setAccumulatedBonus(accumulatedExtraSeconds);
+            bumpStat('manualBoosted');
+            if (reactSetStats) {
+                reactSetStats(Object.assign({}, stats, { accumulated: accumulatedExtraSeconds }));
+            }
+            LOG('manual bonus added: +' + sec + 's (total ' + accumulatedExtraSeconds + 's)');
+        }, []);
+
+        const handleClearBonus = useCallback(() => {
+            accumulatedExtraSeconds = 0;
+            accumulatedQuestionCount = 0;
+            setAccumulatedBonus(0);
+            notifyStatsChange();
+            if (reactSetStats) {
+                reactSetStats(Object.assign({}, stats, { accumulated: 0 }));
+            }
+            LOG('manual bonus cleared');
         }, []);
 
         // Sync theme attribute & accent CSS variable on root container
@@ -6454,6 +8688,8 @@
                         onUpdateSetting=${applySettingChange}
                         onResetAllSettings=${handleResetAllSettings}
                         onResetStats=${handleResetStats}
+                        onAddManualBonus=${handleAddManualBonus}
+                        onClearBonus=${handleClearBonus}
                     />
                 ` : null}
             </div>
@@ -6469,7 +8705,7 @@
         try {
             reactRootInstance = ReactDOM.createRoot(uiContainerEl);
             reactRootInstance.render(html`<${App} />`);
-            LOG('HeroUI v3 React UI mounted');
+            LOG('Glisse & Apple Liquid Glass UI mounted');
         } catch (err) {
             nativeConsole.error('[UL] Error mounting React UI:', err);
         }
@@ -6499,17 +8735,36 @@
             closeSettingsModal();
             return;
         }
+        if (matchesKeybind(e, settings.uiToggleKeybind) && !e.repeat) {
+            e.preventDefault();
+            if (settings.keybindAction === 'open-modal') {
+                if (isModalOpenGlobal) closeSettingsModal();
+                else openSettingsModal();
+            } else {
+                if (isModalOpenGlobal) {
+                    // First press closes settings UI, leaving button visible
+                    closeSettingsModal();
+                    if (!settings.pillVisible) {
+                        settings.pillVisible = true;
+                        saveSettings();
+                        syncModalIfOpen();
+                    }
+                    LOG('settings UI closed via keybind; floating button remains visible');
+                } else {
+                    // Second press (or single press when settings UI is closed) toggles button visibility
+                    settings.pillVisible = !settings.pillVisible;
+                    saveSettings();
+                    syncModalIfOpen();
+                    LOG('pill ' + (settings.pillVisible ? 'SHOWN' : 'HIDDEN'));
+                }
+            }
+            return;
+        }
         if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === 'KeyU') {
             e.preventDefault();
             if (isModalOpenGlobal) closeSettingsModal();
             else openSettingsModal();
             return;
-        }
-        if (matchesKeybind(e, settings.uiToggleKeybind) && !e.repeat) {
-            settings.pillVisible = !settings.pillVisible;
-            saveSettings();
-            syncModalIfOpen();
-            LOG('pill ' + (settings.pillVisible ? 'SHOWN' : 'HIDDEN'));
         }
     }, true);
 
