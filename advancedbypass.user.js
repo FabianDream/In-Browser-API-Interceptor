@@ -10,25 +10,7 @@
 // @inject-into  page
 // @noframes
 //
-// @webRequest   [{"selector":{"include":"://jitsu.uplearn.co.uk/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://jitsu.com/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://openreplay.uplearn.co.uk/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://.ingest.us.sentry.io/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://static.cloudflareinsights.com/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://api-iam.intercom.io/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://widget.intercom.io/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://js.intercomcdn.com/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://nexus-websocket-.intercom.io/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://www.googletagmanager.com/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://google-analytics.com/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://analytics.google.com/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://googleadservices.com/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://doubleclick.net/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://connect.facebook.net/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://sc-static.net/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://bat.bing.com/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://bzrcdn.openai.com/"},"action":"cancel"}]
-// @webRequest   [{"selector":{"include":"://*.posthog.com/"},"action":"cancel"}]
+// @webRequest   [{"selector":"*://*.openreplay.uplearn.co.uk/*","action":"cancel"},{"selector":"*://*.sentry.io/*","action":"cancel"},{"selector":"*://static.cloudflareinsights.com/*","action":"cancel"},{"selector":"*://*.intercom.io/*","action":"cancel"},{"selector":"*://*.intercomcdn.com/*","action":"cancel"},{"selector":"*://*.googletagmanager.com/*","action":"cancel"},{"selector":"*://*.google-analytics.com/*","action":"cancel"},{"selector":"*://analytics.google.com/*","action":"cancel"},{"selector":"*://*.googleadservices.com/*","action":"cancel"},{"selector":"*://*.doubleclick.net/*","action":"cancel"},{"selector":"*://*.facebook.net/*","action":"cancel"},{"selector":"*://*.sc-static.net/*","action":"cancel"},{"selector":"*://bat.bing.com/*","action":"cancel"},{"selector":"*://bzrcdn.openai.com/*","action":"cancel"},{"selector":"*://*.posthog.com/*","action":"cancel"},{"selector":"*://*.fullstory.com/*","action":"cancel"},{"selector":"*://*.hotjar.com/*","action":"cancel"},{"selector":"*://*.mixpanel.com/*","action":"cancel"},{"selector":"*://*.segment.io/*","action":"cancel"},{"selector":"*://*.amplitude.com/*","action":"cancel"}]
 //
 // @require      https://unpkg.com/react@18.3.1/umd/react.production.min.js
 // @require      https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js
@@ -105,6 +87,7 @@
     const SETTINGS_KEY      = 'uplearn_settings_v2';
     const LEGACY_BOOST_KEY  = 'uplearn_time_boost_enabled';
     const LEGACY_UI_KEY     = 'uplearn_time_boost_ui_visible';
+    let publicApi           = null;
 
     const IS_MAC = /Mac|iPhone|iPad|iPod/i.test(
         (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent
@@ -850,23 +833,25 @@
     function hookElementProperty(proto, prop, tag) {
         const desc = Object.getOwnPropertyDescriptor(proto, prop);
         if (desc && desc.set) {
+            const setter = function (val) {
+                if (settings.blockDomElements && isTelemetryUrl(val)) {
+                    reportBlock(`<${tag}>.${prop} assignment`, val, { element: tag });
+                    return '';
+                }
+                if (settings.logLevel === 'verbose' && val) {
+                    const m = matchAnyTelemetryService(val);
+                    if (m && !settings.telemetryServices[m.key]) {
+                        reportAllow(`<${tag}>.${prop}`, val, `service "${m.label}" disabled`);
+                    } else if (m && m.key === 'jitsu' && !settings.suppressJitsu) {
+                        reportAllow(`<${tag}>.${prop}`, val, `service "${m.label}" not suppressed`);
+                    }
+                }
+                return desc.set.call(this, val);
+            };
+            cloak(setter, 'set ' + prop);
             Object.defineProperty(proto, prop, {
                 get: desc.get,
-                set(val) {
-                    if (settings.blockDomElements && isTelemetryUrl(val)) {
-                        reportBlock(`<${tag}>.${prop} assignment`, val, { element: tag });
-                        return '';
-                    }
-                    if (settings.logLevel === 'verbose' && val) {
-                        const m = matchAnyTelemetryService(val);
-                        if (m && !settings.telemetryServices[m.key]) {
-                            reportAllow(`<${tag}>.${prop}`, val, `service "${m.label}" disabled`);
-                        } else if (m && m.key === 'jitsu' && !settings.suppressJitsu) {
-                            reportAllow(`<${tag}>.${prop}`, val, `service "${m.label}" not suppressed`);
-                        }
-                    }
-                    return desc.set.call(this, val);
-                },
+                set: setter,
                 configurable: true,
             });
         }
@@ -1000,7 +985,7 @@
                 const url = origCreateObjectURL.apply(this, arguments);
                 if (blob && telemetryBlobs.has(blob)) {
                     telemetryBlobUrls.add(url);
-                } else if (blob instanceof Blob) {
+                } else if (blob instanceof Blob && blob.size < 1e6 && (!blob.type || blob.type.includes('javascript') || blob.type.includes('text'))) {
                     try {
                         if (typeof blob.text === 'function') {
                             blob.text().then((code) => {
@@ -1024,11 +1009,14 @@
                 }
                 const blob = Reflect.construct(OrigBlob, arguments, new.target);
                 try {
-                    if (blobParts && (Array.isArray(blobParts) || typeof blobParts[Symbol.iterator] === 'function')) {
-                        for (const part of blobParts) {
-                            if (typeof part === 'string' && TELEMETRY_CODE_RE.test(part)) {
-                                telemetryBlobs.add(blob);
-                                break;
+                    const type = (options && options.type) || '';
+                    if (blob.size < 1e6 && (!type || type.includes('javascript') || type.includes('text'))) {
+                        if (blobParts && (Array.isArray(blobParts) || typeof blobParts[Symbol.iterator] === 'function')) {
+                            for (const part of blobParts) {
+                                if (typeof part === 'string' && TELEMETRY_CODE_RE.test(part)) {
+                                    telemetryBlobs.add(blob);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1167,7 +1155,7 @@
     }
 
     const REQ_TRANSFORM_RE = /\b(?:GetFeatureFlags|GetFeatureFlagsEnabledGlobally|currentUser)\b/i;
-    const REQ_INGEST_RE = /\b(?:GetVideoLesson|GetExamPaper|GetExamQuestion|GetExamPracticeSession|AnswerInVideoQuestion|AnswerPreVideoQuestion|SaveExamAnswer|CompleteExamPracticeSession|SubmitQuestionAttempt|videoLesson|examPaper)\b/i;
+    const REQ_INGEST_RE = /\b(?:GetVideoLesson|GetExamPaper|GetExamQuestion|GetExamPracticeSession|Answer[A-Za-z]+Question|SaveExamAnswer|CompleteExamPracticeSession|SubmitQuestionAttempt|videoLesson|examPaper|subsection|feedback)\b/i;
 
     function classifyApiRequest(body) {
         if (!body || typeof body !== 'string' || body.length > MAX_SCAN) return 'none';
@@ -1555,6 +1543,9 @@
 
                 LOG(`[videoLesson] Intercepted "${vl.title || lessonId}" (duration: ${formatSeconds(dur)}, ${questions.length} in-video question(s))`);
                 VLOG('videoLesson intercepted', { lessonId, dur, questions, preQuestions });
+                if (settings.autoSkipVideoEnabled) {
+                    checkAndAutoSkipVideo(false);
+                }
             }
         }
 
@@ -1876,8 +1867,9 @@
 
     function onVideoMediaEvent(e) {
         if (!settings.autoSkipVideoEnabled) return;
-        const target = e.target;
-        if (target && target.tagName === 'VIDEO') {
+        const el = (typeof e.composedPath === 'function' && e.composedPath()[0]) || e.target;
+        const tag = el && el.tagName;
+        if (tag === 'VIDEO' || tag === 'MUX-PLAYER' || tag === 'WISTIA-PLAYER') {
             checkAndAutoSkipVideo(false);
         }
     }
@@ -2038,11 +2030,12 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
     function getCleanElementText(el) {
         if (!el) return '';
-        const cached = cleanedTextCache.get(el);
-        if (cached !== undefined) return cached;
         const raw = el.textContent || el.value || (typeof el.getAttribute === 'function' ? el.getAttribute('aria-label') : '') || '';
+        if (!raw) return '';
+        const cached = cleanedTextCache.get(el);
+        if (cached && cached.raw === raw) return cached.cleaned;
         const cleaned = raw.trim().toLowerCase().replace(/\s+/g, ' ');
-        cleanedTextCache.set(el, cleaned);
+        cleanedTextCache.set(el, { raw, cleaned });
         return cleaned;
     }
 
@@ -2650,25 +2643,30 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                     const cloned = res.clone();
                     if (typeof cloned.text === 'function') {
                         return cloned.text().then((rt) => {
-                            if (shouldTransformFeatureFlags(rt)) {
+                            const ingest = shouldIngestGraphQLResponse(rt);
+                            const transform = shouldTransformFeatureFlags(rt);
+                            if (ingest || transform) {
                                 try {
                                     const parsed = JSON.parse(rt);
-                                    const transformed = stripFullscreenFeatureFlags(parsed);
-                                    const transformedText = JSON.stringify(transformed);
-                                    reportFeatureFlagsTransformed('fetch', url || 'API');
-                                    const newHeaders = new Headers();
-                                    res.headers.forEach((v, k) => {
-                                        const lk = k.toLowerCase();
-                                        if (lk !== 'content-encoding' && lk !== 'content-length') {
-                                            newHeaders.set(k, v);
-                                        }
-                                    });
-                                    newHeaders.set('content-type', 'application/json');
-                                    return new Response(transformedText, {
-                                        status: res.status,
-                                        statusText: res.statusText,
-                                        headers: newHeaders,
-                                    });
+                                    handleApiResponse(parsed);
+                                    if (transform) {
+                                        const transformed = stripFullscreenFeatureFlags(parsed);
+                                        const transformedText = JSON.stringify(transformed);
+                                        reportFeatureFlagsTransformed('fetch', url || 'API');
+                                        const newHeaders = new Headers();
+                                        res.headers.forEach((v, k) => {
+                                            const lk = k.toLowerCase();
+                                            if (lk !== 'content-encoding' && lk !== 'content-length') {
+                                                newHeaders.set(k, v);
+                                            }
+                                        });
+                                        newHeaders.set('content-type', 'application/json');
+                                        return new Response(transformedText, {
+                                            status: res.status,
+                                            statusText: res.statusText,
+                                            headers: newHeaders,
+                                        });
+                                    }
                                 } catch (e) {
                                     WARN('Failed to transform feature flags response:', e);
                                 }
@@ -3036,6 +3034,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             } catch {}
             return origBeacon(url, data);
         };
+        cloak(navigator.sendBeacon, 'sendBeacon');
         VLOG('sendBeacon hook installed');
     }
 
@@ -3173,6 +3172,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             }
             return origAdd.call(this, type, listener, options);
         };
+        cloak(target.addEventListener, 'addEventListener');
     }
     wrapAddEventListener(window);
     wrapAddEventListener(document);
@@ -3188,6 +3188,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 }
                 return origProtoAdd.call(this, type, listener, options);
             };
+            cloak(EventTarget.prototype.addEventListener, 'addEventListener');
         }
     } catch {}
 
@@ -3208,20 +3209,24 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             try {
                 const desc = findPropertyDescriptor(target, prop);
                 let fallbackVal = null;
+                const getter = function () {
+                    if (settings.spoofVisibility) return null;
+                    if (desc && desc.get) return desc.get.call(this);
+                    return fallbackVal;
+                };
+                const setter = function (v) {
+                    if (settings.spoofVisibility) {
+                        VLOG(`suppressed assignment to "${prop}"`);
+                        return;
+                    }
+                    if (desc && desc.set) desc.set.call(this, v);
+                    else fallbackVal = v;
+                };
+                cloak(getter, 'get ' + prop);
+                cloak(setter, 'set ' + prop);
                 Object.defineProperty(target, prop, {
-                    get() {
-                        if (settings.spoofVisibility) return null;
-                        if (desc && desc.get) return desc.get.call(this);
-                        return fallbackVal;
-                    },
-                    set(v) {
-                        if (settings.spoofVisibility) {
-                            VLOG(`suppressed assignment to "${prop}"`);
-                            return;
-                        }
-                        if (desc && desc.set) desc.set.call(this, v);
-                        else fallbackVal = v;
-                    },
+                    get: getter,
+                    set: setter,
                     configurable: true,
                 });
             } catch {}
@@ -5518,6 +5523,10 @@ function getEffectiveTheme(thm) {
                 applyDarkMode();
                 break;
             case 'logLevel':
+                if (publicApi) {
+                    if (value === 'verbose') window.__ul = publicApi;
+                    else try { delete window.__ul; } catch {}
+                }
                 LOG('log level set to:', value);
                 break;
             case 'keybindAction':
@@ -8998,9 +9007,9 @@ var Glisse = (() => {
     }
 
     // ============================================================
-    // PUBLIC API
+    // PUBLIC API (Exposed in verbose mode for DevTools debugging)
     // ============================================================
-    window.__ul = {
+    publicApi = {
         settings, saveSettings, stats,
         openSettings: openSettingsModal,
         closeSettings: closeSettingsModal,
@@ -9037,6 +9046,10 @@ var Glisse = (() => {
         pickExtraSeconds,
         _match: (url) => matchTelemetryService(url),
     };
+
+    if (settings.logLevel === 'verbose') {
+        window.__ul = publicApi;
+    }
 
     LOG('=== READY | timeBoost:', settings.timeBoostEnabled,
         '| range:', settings.extraSecondsMin + '–' + settings.extraSecondsMax + 's',
