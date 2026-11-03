@@ -9,6 +9,8 @@
 // @grant        none
 // @inject-into  page
 // @noframes
+// @downloadURL  https://raw.githubusercontent.com/FabianDream/In-Browser-API-Interceptor/refs/heads/main/advancedbypass.user.js
+// @updateURL    https://raw.githubusercontent.com/FabianDream/In-Browser-API-Interceptor/refs/heads/main/advancedbypass.user.js
 //
 // @webRequest   [{"selector":"*://*.openreplay.uplearn.co.uk/*","action":"cancel"},{"selector":"*://*.sentry.io/*","action":"cancel"},{"selector":"*://static.cloudflareinsights.com/*","action":"cancel"},{"selector":"*://*.intercom.io/*","action":"cancel"},{"selector":"*://*.intercomcdn.com/*","action":"cancel"},{"selector":"*://*.googletagmanager.com/*","action":"cancel"},{"selector":"*://*.google-analytics.com/*","action":"cancel"},{"selector":"*://analytics.google.com/*","action":"cancel"},{"selector":"*://*.googleadservices.com/*","action":"cancel"},{"selector":"*://*.doubleclick.net/*","action":"cancel"},{"selector":"*://*.facebook.net/*","action":"cancel"},{"selector":"*://*.sc-static.net/*","action":"cancel"},{"selector":"*://bat.bing.com/*","action":"cancel"},{"selector":"*://bzrcdn.openai.com/*","action":"cancel"},{"selector":"*://*.posthog.com/*","action":"cancel"},{"selector":"*://*.fullstory.com/*","action":"cancel"},{"selector":"*://*.hotjar.com/*","action":"cancel"},{"selector":"*://*.mixpanel.com/*","action":"cancel"},{"selector":"*://*.segment.io/*","action":"cancel"},{"selector":"*://*.amplitude.com/*","action":"cancel"}]
 //
@@ -59,11 +61,11 @@
     const TELEMETRY_SERVICES = {
         openreplay:      { label: 'OpenReplay',                     hosts: ['openreplay.uplearn.co.uk'] },
         jitsu:           { label: 'Jitsu',                          hosts: ['jitsu.uplearn.co.uk'] },
-        sentry:          { label: 'Sentry',                         hosts: ['ingest.us.sentry.io', 'sentry.io'] },
-        cloudflare:      { label: 'Cloudflare Insights',            hosts: ['static.cloudflareinsights.com', 'cloudflareinsights.com'] },
-        intercom:        { label: 'Intercom',                       hosts: ['api-iam.intercom.io', 'widget.intercom.io', 'js.intercomcdn.com', 'nexus-websocket-.intercom.io', 'intercom.io', 'intercomcdn.com'] },
-        googleAnalytics: { label: 'Google Tag Manager / Analytics', hosts: ['googletagmanager.com', 'google-analytics.com', 'analytics.google.com'] },
-        facebook:        { label: 'Facebook Pixel',                 hosts: ['connect.facebook.net', 'facebook.net'] },
+        sentry:          { label: 'Sentry',                         hosts: ['sentry.io'] },
+        cloudflare:      { label: 'Cloudflare Insights',            hosts: ['cloudflareinsights.com'] },
+        intercom:        { label: 'Intercom',                       hosts: ['intercom.io', 'intercomcdn.com'] },
+        googleAnalytics: { label: 'Google Tag Manager / Analytics', hosts: ['googletagmanager.com', 'google-analytics.com', 'googleadservices.com', 'doubleclick.net'] },
+        facebook:        { label: 'Facebook Pixel',                 hosts: ['facebook.net', 'facebook.com'] },
         snapchat:        { label: 'Snapchat',                       hosts: ['sc-static.net'] },
         bing:            { label: 'Bing',                           hosts: ['bat.bing.com'] },
         openai:          { label: 'OpenAI CDN',                     hosts: ['bzrcdn.openai.com'] },
@@ -528,9 +530,8 @@
             'Dropping queued event after',
             'max send attempts',
         ];
-        for (const h of JITSU_SERVICES_HOSTS_REF()) parts.push(escapeRegExp(h));
+        for (const h of TELEMETRY_SERVICES.jitsu.hosts) parts.push(escapeRegExp(h));
         return new RegExp(parts.join('|'), 'i');
-        function JITSU_SERVICES_HOSTS_REF() { return TELEMETRY_SERVICES.jitsu.hosts; }
     })();
 
     function textMatchesNoise(text) {
@@ -675,6 +676,18 @@
 
     // Dedicated reporter for LogImproperUse so it stands out from generic
     // telemetry blocks. Bumps its own counter and uses pink styling.
+    function describeBody(data) {
+        if (!data) return '';
+        if (typeof data === 'string') return data;
+        try {
+            if (typeof FormData !== 'undefined' && data instanceof FormData) return '(FormData)';
+            if (typeof URLSearchParams !== 'undefined' && data instanceof URLSearchParams) return data.toString();
+            if (typeof Blob !== 'undefined' && data instanceof Blob) return `(Blob · ${data.size} bytes)`;
+            if (typeof ArrayBuffer !== 'undefined' && (data instanceof ArrayBuffer || ArrayBuffer.isView(data))) return `(ArrayBuffer · ${data.byteLength || data.length} bytes)`;
+            if (typeof Document !== 'undefined' && data instanceof Document) return '(Document)';
+        } catch {}
+        return `(${typeof data} body)`;
+    }
     function reportLogImproperUse(source, url, body) {
         bumpStat('logImproperUseBlocked');
         if (settings.logLevel === 'silent') return;
@@ -682,25 +695,28 @@
         let opName = 'LogImproperUse';
         let opType = '';
         let variableNames = [];
-        try {
-            const parsed = JSON.parse(body);
-            const target = Array.isArray(parsed) ? parsed[0] : parsed;
-            if (target && typeof target === 'object') {
-                if (typeof target.operationName === 'string' && target.operationName) {
-                    opName = target.operationName;
+
+        if (settings.logLevel === 'verbose') {
+            try {
+                const parsed = JSON.parse(body);
+                const target = Array.isArray(parsed) ? parsed[0] : parsed;
+                if (target && typeof target === 'object') {
+                    if (typeof target.operationName === 'string' && target.operationName) {
+                        opName = target.operationName;
+                    }
+                    if (target.variables && typeof target.variables === 'object') {
+                        variableNames = Object.keys(target.variables);
+                    }
+                    if (typeof target.query === 'string') {
+                        const m = OP_TYPE_RE.exec(target.query);
+                        if (m) opType = m[1].toLowerCase();
+                    }
                 }
-                if (target.variables && typeof target.variables === 'object') {
-                    variableNames = Object.keys(target.variables);
-                }
-                if (typeof target.query === 'string') {
-                    const m = OP_TYPE_RE.exec(target.query);
-                    if (m) opType = m[1].toLowerCase();
-                }
+            } catch {}
+            if (!opType && typeof body === 'string') {
+                const opTypeMatch = OP_TYPE_RE.exec(body);
+                if (opTypeMatch) opType = opTypeMatch[1].toLowerCase();
             }
-        } catch {}
-        if (!opType && typeof body === 'string') {
-            const opTypeMatch = OP_TYPE_RE.exec(body);
-            if (opTypeMatch) opType = opTypeMatch[1].toLowerCase();
         }
 
         const bodyPreviewShort = truncateBody(body, 140);
@@ -835,6 +851,7 @@
         if (desc && desc.set) {
             const setter = function (val) {
                 if (settings.blockDomElements && isTelemetryUrl(val)) {
+                    bumpStat('blocked');
                     reportBlock(`<${tag}>.${prop} assignment`, val, { element: tag });
                     return '';
                 }
@@ -888,6 +905,7 @@
         const origSetAttribute = Element.prototype.setAttribute;
         Element.prototype.setAttribute = function (name, value) {
             if (settings.blockDomElements && isSrcOrHref(name) && isTelemetryUrl(value)) {
+                bumpStat('blocked');
                 reportBlock(`setAttribute("${name}")`, value, {
                     element: this.tagName ? this.tagName.toLowerCase() : 'unknown',
                 });
@@ -899,6 +917,24 @@
     } catch (e) { WARN('setAttribute patch failed', e); }
 
     try {
+        function checkAndBlockTelemetryElement(el) {
+            const rawTag = el.tagName;
+            if (rawTag === 'SCRIPT' || rawTag === 'IFRAME') {
+                const src = el.src || (typeof el.getAttribute === 'function' ? el.getAttribute('src') : '');
+                if (isTelemetryUrl(src)) {
+                    bumpStat('blocked');
+                    const tag = rawTag.toLowerCase();
+                    reportBlock(`DOM injection (<${tag}>)`, src, {
+                        element: tag,
+                        nodeId: el.id || '(none)',
+                    });
+                    el.remove();
+                    return true;
+                }
+            }
+            return false;
+        }
+
         const domObserver = new MutationObserver((mutations) => {
             if (settings.blockDomElements) {
                 for (let i = 0; i < mutations.length; i++) {
@@ -906,20 +942,12 @@
                     for (let j = 0; j < added.length; j++) {
                         const node = added[j];
                         if (node.nodeType !== 1) continue;
-                        const rawTag = node.tagName;
-                        if (
-                            rawTag === 'SCRIPT' ||
-                            rawTag === 'IFRAME' ||
-                            (typeof rawTag === 'string' && rawTag.length === 6 && (rawTag.toLowerCase() === 'script' || rawTag.toLowerCase() === 'iframe'))
-                        ) {
-                            const tag = rawTag.toLowerCase();
-                            const src = node.src || (typeof node.getAttribute === 'function' ? node.getAttribute('src') : '');
-                            if (isTelemetryUrl(src)) {
-                                reportBlock(`DOM injection (<${tag}>)`, src, {
-                                    element: tag,
-                                    nodeId: node.id || '(none)',
-                                });
-                                node.remove();
+                        if (!checkAndBlockTelemetryElement(node)) {
+                            if (node.children && node.children.length > 0 && typeof node.querySelectorAll === 'function') {
+                                const nested = node.querySelectorAll('script[src], iframe[src]');
+                                for (let k = 0; k < nested.length; k++) {
+                                    checkAndBlockTelemetryElement(nested[k]);
+                                }
                             }
                         }
                     }
@@ -939,6 +967,7 @@
         if (OrigWebSocket) {
             function PatchedWebSocket(url, protocols) {
                 if (settings.blockWebSockets && isTelemetryUrl(url)) {
+                    bumpStat('blocked');
                     reportBlock('WebSocket', String(url), { protocols: protocols || '(none)' });
                     const dummy = new EventTarget();
                     dummy.readyState = OrigWebSocket.CLOSED !== undefined ? OrigWebSocket.CLOSED : 3;
@@ -985,16 +1014,6 @@
                 const url = origCreateObjectURL.apply(this, arguments);
                 if (blob && telemetryBlobs.has(blob)) {
                     telemetryBlobUrls.add(url);
-                } else if (blob instanceof Blob && blob.size < 1e6 && (!blob.type || blob.type.includes('javascript') || blob.type.includes('text'))) {
-                    try {
-                        if (typeof blob.text === 'function') {
-                            blob.text().then((code) => {
-                                if (TELEMETRY_CODE_RE.test(code)) {
-                                    telemetryBlobUrls.add(url);
-                                }
-                            }).catch(() => {});
-                        }
-                    } catch {}
                 }
                 return url;
             };
@@ -1045,7 +1064,8 @@
                     throw new TypeError("Failed to construct 'Worker': Please use the 'new' operator");
                 }
                 const urlStr = typeof scriptURL === 'string' ? scriptURL : String(scriptURL || '');
-                if (telemetryBlobUrls.has(urlStr) || isTelemetryUrl(scriptURL)) {
+                if (settings.telemetryPreset !== 'off' && (telemetryBlobUrls.has(urlStr) || isTelemetryUrl(scriptURL))) {
+                    bumpStat('blocked');
                     reportBlock('WebWorker', urlStr);
                     const dummy = new EventTarget();
                     Object.setPrototypeOf(dummy, (new.target && new.target.prototype) || OrigWorker.prototype);
@@ -1122,7 +1142,7 @@
         } catch (e) { WARN('dark mode apply failed', e); }
     }
 
-    ensureDarkModeStyles();
+    if (settings.darkMode) ensureDarkModeStyles();
     applyDarkMode();
 
     try {
@@ -1155,7 +1175,7 @@
     }
 
     const REQ_TRANSFORM_RE = /\b(?:GetFeatureFlags|GetFeatureFlagsEnabledGlobally|currentUser)\b/i;
-    const REQ_INGEST_RE = /\b(?:GetVideoLesson|GetExamPaper|GetExamQuestion|GetExamPracticeSession|Answer[A-Za-z]+Question|SaveExamAnswer|CompleteExamPracticeSession|SubmitQuestionAttempt|videoLesson|examPaper|subsection|feedback)\b/i;
+    const REQ_INGEST_RE = /\b(?:GetVideoLesson|AnswerInVideoQuestion|videoLesson|subsection)\b/i;
 
     function classifyApiRequest(body) {
         if (!body || typeof body !== 'string' || body.length > MAX_SCAN) return 'none';
@@ -1165,56 +1185,50 @@
     }
 
     // ============================================================
-    // LOGIMPROPERUSE DETECTION
+    // MOCKED GRAPHQL MUTATIONS (Centralized Table)
     // ============================================================
-    const LOG_IMPROPER_PAYLOAD = JSON.stringify({ data: { logImproperUse: true } });
+    const MOCKED_MUTATIONS = {
+        improper: {
+            name: 'LogImproperUse',
+            payload: JSON.stringify({ data: { logImproperUse: true } }),
+            json: () => ({ data: { logImproperUse: true } }),
+            shouldBlock: () => settings.blockLogImproperUse,
+            report: (source, url, body) => reportLogImproperUse(source, url, body),
+        },
+        event: {
+            name: 'LogEvent',
+            payload: JSON.stringify({ data: { logEvent: { id: "mock" } } }),
+            json: () => ({ data: { logEvent: { id: "mock" } } }),
+            shouldBlock: () => settings.blockLogEvent !== false,
+            report: (source, url, body) => reportLogEvent(source, url, body),
+        },
+        search: {
+            name: 'PrivateSearch',
+            payload: JSON.stringify({
+                data: {
+                    logVideoSearchRequest: { id: "mock" },
+                    logLessonSearch: { id: "mock" }
+                }
+            }),
+            json: () => ({
+                data: {
+                    logVideoSearchRequest: { id: "mock" },
+                    logLessonSearch: { id: "mock" }
+                }
+            }),
+            shouldBlock: () => settings.privateSearchMode !== false,
+            report: (source, url, body) => reportLogLessonSearch(source, url, body),
+        },
+    };
 
-    function bodyLooksLikeLogImproperUse(body) {
-        return getBlockedMutationKind(body) === 'improper';
-    }
-
-    function logImproperUseSyntheticResponse() {
-        return new Response(LOG_IMPROPER_PAYLOAD, {
-            status: 200, statusText: 'OK',
-            headers: { 'Content-Type': 'application/json' }
-        });
-    }
-
-    // ============================================================
-    // LOGEVENT DETECTION (Local Interaction Logging)
-    // ============================================================
-    const LOG_EVENT_PAYLOAD = JSON.stringify({ data: { logEvent: { id: "mock" } } });
-
-    function bodyLooksLikeLogEvent(body) {
-        return getBlockedMutationKind(body) === 'event';
-    }
-
-    function logEventSyntheticResponse() {
-        return new Response(LOG_EVENT_PAYLOAD, {
-            status: 200, statusText: 'OK',
-            headers: { 'Content-Type': 'application/json' }
-        });
-    }
-
-    // ============================================================
-    // LOGLESSONSEARCH DETECTION (Private Search Mode)
-    // ============================================================
-    const LOG_LESSON_SEARCH_PAYLOAD = JSON.stringify({
-        data: {
-            logVideoSearchRequest: { id: "mock" },
-            logLessonSearch: { id: "mock" }
-        }
-    });
-
-    function bodyLooksLikeLogLessonSearch(body) {
-        return getBlockedMutationKind(body) === 'search';
-    }
-
-    function logLessonSearchSyntheticResponse() {
-        return new Response(LOG_LESSON_SEARCH_PAYLOAD, {
-            status: 200, statusText: 'OK',
-            headers: { 'Content-Type': 'application/json' }
-        });
+    function interceptBlockedMutation(body, url, source) {
+        const kind = getBlockedMutationKind(body);
+        if (!kind) return null;
+        const config = MOCKED_MUTATIONS[kind];
+        if (!config || !config.shouldBlock()) return null;
+        config.report(source, url, body);
+        bumpStat('blocked');
+        return config;
     }
 
     // ============================================================
@@ -1226,11 +1240,9 @@
         'course_activity_record_improper_use',
     ]);
 
-    const FEATURE_FLAGS_RE = /course_activity_(?:fullscreen_mode|fullscreen_exit_modal|record_improper_use)|(?:featureFlags.*currentUser|currentUser.*featureFlags)/s;
-
     function shouldTransformFeatureFlags(text) {
         if (!text || typeof text !== 'string') return false;
-        return FEATURE_FLAGS_RE.test(text);
+        return text.includes('course_activity_') || (text.includes('featureFlags') && text.includes('currentUser'));
     }
 
     function stripFullscreenFeatureFlags(obj) {
@@ -1307,22 +1319,30 @@
         'CompleteArticleLesson',
     ]);
 
+    const OP_ANSWER_QUESTION_RE   = /^Answer.*Question$/i;
+    const OP_SAVE_EXAM_RE         = /^SaveExam/i;
+    const QSTR_ANSWER_QUESTION_RE = /answer[A-Za-z0-9]*Question/i;
+    const QSTR_SAVE_EXAM_RE       = /saveExam[A-Za-z0-9]*/i;
+
+    const OP_COMPLETE_GROUP_RE    = /^Complete.*(Quiz|Group|Session|Walkthrough)$/i;
+    const QSTR_COMPLETE_GROUP_RE  = /complete[A-Za-z0-9]*(Quiz|Group|Session|Walkthrough)/i;
+
     function isQuestionAnswerOp(opName, qStr) {
         if (KNOWN_QUESTION_OPS.has(opName)) return true;
-        if (/^Answer.*Question$/i.test(opName)) return true;
-        if (/^SaveExam/i.test(opName)) return true;
+        if (OP_ANSWER_QUESTION_RE.test(opName)) return true;
+        if (OP_SAVE_EXAM_RE.test(opName)) return true;
         if (qStr) {
-            if (/answer[A-Za-z0-9]*Question/i.test(qStr)) return true;
-            if (/saveExam[A-Za-z0-9]*/i.test(qStr)) return true;
+            if (QSTR_ANSWER_QUESTION_RE.test(qStr)) return true;
+            if (QSTR_SAVE_EXAM_RE.test(qStr)) return true;
         }
         return false;
     }
 
     function isQuizGroupOp(opName, qStr) {
         if (KNOWN_GROUP_OPS.has(opName)) return true;
-        if (/^Complete.*(Quiz|Group|Session|Walkthrough)$/i.test(opName)) return true;
+        if (OP_COMPLETE_GROUP_RE.test(opName)) return true;
         if (qStr) {
-            if (/complete[A-Za-z0-9]*(Quiz|Group|Session|Walkthrough)/i.test(qStr)) return true;
+            if (QSTR_COMPLETE_GROUP_RE.test(qStr)) return true;
         }
         return false;
     }
@@ -1424,6 +1444,16 @@
      * Video Lesson State & Auto-Skip Progression
      * ------------------------------------------------------------ */
     const knownLessonDurations = new Map();
+    function recordLessonDuration(id, dur) {
+        if (!id || !dur) return;
+        const key = String(id);
+        if (knownLessonDurations.has(key)) {
+            knownLessonDurations.delete(key);
+        } else if (knownLessonDurations.size >= 200) {
+            knownLessonDurations.delete(knownLessonDurations.keys().next().value);
+        }
+        knownLessonDurations.set(key, dur);
+    }
     let currentVideoLesson                 = null;
     let lastSkippedTarget                  = null;
     let autoSkipThrottled                  = false;
@@ -1435,11 +1465,7 @@
     /* ------------------------------------------------------------
      * Unified GraphQL State Storage (In-flight Ingestion)
      * ------------------------------------------------------------ */
-    let latestExamPaperData                = null;
-    let latestUserProfile                  = null;
-    let latestFeatureFlags                 = null;
-    let latestGlobalFeatureFlags           = null;
-    let latestQuizFeedback                 = null;
+
 
     function throttleAutoSkip() {
         autoSkipThrottled = true;
@@ -1465,7 +1491,7 @@
                 if (!item || !item.id) continue;
                 const itemDur = parseDurationToSeconds(item.length) || parseDurationToSeconds(item.duration) || 0;
                 if (itemDur > 0) {
-                    knownLessonDurations.set(String(item.id), itemDur);
+                    recordLessonDuration(item.id, itemDur);
                 }
             }
         }
@@ -1483,66 +1509,15 @@
                     dur = parseDurationToSeconds(vl.duration) || 0;
                 }
                 if (dur > 0) {
-                    knownLessonDurations.set(lessonId, dur);
+                    recordLessonDuration(lessonId, dur);
                 }
 
-                const rawQuestions = Array.isArray(vl.inVideoQuizQuestions)
-                    ? vl.inVideoQuizQuestions.filter(Boolean)
-                    : [];
-                const questions = [];
-                for (let idx = 0; idx < rawQuestions.length; idx++) {
-                    const q = rawQuestions[idx];
-                    const parsedTrig = parseDurationToSeconds(q.triggerTime);
-                    const trig = (parsedTrig != null && isFinite(parsedTrig) && parsedTrig >= 0)
-                        ? parsedTrig
-                        : (isFinite(Number(q.triggerTime)) && Number(q.triggerTime) >= 0 ? Number(q.triggerTime) : null);
-                    const parsedResume = parseDurationToSeconds(q.postQuestionResumeTime);
-                    const resume = (parsedResume != null && isFinite(parsedResume) && parsedResume >= 0)
-                        ? parsedResume
-                        : (trig != null ? trig + 1 : null);
-
-                    questions.push({
-                        id: String(q.id || `q-idx-${idx}`),
-                        quizContentId: (q.quizContent && q.quizContent.id) ? String(q.quizContent.id) : null,
-                        triggerTime: trig,
-                        resumeTime: resume,
-                    });
-                }
-                questions.sort((a, b) => {
-                    if (a.triggerTime == null && b.triggerTime == null) return 0;
-                    if (a.triggerTime == null) return 1;
-                    if (b.triggerTime == null) return -1;
-                    return a.triggerTime - b.triggerTime;
-                });
-
-                const preQuestions = [];
-                if (Array.isArray(vl.preVideoQuestions)) {
-                    for (const pq of vl.preVideoQuestions) {
-                        if (pq && pq.id) {
-                            preQuestions.push(String(pq.id));
-                        }
-                    }
-                }
-
-                lastSkippedTarget = null;
-                lastQuestionAnsweredAt = 0;
-                waitingForPostAnswerResume = false;
                 currentVideoLesson = {
                     id: lessonId,
                     uniqueCode: vl.uniqueCode ? String(vl.uniqueCode) : '',
                     title: vl.title || '',
                     duration: dur,
-                    questions: questions,
-                    totalExpectedQuestions: rawQuestions.length,
-                    preQuestions: preQuestions,
-                    answeredQuestionIds: new Set(),
-                    answeredPreQuestionIds: new Set(),
-                    completed: false,
-                    receivedAt: Date.now(),
                 };
-
-                LOG(`[videoLesson] Intercepted "${vl.title || lessonId}" (duration: ${formatSeconds(dur)}, ${questions.length} in-video question(s))`);
-                VLOG('videoLesson intercepted', { lessonId, dur, questions, preQuestions });
                 if (settings.autoSkipVideoEnabled) {
                     checkAndAutoSkipVideo(false);
                 }
@@ -1551,106 +1526,9 @@
 
         // 2. In-video question response
         if (d.answerInVideoQuestion) {
-            const ai = d.answerInVideoQuestion;
-            const q = ai.question;
-            const responses = Array.isArray(ai.responses) ? ai.responses : [];
-            // A question is completed when:
-            // - All response items are marked correct, OR
-            // - MarkedQuestion solution/explanation is returned (final attempt completed), OR
-            // - Direct mock/test response without responses array has question.id / question.quizContent
-            const allCorrect = responses.length > 0 && responses.every((r) => r && r.correct);
-            const hasMarkedSolution = Boolean(
-                q && q.quizContent && (q.quizContent.quizDefinition || q.quizContent.explanation)
-            );
-            const isDirectMock = Boolean(
-                (!ai.responses || responses.length === 0) && q && (q.id || q.quizContent)
-            );
-            const isCompleted = allCorrect || hasMarkedSolution || isDirectMock;
-
-            if (currentVideoLesson && isCompleted) {
-                let targetId = null;
-                if (q && q.id) {
-                    targetId = String(q.id);
-                } else if (q && q.quizContent && q.quizContent.id) {
-                    targetId = String(q.quizContent.id);
-                }
-
-                if (targetId) {
-                    currentVideoLesson.answeredQuestionIds.add(targetId);
-                    const matchedQ = currentVideoLesson.questions.find(
-                        (item) => item.id === targetId || item.quizContentId === targetId
-                    );
-                    if (matchedQ) {
-                        if (matchedQ.id) currentVideoLesson.answeredQuestionIds.add(matchedQ.id);
-                        if (matchedQ.quizContentId) currentVideoLesson.answeredQuestionIds.add(matchedQ.quizContentId);
-                    }
-                    VLOG('in-video question marked answered', targetId);
-                } else {
-                    // Fallback: mark the earliest unanswered question near current playback time
-                    const video = findActiveVideoElement();
-                    const curT = video ? (video.currentTime || 0) : 0;
-                    const answered = currentVideoLesson.answeredQuestionIds;
-                    const candidate = currentVideoLesson.questions.find(
-                        (item) => !answered.has(String(item.id)) && item.triggerTime != null && item.triggerTime <= curT + 2.5
-                    ) || currentVideoLesson.questions.find((item) => !answered.has(String(item.id)));
-                    if (candidate) {
-                        if (candidate.id) currentVideoLesson.answeredQuestionIds.add(candidate.id);
-                        if (candidate.quizContentId) currentVideoLesson.answeredQuestionIds.add(candidate.quizContentId);
-                        VLOG('in-video question marked answered via timeline fallback', candidate.id);
-                    }
-                }
-                lastQuestionAnsweredAt = Date.now();
-                waitingForPostAnswerResume = true;
-            }
-        }
-
-        // 3. Pre-video question response
-        if (d.answerPreVideoQuestion) {
-            const ap = d.answerPreVideoQuestion;
-            const pq = ap.question;
-            const preId = (pq && pq.id) ? String(pq.id) : null;
-            if (currentVideoLesson) {
-                if (preId) {
-                    currentVideoLesson.answeredPreQuestionIds.add(preId);
-                } else if (Array.isArray(currentVideoLesson.preQuestions)) {
-                    const nextPre = currentVideoLesson.preQuestions.find((id) => !currentVideoLesson.answeredPreQuestionIds.has(id));
-                    if (nextPre) currentVideoLesson.answeredPreQuestionIds.add(nextPre);
-                }
-            }
-        }
-
-        // 4. Exam paper & practice session payloads
-        if (d.examPaper || d.examPracticeSession || (d.module && (d.module.examPapers || d.module.currentUserEnrolment))) {
-            const ep = d.examPaper || d.examPracticeSession || d.module;
-            latestExamPaperData = ep;
-            VLOG('exam paper / practice session intercepted', ep);
-        }
-
-        // 5. Feature flags & user profile payloads
-        if (d.currentUser) {
-            latestUserProfile = d.currentUser;
-            if (d.currentUser.featureFlags) {
-                latestFeatureFlags = d.currentUser.featureFlags;
-            }
-            VLOG('currentUser / featureFlags intercepted', d.currentUser);
-        }
-        if (d.featureFlagsEnabledGlobally) {
-            latestGlobalFeatureFlags = d.featureFlagsEnabledGlobally;
-            VLOG('featureFlagsEnabledGlobally intercepted', d.featureFlagsEnabledGlobally);
-        }
-
-        // 6. Quiz feedback payloads
-        const feedbackObj = d.feedback || d.feedbackMessages || d.feedbacks || d.quizFeedback ||
-            (d.answerProgressQuizQuestion && (d.answerProgressQuizQuestion.feedback || d.answerProgressQuizQuestion.responses)) ||
-            (d.answerSpacedPracticeQuizQuestion && (d.answerSpacedPracticeQuizQuestion.feedback || d.answerSpacedPracticeQuizQuestion.responses)) ||
-            (d.answerDiagnosticQuestion && (d.answerDiagnosticQuestion.feedback || d.answerDiagnosticQuestion.responses)) ||
-            (d.answerExamQuestion && (d.answerExamQuestion.feedback || d.answerExamQuestion.responses)) ||
-            (d.answerStrengthenQuizQuestion && (d.answerStrengthenQuizQuestion.feedback || d.answerStrengthenQuizQuestion.responses));
-        if (feedbackObj) {
-            latestQuizFeedback = feedbackObj;
-            VLOG('quiz feedback intercepted', latestQuizFeedback);
-        }
-    }
+            lastQuestionAnsweredAt = Date.now();
+            waitingForPostAnswerResume = true;
+        }    }
 
     function findActiveVideoElement() {
         try {
@@ -1748,7 +1626,9 @@
                     if (!txt) continue;
                     if (QUIZ_ACTION_LABELS.has(txt) || QUESTION_SUBMIT_LABELS.has(txt) || QUESTION_SUBMIT_RE.test(txt)) {
                         if (isElementVisible(btn)) {
-                            lastResolvedSubmitBtn = btn;
+                            if (QUESTION_SUBMIT_LABELS.has(txt) || QUESTION_SUBMIT_RE.test(txt)) {
+                                lastResolvedSubmitBtn = btn;
+                            }
                             return true;
                         }
                     }
@@ -1800,7 +1680,7 @@
         if (duration > 0 && currentVideoLesson && currentVideoLesson.duration <= 0) {
             currentVideoLesson.duration = duration;
             if (currentVideoLesson.id) {
-                knownLessonDurations.set(currentVideoLesson.id, duration);
+                recordLessonDuration(currentVideoLesson.id, duration);
             }
         }
 
@@ -1888,9 +1768,7 @@
         checkAndAutoSkipVideo(false);
     }
 
-    function stopVideoAutoSkipController() {
-        // Media listeners are zero-overhead no-ops when settings.autoSkipVideoEnabled === false
-    }
+
 
     function initVideoAutoSkipController() {
         installVideoMediaListeners();
@@ -2308,6 +2186,27 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         }, 0);
     }
 
+    function isRelevantQuestionMutationNode(node) {
+        if (!node || node.nodeType !== 1) return false;
+        if (node === uiHostEl) return false;
+        const tid = node.id;
+        if (tid === MANUAL_BUTTON_ID || (typeof tid === 'string' && tid.includes('__ul-'))) return false;
+
+        const tag = node.tagName;
+        if (tag === 'BUTTON' || tag === 'INPUT') return true;
+
+        const role = typeof node.getAttribute === 'function' ? node.getAttribute('role') : null;
+        if (role === 'button' || role === 'dialog') return true;
+
+        const cls = typeof node.className === 'string' ? node.className : '';
+        if (cls.includes('quiz') || cls.includes('question') || cls.includes('modal') || cls.includes('dialog')) return true;
+
+        if (node.children && node.children.length > 0 && typeof node.querySelector === 'function') {
+            return !!node.querySelector('button, input[type="submit"], [role="button"], [role="dialog"], .quiz-content, [data-testid*="question"], [data-testid*="quiz"], .question');
+        }
+        return false;
+    }
+
     let manualBtnScheduled = false;
     function scheduleEnsureButton(mutations) {
         if (!settings.manualTimeButtonEnabled || manualBtnScheduled) return;
@@ -2318,33 +2217,17 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 if (m.type === 'childList') {
                     const added = m.addedNodes;
                     for (let j = 0; j < added.length; j++) {
-                        if (added[j].nodeType === 1) {
-                            const node = added[j];
-                            const tid = node.id;
-                            const isOurs = node === uiHostEl ||
-                                tid === MANUAL_BUTTON_ID ||
-                                (typeof tid === 'string' && tid.includes('__ul-')) ||
-                                (uiHostEl && typeof uiHostEl.contains === 'function' && uiHostEl.contains(node));
-                            if (!isOurs) {
-                                hasRelevantElementChange = true;
-                                break;
-                            }
+                        if (isRelevantQuestionMutationNode(added[j])) {
+                            hasRelevantElementChange = true;
+                            break;
                         }
                     }
                     if (hasRelevantElementChange) break;
                     const removed = m.removedNodes;
                     for (let j = 0; j < removed.length; j++) {
-                        if (removed[j].nodeType === 1) {
-                            const node = removed[j];
-                            const tid = node.id;
-                            const isOurs = node === uiHostEl ||
-                                tid === MANUAL_BUTTON_ID ||
-                                (typeof tid === 'string' && tid.includes('__ul-')) ||
-                                (uiHostEl && typeof uiHostEl.contains === 'function' && uiHostEl.contains(node));
-                            if (!isOurs) {
-                                hasRelevantElementChange = true;
-                                break;
-                            }
+                        if (isRelevantQuestionMutationNode(removed[j])) {
+                            hasRelevantElementChange = true;
+                            break;
                         }
                     }
                     if (hasRelevantElementChange) break;
@@ -2359,9 +2242,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         }, 150);
     }
 
-    function initManualButtonObserver() {
-        // Merged into root domObserver to prevent redundant document subtree observers
-    }
+
 
     /* ------------------------------------------------------------
      * Body Rewriting & Network Injection
@@ -2716,13 +2597,15 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                         };
 
                         let bodyStr = init && typeof init.body === 'string' ? init.body : null;
-                        if (bodyStr == null && typeof Request !== 'undefined' && input instanceof Request) {
-                            try {
-                                const ct = (input.headers.get('content-type') || '').toLowerCase();
-                                if (ct.includes('application/json') || ct.includes('text/')) {
-                                    return input.clone().text().then(doBlock, () => doBlock(null));
-                                }
-                            } catch {}
+                        if (settings.logLevel !== 'silent') {
+                            if (bodyStr == null && typeof Request !== 'undefined' && input instanceof Request) {
+                                try {
+                                    const ct = (input.headers.get('content-type') || '').toLowerCase();
+                                    if (ct.includes('application/json') || ct.includes('text/')) {
+                                        return input.clone().text().then(doBlock, () => doBlock(null));
+                                    }
+                                } catch {}
+                            }
                         }
                         return Promise.resolve(doBlock(bodyStr));
                     }
@@ -2760,19 +2643,12 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                             if (ct.includes('application/json')) {
                                 const passInit = init;
                                 return input.clone().text().then((text) => {
-                                    const blockedKind = getBlockedMutationKind(text);
-                                    if (blockedKind === 'improper' && settings.blockLogImproperUse) {
-                                        reportLogImproperUse('fetch · Request body', url, text);
-                                        bumpStat('blocked');
-                                        return logImproperUseSyntheticResponse();
-                                    }
-                                    if (blockedKind === 'event' && settings.blockLogEvent !== false) {
-                                        reportLogEvent('fetch · Request body', url, text);
-                                        return logEventSyntheticResponse();
-                                    }
-                                    if (blockedKind === 'search' && settings.privateSearchMode !== false) {
-                                        reportLogLessonSearch('fetch · Request body', url, text);
-                                        return logLessonSearchSyntheticResponse();
+                                    const mocked = interceptBlockedMutation(text, url, 'fetch · Request body');
+                                    if (mocked) {
+                                        return new Response(mocked.payload, {
+                                            status: 200, statusText: 'OK',
+                                            headers: { 'Content-Type': 'application/json' }
+                                        });
                                     }
                                     const reqK = classifyApiRequest(text);
                                     const { body: newBody, changed } = maybeBumpTimeSpent(text, 'fetch-Req');
@@ -2789,19 +2665,12 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                         }
 
                         if (body != null) {
-                            const blockedKind = getBlockedMutationKind(body);
-                            if (blockedKind === 'improper' && settings.blockLogImproperUse) {
-                                reportLogImproperUse('fetch', url, body);
-                                bumpStat('blocked');
-                                return Promise.resolve(logImproperUseSyntheticResponse());
-                            }
-                            if (blockedKind === 'event' && settings.blockLogEvent !== false) {
-                                reportLogEvent('fetch', url, body);
-                                return Promise.resolve(logEventSyntheticResponse());
-                            }
-                            if (blockedKind === 'search' && settings.privateSearchMode !== false) {
-                                reportLogLessonSearch('fetch', url, body);
-                                return Promise.resolve(logLessonSearchSyntheticResponse());
+                            const mocked = interceptBlockedMutation(body, url, 'fetch');
+                            if (mocked) {
+                                return Promise.resolve(new Response(mocked.payload, {
+                                    status: 200, statusText: 'OK',
+                                    headers: { 'Content-Type': 'application/json' }
+                                }));
                             }
 
                             reqKind = classifyApiRequest(body);
@@ -2870,15 +2739,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 if (anyMatch) {
                     // ---- Telemetry block ----
                     if (isServiceMatchBlocked(anyMatch)) {
-                        let bodyStr = null;
-                        try {
-                            if (typeof body === 'string') bodyStr = body;
-                            else if (body instanceof Document || body instanceof Blob || body instanceof FormData) {
-                                bodyStr = `(${body.constructor ? body.constructor.name : 'non-string'} body)`;
-                            } else if (body != null) {
-                                bodyStr = `(${typeof body} body)`;
-                            }
-                        } catch {}
+                        let bodyStr = describeBody(body);
                         if (anyMatch.key === 'jitsu') {
                             bumpStat('jitsuPackets');
                             reportJitsuPacket('XHR · BLOCKED', url, bodyStr);
@@ -2893,93 +2754,83 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                     // ---- Jitsu allowed: log packet, then pass through ----
                     if (anyMatch.key === 'jitsu') {
                         bumpStat('jitsuPackets');
-                        let bodyStr = null;
-                        try {
-                            if (typeof body === 'string') bodyStr = body;
-                            else if (body != null) bodyStr = `(${body.constructor ? body.constructor.name : typeof body} body)`;
-                        } catch {}
-                        reportJitsuPacket('XHR', url, bodyStr);
+                        reportJitsuPacket('XHR', url, describeBody(body));
                     } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
                         reportAllow('XHR', url, `service "${anyMatch.label}" disabled in settings`);
                     }
                 } else if (isTargetApi(url)) {
                     if (method === 'POST') bumpStat('apiPosts');
 
-                    const blockedKind = getBlockedMutationKind(body);
-                    if (blockedKind === 'improper' && settings.blockLogImproperUse) {
-                        reportLogImproperUse('XHR', url,
-                            typeof body === 'string' ? body : '(non-string body)');
-                        bumpStat('blocked');
-                        mockBlockedXHR(this, LOG_IMPROPER_PAYLOAD, () => ({ data: { logImproperUse: true } }));
+                    const mocked = interceptBlockedMutation(body, url, 'XHR');
+                    if (mocked) {
+                        mockBlockedXHR(this, mocked.payload, mocked.json);
                         return;
                     }
 
-                    if (blockedKind === 'event' && settings.blockLogEvent !== false) {
-                        reportLogEvent('XHR', url,
-                            typeof body === 'string' ? body : '(non-string body)');
-                        mockBlockedXHR(this, LOG_EVENT_PAYLOAD, () => ({ data: { logEvent: { id: "mock" } } }));
-                        return;
-                    }
-
-                    if (blockedKind === 'search' && settings.privateSearchMode !== false) {
-                        reportLogLessonSearch('XHR', url,
-                            typeof body === 'string' ? body : '(non-string body)');
-                        mockBlockedXHR(this, LOG_LESSON_SEARCH_PAYLOAD, () => ({ data: { logVideoSearchRequest: { id: "mock" }, logLessonSearch: { id: "mock" } } }));
-                        return;
-                    }
-
+                    let reqKind = 'none';
                     if (typeof body === 'string') {
+                        reqKind = classifyApiRequest(body);
                         const { body: newBody, changed } = maybeBumpTimeSpent(body, 'xhr');
                         if (changed) body = newBody;
                     }
 
-                    const selfXhr = this;
-                    let xhrHandled = false;
-                    const cleanupXhrListeners = function () {
-                        try {
-                            selfXhr.removeEventListener('readystatechange', handleXhrResponse, true);
-                            selfXhr.removeEventListener('loadend', handleXhrResponse, true);
-                        } catch {}
-                    };
-                    const handleXhrResponse = function () {
-                        if (xhrHandled) return;
-                        try {
-                            if (selfXhr.readyState === 4) {
-                                xhrHandled = true;
-                                cleanupXhrListeners();
-                                if (selfXhr.status === 200) {
-                                    const rt = selfXhr.responseText;
-                                    const ingest = shouldIngestGraphQLResponse(rt);
-                                    const transform = shouldTransformFeatureFlags(rt);
-                                    if (ingest || transform) {
-                                        try {
-                                            const parsed = JSON.parse(rt);
-                                            if (ingest) handleApiResponse(parsed);
-                                            if (transform) {
-                                                const modifiedJson = stripFullscreenFeatureFlags(parsed);
-                                                const modifiedText = JSON.stringify(modifiedJson);
-                                                reportFeatureFlagsTransformed('XHR', url || 'API');
-                                                Object.defineProperty(selfXhr, 'responseText', {
-                                                    get() { return modifiedText; },
-                                                    configurable: true,
-                                                });
-                                                Object.defineProperty(selfXhr, 'response', {
-                                                    get() {
-                                                        return selfXhr.responseType === 'json' ? modifiedJson : modifiedText;
-                                                    },
-                                                    configurable: true,
-                                                });
+                    if (reqKind !== 'none') {
+                        const selfXhr = this;
+                        let xhrHandled = false;
+                        const cleanupXhrListeners = function () {
+                            try {
+                                selfXhr.removeEventListener('readystatechange', handleXhrResponse, true);
+                                selfXhr.removeEventListener('loadend', handleXhrResponse, true);
+                            } catch {}
+                        };
+                        const handleXhrResponse = function () {
+                            if (xhrHandled) return;
+                            try {
+                                if (selfXhr.readyState === 4) {
+                                    xhrHandled = true;
+                                    cleanupXhrListeners();
+                                    if (selfXhr.status === 200) {
+                                        if (selfXhr.responseType === 'json') {
+                                            if (selfXhr.response && typeof selfXhr.response === 'object') {
+                                                handleApiResponse(selfXhr.response);
                                             }
-                                        } catch {}
+                                            return;
+                                        }
+                                        if (!selfXhr.responseType || selfXhr.responseType === 'text') {
+                                            const rt = selfXhr.responseText;
+                                            const ingest = reqKind === 'ingest' || shouldIngestGraphQLResponse(rt);
+                                            const transform = reqKind === 'transform' || shouldTransformFeatureFlags(rt);
+                                            if (ingest || transform) {
+                                                try {
+                                                    const parsed = JSON.parse(rt);
+                                                    if (ingest) handleApiResponse(parsed);
+                                                    if (transform) {
+                                                        const modifiedJson = stripFullscreenFeatureFlags(parsed);
+                                                        const modifiedText = JSON.stringify(modifiedJson);
+                                                        reportFeatureFlagsTransformed('XHR', url || 'API');
+                                                        Object.defineProperty(selfXhr, 'responseText', {
+                                                            get() { return modifiedText; },
+                                                            configurable: true,
+                                                        });
+                                                        Object.defineProperty(selfXhr, 'response', {
+                                                            get() {
+                                                                return selfXhr.responseType === 'json' ? modifiedJson : modifiedText;
+                                                            },
+                                                            configurable: true,
+                                                        });
+                                                    }
+                                                } catch {}
+                                            }
+                                        }
                                     }
                                 }
+                            } catch {
+                                cleanupXhrListeners();
                             }
-                        } catch {
-                            cleanupXhrListeners();
-                        }
-                    };
-                    this.addEventListener('readystatechange', handleXhrResponse, true);
-                    this.addEventListener('loadend', handleXhrResponse, { once: true, capture: true });
+                        };
+                        this.addEventListener('readystatechange', handleXhrResponse, true);
+                        this.addEventListener('loadend', handleXhrResponse, { once: true, capture: true });
+                    }
                 }
             } catch (e) {
                 WARN('xhr interceptor error:', e);
@@ -3000,13 +2851,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 const anyMatch = matchAnyTelemetryService(url);
                 if (anyMatch) {
                     if (settings.blockSendBeacon && isServiceMatchBlocked(anyMatch)) {
-                        let bodyStr = null;
-                        try {
-                            if (typeof data === 'string') bodyStr = data;
-                            else if (data instanceof Blob) bodyStr = `(Blob · ${data.size} bytes)`;
-                            else if (data instanceof ArrayBuffer) bodyStr = `(ArrayBuffer · ${data.byteLength} bytes)`;
-                            else if (data != null) bodyStr = `(${typeof data} body)`;
-                        } catch {}
+                        const bodyStr = describeBody(data);
                         if (anyMatch.key === 'jitsu') {
                             bumpStat('jitsuPackets');
                             reportJitsuPacket('sendBeacon · BLOCKED', String(url), bodyStr);
@@ -3019,14 +2864,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
                     if (anyMatch.key === 'jitsu') {
                         bumpStat('jitsuPackets');
-                        let bodyStr = null;
-                        try {
-                            if (typeof data === 'string') bodyStr = data;
-                            else if (data instanceof Blob) bodyStr = `(Blob · ${data.size} bytes)`;
-                            else if (data instanceof ArrayBuffer) bodyStr = `(ArrayBuffer · ${data.byteLength} bytes)`;
-                            else if (data != null) bodyStr = `(${typeof data} body)`;
-                        } catch {}
-                        reportJitsuPacket('sendBeacon', String(url), bodyStr);
+                        reportJitsuPacket('sendBeacon', String(url), describeBody(data));
                     } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
                         reportAllow('sendBeacon', url, `service "${anyMatch.label}" disabled in settings`);
                     }
@@ -3135,8 +2973,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 e.target !== window &&
                 e.target !== document &&
                 e.target !== document.documentElement &&
-                e.target !== document.body &&
-                ORIG_HAS_FOCUS()
+                e.target !== document.body
             ) {
                 return;
             }
@@ -3161,21 +2998,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         } catch {}
     });
 
-    function wrapAddEventListener(target) {
-        const targetName = target === window ? 'window' : 'document';
-        const origAdd = target.addEventListener;
-        if (!origAdd) return;
-        target.addEventListener = function (type, listener, options) {
-            if (settings.spoofVisibility && SUPPRESSED_EVENTS.has(type)) {
-                VLOG(`suppressed "${type}" listener registration on ${targetName}`);
-                return;
-            }
-            return origAdd.call(this, type, listener, options);
-        };
-        cloak(target.addEventListener, 'addEventListener');
-    }
-    wrapAddEventListener(window);
-    wrapAddEventListener(document);
+
 
     try {
         if (origProtoAdd) {
@@ -3241,7 +3064,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         'mozRequestFullScreen', 'msRequestFullscreen',
     ];
     const patchedFullscreenFns = new WeakSet();
-    const origFullscreenFns = new WeakMap();
 
     function installFullscreenBlocker() {
         FULLSCREEN_METHODS.forEach((name) => {
@@ -3268,7 +3090,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 return orig.apply(this, arguments);
             };
             patchedFullscreenFns.add(wrapped);
-            origFullscreenFns.set(wrapped, orig);
             cloak(wrapped, name);
             try {
                 Object.defineProperty(proto, name, {
@@ -3304,7 +3125,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         if (KEY_DISPLAY_MAP[code]) return KEY_DISPLAY_MAP[code];
         if (/^Key[A-Z]$/.test(code)) return code.slice(3);
         if (/^Digit\d$/.test(code)) return code.slice(5);
-        if (/^Numpad\d$/.test(code)) return 'Num ' + code.slice(6);
         if (/^Numpad/.test(code)) return 'Num ' + code.slice(6);
         if (/^F\d+$/.test(code)) return code;
         return code;
@@ -3489,39 +3309,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   --lg-pill-tint: rgba(18, 18, 22, 0.72);
 }
 
-@media (prefers-color-scheme: dark) {
-  :where(:root:not([data-theme="light"]), .heroui-root:not([data-theme="light"])) {
-    --lg-foreground: #ffffff;
-    --lg-muted: #b8b8c2;
-    --lg-glass: rgba(40, 40, 40, 0.65);
-    --lg-glass-active: rgba(70, 70, 70, 0.65);
-    --lg-edge: rgba(255, 255, 255, 0.09);
-    --lg-drop: transparent;
-    --lg-selection: rgba(255, 255, 255, 0.15);
-    --lg-lens: rgba(255, 255, 255, 0.06);
-    --lg-surface: rgba(18, 18, 22, 0.92);
-    --lg-surface-edge: rgba(255, 255, 255, 0.14);
-    --lg-shadow: rgba(0, 0, 0, 0.42);
-    --lg-highlight: rgba(235, 235, 245, 0.14);
-    --lg-separator: rgba(235, 235, 245, 0.20);
-    --lg-destructive: #ff4245;
-    --lg-track: rgba(235, 235, 245, 0.3);
-    --lg-rail: rgba(255, 255, 255, 0.1);
-    --lg-on: #30d158;
-    --lg-fill: #0091ff;
-    --lg-ring: rgba(255, 255, 255, 0.5);
-    --lg-blur: 1px;
-    --lg-bezel: 8px;
-    --lg-thickness: 16px;
-    --lg-zoom: 1.02;
-    --lg-rim-saturation: 1.6;
-    --lg-refraction: 1.05;
-    --lg-row-tint: rgba(255, 255, 255, 0.045);
-    --lg-card-tint: rgba(255, 255, 255, 0.025);
-    --lg-dialog-tint: rgba(14, 14, 18, 0.88);
-    --lg-pill-tint: rgba(18, 18, 22, 0.72);
-  }
-}
+
 
 /* Glass */
 
@@ -3563,52 +3351,74 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   transition-duration: 0s;
 }
 
-/* Glass refracting a copy of its backdrop, where the live one can't be filtered */
-
-.lg-glass[data-copy] {
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
-}
-
-.lg-glass-copy {
-  position: absolute;
-  top: 0;
-  left: 0;
-  margin: 0;
-  overflow: hidden;
-  transform-origin: 0 0;
-  pointer-events: none;
-}
-
-.lg-glass-copy > div {
-  position: absolute;
-  top: 0;
-  left: 0;
-  transform-origin: 0 0;
-}
-
 /* Button */
 
 .lg-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  white-space: nowrap;
+  flex-shrink: 0;
   gap: 8px;
-  height: 40px;
+  height: 34px;
   padding: 0 16px;
-  border: 0;
-  border-radius: 20px;
-  color: var(--lg-foreground);
+  border: 0.5px solid var(--lg-edge);
+  border-radius: 17px;
   font: inherit;
-  font-size: 14px;
+  font-size: 12.5px;
+  font-weight: 550;
+  letter-spacing: -0.01em;
+  box-sizing: border-box;
+  color: var(--lg-foreground);
+  background-color: var(--lg-highlight);
+  box-shadow: 0 1px 2px var(--lg-drop);
   cursor: pointer;
-  /* A long press keeps pressing, as on iOS, rather than selecting the label. */
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
   -webkit-touch-callout: none;
   user-select: none;
   -webkit-user-select: none;
-  transition: background-color 200ms ease;
+  transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease, box-shadow 140ms ease;
+}
+.lg-button:hover {
+  background-color: var(--lg-glass-active);
+  border-color: rgba(255, 255, 255, 0.22);
+  transform: translateY(-0.5px);
+}
+.lg-button:active {
+  transform: scale(0.98);
+}
+
+.lg-button[data-icon="only"] {
+  width: 34px;
+  height: 34px;
+  min-width: 34px;
+  padding: 0;
+  border-radius: 17px;
+}
+
+/* Destructive Action Buttons (e.g. Reset All Preferences) */
+.lg-button[data-destructive] {
+  background-color: rgba(255, 59, 48, 0.12);
+  border: 0.5px solid rgba(255, 59, 48, 0.35);
+  color: #ff453a;
+  font-weight: 590;
+}
+.lg-button[data-destructive]:hover {
+  background-color: rgba(255, 59, 48, 0.22);
+  border-color: rgba(255, 59, 48, 0.6);
+  box-shadow: 0 2px 8px rgba(255, 59, 48, 0.2);
+}
+
+/* Filled Accent Buttons */
+.lg-button[data-variant="filled"] {
+  background-color: var(--accent, var(--lg-fill));
+  border-color: transparent;
+  color: #ffffff;
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--accent, var(--lg-fill)) 35%, transparent);
+}
+.lg-button[data-variant="filled"]:hover {
+  background-color: color-mix(in srgb, var(--accent, var(--lg-fill)) 90%, #ffffff);
 }
 
 .lg-button[data-icon] {
@@ -4529,17 +4339,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 z-index: 3;
             }
 
-            .modal__footer {
-                display: flex;
-                align-items: center;
-                justify-content: flex-end;
-                gap: 10px;
-                padding: 12px 20px;
-                border-top: 0.5px solid var(--lg-separator);
-                background: transparent;
-                flex-shrink: 0;
-            }
-
             /* Tabs Panels */
             .tabs__panel {
                 display: none;
@@ -4605,41 +4404,28 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                Ensures dropdown menus ALWAYS stay on top of all other cards,
                rows, switches, sliders, and buttons in both static and floating mode
                ============================================================ */
-            :is(.card, .col-stack):has(.lg-menu-card),
-            :is(.card, .col-stack):has(.lg-menu--active),
-            :is(.card, .col-stack):has([data-phase="open"]),
+            :is(.card, .col-stack)[data-menu-open="true"],
             :is(.card, .col-stack):has([aria-expanded="true"]) {
                 z-index: 9000 !important;
             }
 
-            :is(.card__content):has(.lg-menu-card),
-            :is(.card__content):has(.lg-menu--active),
-            :is(.card__content):has([data-phase="open"]),
-            :is(.card__content):has([aria-expanded="true"]) {
+            :is(.card__content)[data-menu-open="true"] {
                 z-index: 9100 !important;
             }
 
-            :is(.field-row, .field-switch-row, .field-box, .switch):has(.lg-menu-card),
-            :is(.field-row, .field-switch-row, .field-box, .switch):has(.lg-menu--active),
-            :is(.field-row, .field-switch-row, .field-box, .switch):has([data-phase="open"]),
-            :is(.field-row, .field-switch-row, .field-box, .switch):has([aria-expanded="true"]) {
+            :is(.field-row, .field-switch-row, .field-box, .switch)[data-menu-open="true"] {
                 z-index: 9200 !important;
             }
 
-            .lg-menu-select:has(.lg-menu-card),
-            .lg-menu-select:has(.lg-menu--active),
-            .lg-menu-select:has([data-phase="open"]),
+            .lg-menu-select[data-menu-open="true"],
             .lg-menu-select:has([aria-expanded="true"]),
-            .lg-menu:has(.lg-menu-card),
-            .lg-menu:has(.lg-menu--active),
             .lg-menu[data-phase="open"],
             .lg-menu[data-open="true"] {
                 z-index: 9500 !important;
             }
 
             /* Prevent other rows/buttons from elevating on hover above open dropdown menus */
-            .tabs__panel:has(.lg-menu-card) :is(.field-row, .field-switch-row, .field-box, .switch):not(:has(.lg-menu-card)):hover,
-            .modal__body:has(.lg-menu-card) :is(.field-row, .field-switch-row, .field-box, .switch):not(:has(.lg-menu-card)):hover {
+            [data-has-menu-open="true"] :is(.field-row, .field-switch-row, .field-box, .switch):not([data-menu-open="true"]):hover {
                 transform: none !important;
                 z-index: 1 !important;
             }
@@ -4733,66 +4519,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 flex-shrink: 0;
             }
 
-            .lg-button {
-                display: inline-flex !important;
-                align-items: center !important;
-                justify-content: center !important;
-                white-space: nowrap !important;
-                flex-shrink: 0 !important;
-                height: 34px !important;
-                padding: 0 16px !important;
-                border-radius: 17px !important;
-                font-size: 12.5px !important;
-                font-weight: 550 !important;
-                letter-spacing: -0.01em !important;
-                box-sizing: border-box !important;
-                background-color: var(--lg-highlight) !important;
-                border: 0.5px solid var(--lg-edge) !important;
-                color: var(--lg-foreground) !important;
-                box-shadow: 0 1px 2px var(--lg-drop) !important;
-                transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease, box-shadow 140ms ease !important;
-            }
-            .lg-button:hover {
-                background-color: var(--lg-glass-active) !important;
-                border-color: rgba(255, 255, 255, 0.22) !important;
-                transform: translateY(-0.5px) !important;
-            }
-            .lg-button:active {
-                transform: scale(0.98) !important;
-            }
-
-            .lg-button[data-icon="only"] {
-                width: 34px !important;
-                height: 34px !important;
-                min-width: 34px !important;
-                padding: 0 !important;
-                border-radius: 17px !important;
-            }
-
-            /* Destructive Action Buttons (e.g. Reset All Preferences) */
-            .lg-button[data-destructive] {
-                background-color: rgba(255, 59, 48, 0.12) !important;
-                border: 0.5px solid rgba(255, 59, 48, 0.35) !important;
-                color: #ff453a !important;
-                font-weight: 590 !important;
-            }
-            .lg-button[data-destructive]:hover {
-                background-color: rgba(255, 59, 48, 0.22) !important;
-                border-color: rgba(255, 59, 48, 0.6) !important;
-                box-shadow: 0 2px 8px rgba(255, 59, 48, 0.2) !important;
-            }
-
-            /* Filled Accent Buttons */
-            .lg-button[data-variant="filled"] {
-                background-color: var(--accent, var(--lg-fill)) !important;
-                border-color: transparent !important;
-                color: #ffffff !important;
-                box-shadow: 0 2px 6px color-mix(in srgb, var(--accent, var(--lg-fill)) 35%, transparent) !important;
-            }
-            .lg-button[data-variant="filled"]:hover {
-                background-color: color-mix(in srgb, var(--accent, var(--lg-fill)) 90%, #ffffff) !important;
-            }
-
             /* Quick Range Presets Chips in TimeBoost */
             .field-box .lg-button {
                 height: 30px !important;
@@ -4834,7 +4560,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 box-sizing: border-box;
             }
 
-            .field-switch-content, .switch__content {
+            .field-switch-content {
                 display: flex;
                 flex-direction: column;
                 gap: 3px;
@@ -4912,8 +4638,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             }
 
             /* Services Search & Grid */
-            .services-search-bar,
-            .services-toolbar {
+.services-toolbar {
                 display: flex;
                 align-items: center;
                 gap: 8px;
@@ -5132,8 +4857,8 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 --lg-thickness: 16px !important;
                 --lg-zoom: 1.02 !important;
                 --lg-rim-saturation: 1.6 !important;
-                -webkit-backdrop-filter: blur(12px) saturate(1.4) !important;
-                backdrop-filter: blur(12px) saturate(1.4) !important;
+                -webkit-backdrop-filter: blur(var(--lg-blur, 12px)) var(--lg-filter, saturate(1.4)) !important;
+                backdrop-filter: blur(var(--lg-blur, 12px)) var(--lg-filter, saturate(1.4)) !important;
                 color: var(--lg-foreground);
                 box-shadow:
                     inset 0 1px 1px 0 rgba(255, 255, 255, 0.35),
@@ -5273,23 +4998,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 animation: heroui-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
             }
 
-            .input {
-                background: var(--lg-glass);
-                color: var(--lg-foreground);
-                border: 0.5px solid var(--lg-separator);
-                border-radius: 9999px;
-                height: 32px;
-                padding: 0 12px;
-                font-size: 13px;
-                font-family: inherit;
-                outline: none;
-                transition: border-color 150ms, box-shadow 150ms;
-            }
-            .input:focus {
-                border-color: var(--accent, var(--lg-fill));
-                box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, var(--lg-fill)) 25%, transparent);
-            }
-
             /* Pop-up Options powered by Glisse.Menu */
             .lg-menu-select {
                 display: inline-flex;
@@ -5330,7 +5038,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 flex-shrink: 0;
                 transition: transform 180ms ease;
             }
-            .lg-menu-select:has(.lg-menu-card[data-phase="open"]) .lg-select-chevron {
+            .lg-menu-select[data-menu-open="true"] .lg-select-chevron {
                 transform: rotate(180deg);
             }
             .lg-menu-select .lg-menu-glyph {
@@ -5494,7 +5202,7 @@ function getEffectiveTheme(thm) {
                 if (value) {
                     startVideoAutoSkipController();
                 } else {
-                    stopVideoAutoSkipController();
+                    // autoSkip stopped (no-op)
                 }
                 LOG('auto-skip video to questions / completion ' + (value ? 'ENABLED' : 'DISABLED'));
                 break;
@@ -5566,67 +5274,14 @@ function getEffectiveTheme(thm) {
     // Exports: Button, Glass, Input, Menu, SearchField, Slider, Switch, TabBar
     // ============================================================
 var Glisse = (() => {
-  var __defProp = Object.defineProperty;
-  var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
-  var __getOwnPropNames = Object.getOwnPropertyNames;
-  var __hasOwnProp = Object.prototype.hasOwnProperty;
-  var __export = (target, all) => {
-    for (var name in all)
-      __defProp(target, name, { get: all[name], enumerable: true });
-  };
-  var __copyProps = (to, from, except, desc) => {
-    if (from && typeof from === "object" || typeof from === "function") {
-      for (let key of __getOwnPropNames(from))
-        if (!__hasOwnProp.call(to, key) && key !== except)
-          __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
-    }
-    return to;
-  };
-  var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+  // React primitives destructuring & simplified jsx
+  const { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, createElement } = React;
 
-  // ../../../../../../private/tmp/glisse_pkg/entry.js
-  var entry_exports = {};
-  __export(entry_exports, {
-    Button: () => Button,
-    Glass: () => Glass,
-    Input: () => Input,
-    Menu: () => Menu,
-    SearchField: () => SearchField,
-    Slider: () => Slider,
-    Switch: () => Switch,
-    TabBar: () => TabBar
-  });
-
-  // ../../../../../../private/tmp/glisse_pkg/react-shim.js
-  var React = typeof window !== "undefined" && window.React ? window.React : typeof globalThis !== "undefined" && globalThis.React ? globalThis.React : {};
-  var forwardRef = React.forwardRef ? React.forwardRef.bind(React) : (fn) => fn;
-  var useCallback = (...args) => (window.React || React).useCallback(...args);
-  var useEffect = (...args) => (window.React || React).useEffect(...args);
-  var useImperativeHandle = (...args) => (window.React || React).useImperativeHandle(...args);
-  var useLayoutEffect = (...args) => (window.React || React).useLayoutEffect(...args);
-  var useRef = (...args) => (window.React || React).useRef(...args);
-  var useState = (...args) => (window.React || React).useState(...args);
-
-  // ../../../../../../private/tmp/glisse_pkg/jsx-shim.js
   function jsx(type, props, key) {
-    const R = typeof window !== "undefined" && window.React ? window.React : globalThis.React;
-    if (!props) return R.createElement(type, key !== void 0 ? { key } : null);
-    const { children, ...rest } = props;
-    const finalProps = key !== void 0 ? { ...rest, key } : rest;
-    return R.createElement(type, finalProps, children);
+    return key !== void 0 ? createElement(type, { ...props, key }) : createElement(type, props);
   }
-  function jsxs(type, props, key) {
-    const R = typeof window !== "undefined" && window.React ? window.React : globalThis.React;
-    if (!props) return R.createElement(type, key !== void 0 ? { key } : null);
-    const { children, ...rest } = props;
-    const finalProps = key !== void 0 ? { ...rest, key } : rest;
-    if (Array.isArray(children)) {
-      return R.createElement(type, finalProps, ...children);
-    }
-    return R.createElement(type, finalProps, children);
-  }
+  const jsxs = jsx;
 
-  // ../../../../../../private/tmp/glisse_pkg/package/dist/index.js
   function cx(...names) {
     return names.filter(Boolean).join(" ");
   }
@@ -5846,7 +5501,11 @@ var Glisse = (() => {
     if (target) target.append(root);
     return defs;
   }
+  const profileCache = new Map();
   function profile(bezel, thickness) {
+    const key = `${bezel}-${thickness}`;
+    const cached = profileCache.get(key);
+    if (cached) return cached;
     const samples = /* @__PURE__ */ new Float32Array(128);
     let maximum = 0;
     for (let i = 0; i < samples.length; i++) {
@@ -5857,90 +5516,142 @@ var Glisse = (() => {
       samples[i] = Math.tan(incident - refracted) * (thickness + surface * bezel);
       maximum = Math.max(maximum, samples[i]);
     }
-    return {
+    const result = {
       samples,
       maximum
     };
+    profileCache.set(key, result);
+    return result;
   }
-  function maps(width, height, radius, selection, shape) {
-    const density = 1;
+  let sharedCanvas = null;
+  let sharedCtx = null;
+  let lensIdCounter = 0;
+
+  function maps(width, height, radius, selection, shape, needDisplacement = true) {
     const bezel = shape.bezel ?? clamp$2(Math.min(width, height) * 0.12, 4, 10);
     const { samples, maximum } = profile(bezel, shape.thickness ?? clamp$2(Math.min(width, height) * 0.2, 8, 24));
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.ceil(width * density);
-    canvas.height = Math.ceil(height * density);
-    const context = canvas.getContext("2d");
-    const field = context.createImageData(canvas.width, canvas.height);
-    const shine = context.createImageData(canvas.width, canvas.height);
-    const magnify = shape.zoom > 1 ? context.createImageData(canvas.width, canvas.height) : void 0;
+    const w = Math.ceil(width);
+    const h = Math.ceil(height);
+
+    if (!sharedCanvas) {
+      sharedCanvas = document.createElement("canvas");
+      sharedCtx = sharedCanvas.getContext("2d");
+    }
+    sharedCanvas.width = w;
+    sharedCanvas.height = h;
+
+    const field = needDisplacement ? sharedCtx.createImageData(w, h) : null;
+    if (field) new Uint32Array(field.data.buffer).fill(0xFF808080);
+
+    const shine = sharedCtx.createImageData(w, h);
+    const useMagnify = needDisplacement && !selection && shape.zoom > 1;
+    const magnify = useMagnify ? sharedCtx.createImageData(w, h) : null;
     const reach = Math.max(width, height) / 2;
     const direction = selection ? 1 : -1;
-    for (let y = 0; y < canvas.height; y++) for (let x = 0; x < canvas.width; x++) {
-      const px = (x + 0.5) * width / canvas.width - width / 2;
-      const py = (y + 0.5) * height / canvas.height - height / 2;
-      const qx = Math.abs(px) - (width / 2 - radius);
-      const qy = Math.abs(py) - (height / 2 - radius);
-      const ox = Math.max(qx, 0);
-      const oy = Math.max(qy, 0);
-      const length = Math.hypot(ox, oy);
-      const distance = radius - (length + Math.min(Math.max(qx, qy), 0));
-      const nx = length > 0 ? ox / length * Math.sign(px) : qx > qy ? Math.sign(px) : 0;
-      const ny = length > 0 ? oy / length * Math.sign(py) : qx > qy ? 0 : Math.sign(py);
-      let shift = 0;
-      if (distance >= 0 && distance < bezel) {
-        const sample = distance / bezel * (samples.length - 1);
-        const lower = Math.floor(sample);
-        const a = samples[lower];
-        shift = a + (samples[Math.min(lower + 1, samples.length - 1)] - a) * (sample - lower);
-      }
-      const i = (y * canvas.width + x) * 4;
-      field.data[i] = Math.round(127.5 + direction * nx * shift / maximum * 127.5);
-      field.data[i + 1] = Math.round(127.5 + direction * ny * shift / maximum * 127.5);
-      field.data[i + 2] = 128;
-      field.data[i + 3] = 255;
-      if (magnify) {
-        magnify.data[i] = Math.round(127.5 - px / reach * 127.5);
-        magnify.data[i + 1] = Math.round(127.5 - py / reach * 127.5);
-        magnify.data[i + 2] = 128;
-        magnify.data[i + 3] = 255;
-      }
-      const light = -(nx + ny) * Math.SQRT1_2;
-      const glint = Math.max(light, 0) ** 3;
-      const reflected = Math.max(-light, 0) ** 3;
-      shine.data[i] = shine.data[i + 1] = shine.data[i + 2] = 255;
-      let alpha = 0;
-      if (distance >= 0 && selection) {
-        const d0 = (distance - 0.18) / 0.22;
-        const d1 = (distance - 0.42) / 0.22;
-        const d2 = (distance - 0.66) / 0.22;
-        const b0 = Math.exp(-(d0 * d0));
-        const b1 = Math.exp(-(d1 * d1));
-        const b2 = Math.exp(-(d2 * d2));
-        const peak = Math.max(b0, b1, b2);
-        alpha = peak * (0.06 + 0.8 * glint + 0.35 * reflected) * 0.85;
-        const invPeak = peak ? 0.35 / peak : 0;
-        shine.data[i] = Math.round(255 * (0.65 + b0 * invPeak));
-        shine.data[i + 1] = Math.round(255 * (0.65 + b1 * invPeak));
-        shine.data[i + 2] = Math.round(255 * (0.65 + b2 * invPeak));
-      } else if (distance >= 0) {
-        const rim = Math.exp(-(((distance - 0.4) / 0.38) ** 2));
-        const bloom = Math.exp(-((distance / (bezel * 0.22)) ** 2));
-        alpha = rim * (0.045 + 0.52 * glint + 0.2 * reflected) + bloom * 0.02 * glint;
-      }
-      shine.data[i + 3] = Math.round(clamp$2(alpha, 0, 1) * 255);
-    }
-    context.putImageData(field, 0, 0);
-    const displacement = canvas.toDataURL();
-    context.putImageData(shine, 0, 0);
-    const highlight = canvas.toDataURL();
-    let zoom;
+
+    let magX = null, magY = null;
     if (magnify) {
-      context.putImageData(magnify, 0, 0);
+      magX = new Uint8Array(w);
+      magY = new Uint8Array(h);
+      for (let x = 0; x < w; x++) magX[x] = Math.round(127.5 - ((x + 0.5) - width / 2) / reach * 127.5);
+      for (let y = 0; y < h; y++) magY[y] = Math.round(127.5 - ((y + 0.5) - height / 2) / reach * 127.5);
+    }
+
+    for (let y = 0; y < h; y++) {
+      const py = (y + 0.5) - height / 2;
+      const qy = Math.abs(py) - (height / 2 - radius);
+      const rowOffset = y * w * 4;
+
+      for (let x = 0; x < w; x++) {
+        const px = (x + 0.5) - width / 2;
+        const qx = Math.abs(px) - (width / 2 - radius);
+        const i = rowOffset + (x * 4);
+
+        if (qx < -bezel && qy < -bezel) {
+          if (magnify) {
+            magnify.data[i] = magX[x];
+            magnify.data[i + 1] = magY[y];
+            magnify.data[i + 2] = 128;
+            magnify.data[i + 3] = 255;
+          }
+          continue;
+        }
+
+        const ox = Math.max(qx, 0);
+        const oy = Math.max(qy, 0);
+        const length = Math.hypot(ox, oy);
+        const distance = radius - (length + Math.min(Math.max(qx, qy), 0));
+        const nx = length > 0 ? ox / length * Math.sign(px) : qx > qy ? Math.sign(px) : 0;
+        const ny = length > 0 ? oy / length * Math.sign(py) : qx > qy ? 0 : Math.sign(py);
+
+        let shift = 0;
+        if (distance >= 0 && distance < bezel) {
+          const sample = distance / bezel * (samples.length - 1);
+          const lower = Math.floor(sample);
+          const a = samples[lower];
+          shift = a + (samples[Math.min(lower + 1, samples.length - 1)] - a) * (sample - lower);
+        }
+
+        if (field) {
+          field.data[i] = Math.round(127.5 + direction * nx * shift / maximum * 127.5);
+          field.data[i + 1] = Math.round(127.5 + direction * ny * shift / maximum * 127.5);
+          field.data[i + 2] = 128;
+          field.data[i + 3] = 255;
+        }
+
+        if (magnify) {
+          magnify.data[i] = magX[x];
+          magnify.data[i + 1] = magY[y];
+          magnify.data[i + 2] = 128;
+          magnify.data[i + 3] = 255;
+        }
+
+        const light = -(nx + ny) * Math.SQRT1_2;
+        const glint = Math.max(light, 0) ** 3;
+        const reflected = Math.max(-light, 0) ** 3;
+        shine.data[i] = shine.data[i + 1] = shine.data[i + 2] = 255;
+        let alpha = 0;
+
+        if (distance >= 0 && selection) {
+          const d0 = (distance - 0.18) / 0.22;
+          const d1 = (distance - 0.42) / 0.22;
+          const d2 = (distance - 0.66) / 0.22;
+          const b0 = Math.exp(-(d0 * d0));
+          const b1 = Math.exp(-(d1 * d1));
+          const b2 = Math.exp(-(d2 * d2));
+          const peak = Math.max(b0, b1, b2);
+          alpha = peak * (0.06 + 0.8 * glint + 0.35 * reflected) * 0.85;
+          const invPeak = peak ? 0.35 / peak : 0;
+          shine.data[i] = Math.round(255 * (0.65 + b0 * invPeak));
+          shine.data[i + 1] = Math.round(255 * (0.65 + b1 * invPeak));
+          shine.data[i + 2] = Math.round(255 * (0.65 + b2 * invPeak));
+        } else if (distance >= 0) {
+          const rim = Math.exp(-(((distance - 0.4) / 0.38) ** 2));
+          const bloom = Math.exp(-((distance / (bezel * 0.22)) ** 2));
+          alpha = rim * (0.045 + 0.52 * glint + 0.2 * reflected) + bloom * 0.02 * glint;
+        }
+        shine.data[i + 3] = Math.round(clamp$2(alpha, 0, 1) * 255);
+      }
+    }
+
+    let displacement = null;
+    if (field) {
+      sharedCtx.putImageData(field, 0, 0);
+      displacement = sharedCanvas.toDataURL();
+    }
+
+    sharedCtx.putImageData(shine, 0, 0);
+    const highlight = sharedCanvas.toDataURL();
+
+    let zoom = null;
+    if (magnify) {
+      sharedCtx.putImageData(magnify, 0, 0);
       zoom = {
-        map: canvas.toDataURL(),
+        map: sharedCanvas.toDataURL(),
         scale: 2 * reach * (1 - 1 / shape.zoom)
       };
     }
+
     return {
       displacement,
       highlight,
@@ -5948,18 +5659,40 @@ var Glisse = (() => {
       scale: maximum * 2 * shape.level
     };
   }
-  function lens(width, height, radius, selection, shape) {
+
+  function lens(width, height, radius, selection, shape, filtered = true) {
     const key = Object.values({
       width,
       height,
       radius,
       selection,
+      filtered,
       ...shape
     }).join("-");
     const cached = lenses.get(key);
     if (cached) return cached;
-    const { displacement, highlight, zoom, scale } = maps(width, height, radius, selection, shape);
-    const id2 = `glisse-${lenses.size}`;
+
+    const { displacement, highlight, zoom, scale } = maps(width, height, radius, selection, shape, filtered);
+
+    if (!filtered || !displacement) {
+      const result = {
+        filter: "none",
+        rim: `url("${highlight}")`,
+        filterNode: null
+      };
+      if (lenses.size >= 50) {
+        const oldestKey = lenses.keys().next().value;
+        const oldest = lenses.get(oldestKey);
+        if (oldest && oldest.filterNode && oldest.filterNode.parentNode) {
+          oldest.filterNode.remove();
+        }
+        lenses.delete(oldestKey);
+      }
+      lenses.set(key, result);
+      return result;
+    }
+
+    const id2 = `glisse-${++lensIdCounter}`;
     const box = {
       x: 0,
       y: 0,
@@ -5979,23 +5712,12 @@ var Glisse = (() => {
       preserveAspectRatio: "none",
       result: "field"
     }));
+
     if (selection) {
       for (const [name, factor, values] of [
-        [
-          "r",
-          1.035,
-          "1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0"
-        ],
-        [
-          "g",
-          1,
-          "0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0"
-        ],
-        [
-          "b",
-          0.965,
-          "0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 1 0"
-        ]
+        ["r", 1.035, "1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0"],
+        ["g", 1, "0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0"],
+        ["b", 0.965, "0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 1 0"]
       ]) filter.append(svg("feDisplacementMap", {
         in: "SourceGraphic",
         in2: "field",
@@ -6085,6 +5807,7 @@ var Glisse = (() => {
         }));
       }
     }
+
     if (lenses.size >= 50) {
       const oldestKey = lenses.keys().next().value;
       const oldest = lenses.get(oldestKey);
@@ -6102,27 +5825,111 @@ var Glisse = (() => {
     lenses.set(key, result);
     return result;
   }
-  function fit(element, selection, filtered) {
-    const width = element.offsetWidth;
-    const height = element.offsetHeight;
-    if (!width || !height) return;
-    const style = getComputedStyle(element);
-    const corner = style.borderTopLeftRadius;
-    const radius = Math.min(width / 2, height / 2, corner.endsWith("%") ? Math.min(width, height) * parseFloat(corner) / 100 : parseFloat(corner));
-    const length = (name) => {
-      const value = parseFloat(style.getPropertyValue(name));
-      return Number.isFinite(value) ? value : void 0;
-    };
-    const { filter, rim } = lens(width, height, radius, selection, {
-      bezel: length("--lg-bezel"),
-      thickness: length("--lg-thickness"),
-      level: length("--lg-refraction") ?? 1,
-      zoom: Math.max(1, length("--lg-zoom") ?? 1),
-      saturation: Math.max(1, length("--lg-rim-saturation") ?? 1)
-    });
-    if (filtered) element.style.setProperty("--lg-filter", filter);
-    element.style.setProperty("--lg-rim", rim);
+  let cachedRootShape = null;
+  function getRootShape() {
+    if (cachedRootShape) return cachedRootShape;
+    const rootEl = (typeof uiContainerEl !== "undefined" && uiContainerEl) ||
+                   (typeof uiShadowRoot !== "undefined" && uiShadowRoot && uiShadowRoot.host) ||
+                   document.documentElement;
+    if (!rootEl) return { bezel: 8, thickness: 16, level: 1.05, zoom: 1.02, saturation: 1.6 };
+    try {
+      const style = getComputedStyle(rootEl);
+      const parseVal = (name, def) => {
+        const v = parseFloat(style.getPropertyValue(name));
+        return Number.isFinite(v) ? v : def;
+      };
+      cachedRootShape = {
+        bezel: parseVal("--lg-bezel", 8),
+        thickness: parseVal("--lg-thickness", 16),
+        level: parseVal("--lg-refraction", 1.05),
+        zoom: Math.max(1, parseVal("--lg-zoom", 1.02)),
+        saturation: Math.max(1, parseVal("--lg-rim-saturation", 1.6))
+      };
+      return cachedRootShape;
+    } catch {
+      return { bezel: 8, thickness: 16, level: 1.05, zoom: 1.02, saturation: 1.6 };
+    }
   }
+
+  const REFRACTS_BACKDROP = typeof navigator !== "undefined" && /Chrom(?:e|ium)\//.test(navigator.userAgent);
+  const dirtyRefractElements = new Map();
+  let flushScheduled = false;
+
+  function scheduleRefract(element, selection, filtered) {
+    dirtyRefractElements.set(element, { selection, filtered });
+    if (!flushScheduled) {
+      flushScheduled = true;
+      whenIdle(flushRefractBatch);
+    }
+  }
+
+  function flushRefractBatch() {
+    flushScheduled = false;
+    if (dirtyRefractElements.size === 0) return;
+
+    const entries = Array.from(dirtyRefractElements.entries());
+    dirtyRefractElements.clear();
+    const rootShape = getRootShape();
+
+    // Pass 1: READ layout & dimensions in batch
+    const batch = [];
+    for (let i = 0; i < entries.length; i++) {
+      const [element, { selection, filtered }] = entries[i];
+      if (!element.isConnected) continue;
+      const rawWidth = element.offsetWidth;
+      const rawHeight = element.offsetHeight;
+      if (!rawWidth || !rawHeight) continue;
+
+      const width = Math.round(rawWidth / 4) * 4;
+      const height = Math.round(rawHeight / 4) * 4;
+      const inlineRadius = element.style.borderRadius;
+      let corner = inlineRadius;
+      if (!corner) {
+        if (element.classList.contains("lg-button")) corner = "17px";
+        else if (element.classList.contains("lg-input")) corner = "14px";
+        else if (element.classList.contains("lg-switch") || element.classList.contains("heroui-pill")) corner = "9999px";
+        else {
+          try {
+            corner = getComputedStyle(element).borderTopLeftRadius || "12px";
+          } catch {
+            corner = "12px";
+          }
+        }
+      }
+      const radius = Math.min(width / 2, height / 2, corner.endsWith("%") ? Math.min(width, height) * parseFloat(corner) / 100 : parseFloat(corner));
+
+      const inlineBezel = parseFloat(element.style.getPropertyValue("--lg-bezel"));
+      const inlineThickness = parseFloat(element.style.getPropertyValue("--lg-thickness"));
+      const inlineRefract = parseFloat(element.style.getPropertyValue("--lg-refraction"));
+      const inlineZoom = parseFloat(element.style.getPropertyValue("--lg-zoom"));
+      const inlineSat = parseFloat(element.style.getPropertyValue("--lg-rim-saturation"));
+
+      batch.push({
+        element,
+        width,
+        height,
+        radius,
+        selection,
+        filtered,
+        shape: {
+          bezel: Number.isFinite(inlineBezel) ? inlineBezel : rootShape.bezel,
+          thickness: Number.isFinite(inlineThickness) ? inlineThickness : rootShape.thickness,
+          level: Number.isFinite(inlineRefract) ? inlineRefract : rootShape.level,
+          zoom: Math.max(1, Number.isFinite(inlineZoom) ? inlineZoom : rootShape.zoom),
+          saturation: Math.max(1, Number.isFinite(inlineSat) ? inlineSat : rootShape.saturation)
+        }
+      });
+    }
+
+    // Pass 2: WRITE styles in batch
+    for (let i = 0; i < batch.length; i++) {
+      const item = batch[i];
+      const { filter, rim } = lens(item.width, item.height, item.radius, item.selection, item.shape, item.filtered);
+      if (item.filtered) item.element.style.setProperty("--lg-filter", filter);
+      item.element.style.setProperty("--lg-rim", rim);
+    }
+  }
+
   function whenIdle(callback) {
     if ("requestIdleCallback" in window) {
       const handle2 = requestIdleCallback(callback, { timeout: 500 });
@@ -6131,7 +5938,7 @@ var Glisse = (() => {
     const handle = setTimeout(callback, 50);
     return () => clearTimeout(handle);
   }
-  var refractsBackdrop = () => /Chrom(?:e|ium)\//.test(navigator.userAgent);
+
   const refractCallbacks = new WeakMap();
   let sharedRefractObserver = null;
   function getSharedRefractObserver() {
@@ -6147,28 +5954,29 @@ var Glisse = (() => {
   }
 
   function refract(element, selection, filtered) {
-    let cancel;
     const onResize = () => {
-      cancel?.();
-      cancel = whenIdle(() => fit(element, selection, filtered));
+      scheduleRefract(element, selection, filtered);
     };
     refractCallbacks.set(element, onResize);
     const observer = getSharedRefractObserver();
     if (observer) observer.observe(element);
+    scheduleRefract(element, selection, filtered);
+
     return () => {
-      cancel?.();
+      dirtyRefractElements.delete(element);
       if (observer) observer.unobserve(element);
       refractCallbacks.delete(element);
       element.style.removeProperty("--lg-filter");
       element.style.removeProperty("--lg-rim");
     };
   }
-  function useRefraction(ref, selection = false) {
+  function useRefraction(ref, selection = false, enabled = true) {
     useEffect(() => {
+      if (!enabled) return;
       const element = ref.current;
       if (!element) return;
-      return refract(element, selection, refractsBackdrop());
-    }, [ref, selection]);
+      return refract(element, selection, REFRACTS_BACKDROP);
+    }, [ref, selection, enabled]);
   }
   var Button = /* @__PURE__ */ forwardRef(function Button2({ icon, variant = "glass", destructive, tint, children, className, style, type = "button", ...props }, forwardedRef) {
     const ref = useRef(null);
@@ -6191,10 +5999,10 @@ var Glisse = (() => {
       children: [icon, children]
     });
   });
-  var Glass = /* @__PURE__ */ forwardRef(function Glass2({ className, ...props }, forwardedRef) {
+  var Glass = /* @__PURE__ */ forwardRef(function Glass2({ className, refract = true, ...props }, forwardedRef) {
     const ref = useRef(null);
     useImperativeHandle(forwardedRef, () => ref.current);
-    useRefraction(ref);
+    useRefraction(ref, false, refract);
     return /* @__PURE__ */ jsx("div", {
       ref,
       className: cx("lg-glass", className),
@@ -6310,6 +6118,16 @@ var Glisse = (() => {
       const glyph = glyphRef.current;
       const content = contentRef.current;
       const plate = plateRef.current;
+
+      const parentRow = trigger ? trigger.closest(".field-row, .field-switch-row, .field-box, .switch") : null;
+      const parentCard = trigger ? trigger.closest(".card, .col-stack") : null;
+      const parentSelect = trigger ? trigger.closest(".lg-menu-select") : null;
+      const modalEl = trigger ? (trigger.closest(".modal, .tabs__panel, .modal__body") || (typeof uiContainerEl !== "undefined" ? uiContainerEl : null)) : null;
+
+      if (parentRow) parentRow.setAttribute("data-menu-open", "true");
+      if (parentCard) parentCard.setAttribute("data-menu-open", "true");
+      if (parentSelect) parentSelect.setAttribute("data-menu-open", "true");
+      if (modalEl) modalEl.setAttribute("data-has-menu-open", "true");
       const from = {
         width: trigger.offsetWidth,
         height: trigger.offsetHeight
@@ -6392,7 +6210,6 @@ var Glisse = (() => {
       });
       let gesture = null;
       let current = null;
-      let suppressClickUntil = 0;
       const close = (restoreFocus = true) => {
         setPhase("leaving");
         if (restoreFocus) triggerRef.current?.focus({ preventScroll: true });
@@ -6456,7 +6273,6 @@ var Glisse = (() => {
         scale.set(1);
         x.set(0);
         y.set(0);
-        suppressClickUntil = performance.now() + 500;
         if (chosen) {
           selectHandled = true;
           const item = latest.current[Number(chosen.dataset.index)];
@@ -6515,6 +6331,10 @@ var Glisse = (() => {
       card.addEventListener("keydown", key);
       document.addEventListener("pointerdown", outside, true);
       return () => {
+        if (parentRow) parentRow.removeAttribute("data-menu-open");
+        if (parentCard) parentCard.removeAttribute("data-menu-open");
+        if (parentSelect) parentSelect.removeAttribute("data-menu-open");
+        if (modalEl) modalEl.removeAttribute("data-has-menu-open");
         [
           shape,
           scale,
@@ -7176,7 +6996,16 @@ var Glisse = (() => {
       ]
     });
   }
-  return __toCommonJS(entry_exports);
+  return {
+    Button,
+    Glass,
+    Input,
+    Menu,
+    SearchField,
+    Slider,
+    Switch,
+    TabBar
+  };
 })();
 
 
@@ -7186,6 +7015,18 @@ var Glisse = (() => {
     const html = (typeof htm !== 'undefined' && typeof React !== 'undefined')
         ? htm.bind(React.createElement)
         : null;
+
+    // Hoisted static SVG icons for zero reconciliation overhead
+    const SVG_ICONS = {
+        chevron: html`<svg className="lg-select-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>`,
+        checkSelect: html`<svg className="lg-select-item-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`,
+        checkSwatch: html`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`,
+        dragHandlePill: html`<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style=${{ flexShrink: 0 }}><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>`,
+        dragHandleModal: html`<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="5 9 2 12 5 15"></polyline><polyline points="9 5 12 2 15 5"></polyline><polyline points="15 19 12 22 9 19"></polyline><polyline points="19 9 22 12 19 15"></polyline><line x1="2" y1="12" x2="22" y2="12"></line><line x1="12" y1="2" x2="12" y2="22"></line></svg>`,
+        resetPill: html`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style=${{ marginRight: '5px' }}><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg>`,
+        modalGear: html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>`,
+        closeModal: html`<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`,
+    };
 
     // Modal Compound Component (Glisse Liquid Glass Window)
     const Modal = ({ isOpen, isClosing, onClose, children }) => {
@@ -7239,7 +7080,7 @@ var Glisse = (() => {
 
     // Tabs Compound Component
     const Tabs = ({ children }) => html`<div className="tabs">${children}</div>`;
-    Tabs.Panel = React.memo(({ id, activeTab, children }) => {
+    Tabs.Panel = ({ id, activeTab, children }) => {
         const isActive = id === activeTab;
         return html`
             <div 
@@ -7251,10 +7092,10 @@ var Glisse = (() => {
                 ${children}
             </div>
         `;
-    });
+    };
 
     // Switch Row Component with Glisse Liquid Glass Switch
-    const Switch = React.memo(({ isSelected, onChange, disabled, isDisabled, size = 'md', className = '', children, onClick }) => {
+    const Switch = ({ isSelected, onChange, disabled, isDisabled, size = 'md', className = '', children, onClick }) => {
         const effectiveChecked = Boolean(isSelected);
         const effectiveDisabled = Boolean(disabled || isDisabled);
 
@@ -7285,12 +7126,12 @@ var Glisse = (() => {
                 </div>
             </div>
         `;
-    });
+    };
     Switch.Label = ({ children }) => html`<div data-slot="label">${children}</div>`;
     Switch.Description = ({ children }) => html`<div data-slot="description">${children}</div>`;
 
     // FieldRow Component (Clean Uniform Box)
-    const FieldRow = React.memo(({ className = '', style = {}, onClick, children, ...restProps }) => html`
+    const FieldRow = ({ className = '', style = {}, onClick, children, ...restProps }) => html`
         <div
             className=${`field-row ${className}`.trim()}
             style=${style}
@@ -7299,23 +7140,23 @@ var Glisse = (() => {
         >
             ${children}
         </div>
-    `);
+    `;
 
     // Card Compound Component (Clean Uniform Card)
-    const Card = React.memo(({ variant = 'secondary', className = '', children }) => html`
+    const Card = ({ variant = 'secondary', className = '', children }) => html`
         <div className=${`card card--${variant} ${className}`.trim()}>${children}</div>
-    `);
+    `;
     Card.Header = ({ className = '', children }) => html`<div className=${`card__header ${className}`.trim()}>${children}</div>`;
     Card.Title = ({ className = '', children }) => html`<div className=${`card__title ${className}`.trim()}>${children}</div>`;
     Card.Description = ({ className = '', children }) => html`<div className=${`card__description ${className}`.trim()}>${children}</div>`;
     Card.Content = ({ className = '', children }) => html`<div className=${`card__content ${className}`.trim()}>${children}</div>`;
 
     // Badge Component
-    const Badge = React.memo(({ size = 'sm', variant = 'primary', color = '', className = '', children }) => html`
+    const Badge = ({ size = 'sm', variant = 'primary', color = '', className = '', children }) => html`
         <span className=${`badge badge--${size} badge--${variant} ${color ? `badge--${color}` : ''} ${className}`}>
             ${children}
         </span>
-    `);
+    `;
 
     // GlisseSelect Component (Powered by official Kelvin Zhang Glisse.Menu)
     const GlisseSelect = React.memo(({ options, selectedKey, onSelectionChange, ariaLabel = "Options", align = "end" }) => {
@@ -7323,9 +7164,7 @@ var Glisse = (() => {
         const triggerIcon = html`
             <span className="lg-select-trigger-content">
                 <span className="lg-select-current-label">${selectedOption.label}</span>
-                <svg className="lg-select-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="m6 9 6 6 6-6"/>
-                </svg>
+${SVG_ICONS.chevron}
             </span>
         `;
 
@@ -7339,9 +7178,7 @@ var Glisse = (() => {
                             ${opt.desc ? html`<span className="lg-select-item-desc">${opt.desc}</span>` : null}
                         </span>
                         ${isSelected ? html`
-                            <svg className="lg-select-item-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                                <polyline points="20 6 9 17 4 12"></polyline>
-                            </svg>
+${SVG_ICONS.checkSelect}
                         ` : null}
                     </span>
                 `,
@@ -7401,7 +7238,7 @@ var Glisse = (() => {
     ];
 
     // Glisse Slider Wrapper
-    const Slider = React.memo(({
+    const Slider = ({
         value,
         defaultValue = 0,
         minValue = 0,
@@ -7433,7 +7270,7 @@ var Glisse = (() => {
                 </span>
             </div>
         `;
-    });
+    };
 
     // ServiceTile with Glisse Liquid Glass Switch
     const ServiceTile = React.memo(({ serviceKey, service, isChecked, onToggle }) => {
@@ -7493,6 +7330,7 @@ var Glisse = (() => {
         return html`
             <${Glisse.Glass} 
                 id="__ul-pill"
+                refract=${isMinimal}
                 className=${`heroui-pill ${isMinimal ? 'heroui-pill--minimal' : ''}`}
                 data-mode=${mode}
                 style=${pillStyle}
@@ -8017,9 +7855,7 @@ var Glisse = (() => {
             >
                 ${isSelected ? html`
                     <span style=${{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#ffffff' }}>
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-                            <polyline points="20 6 9 17 4 12"></polyline>
-                        </svg>
+${SVG_ICONS.checkSwatch}
                     </span>
                 ` : null}
             </div>
@@ -8205,11 +8041,7 @@ var Glisse = (() => {
 
                             ${isOpenModalAction ? html`
                                 <div className="field-callout" style=${{ margin: '4px 0' }}>
-                                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style=${{ flexShrink: 0 }}>
-                                        <circle cx="12" cy="12" r="10"></circle>
-                                        <line x1="12" y1="16" x2="12" y2="12"></line>
-                                        <line x1="12" y1="8" x2="12.01" y2="8"></line>
-                                    </svg>
+${SVG_ICONS.dragHandlePill}
                                     <span>Floating button is hidden because Keybind Action is set to "Open Settings Directly". Press your shortcut to toggle settings.</span>
                                 </div>
                             ` : html`
@@ -8328,12 +8160,7 @@ var Glisse = (() => {
                             <${Card.Description}>Live metric counters accumulated in this browser session.<//>
                         </div>
                         <${Glisse.Button} variant="glass" onClick=${handleReset}>
-                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style=${{ marginRight: '5px' }}>
-                                <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
-                                <path d="M21 3v5h-5"/>
-                                <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>
-                                <path d="M3 21v-5h5"/>
-                            </svg>
+${SVG_ICONS.resetPill}
                             <span>Clear Session Metrics</span>
                         <//>
                     </div>
@@ -8412,6 +8239,13 @@ var Glisse = (() => {
             <//>
         `;
     });
+
+    const SETTINGS_TAB_ITEMS = [
+        { value: 'telemetry', label: '🛡 Telemetry' },
+        { value: 'timeboost', label: '⏱ Time Boost' },
+        { value: 'preferences', label: '🎨 Preferences' },
+        { value: 'stats', label: '📊 Statistics' },
+    ];
 
     // Glisse SettingsModal (No traffic lights, authentic Glisse TabBar & Buttons)
     const SettingsModal = React.memo(({
@@ -8558,13 +8392,6 @@ var Glisse = (() => {
 
         if (!isOpen && !isClosing) return null;
 
-        const tabItems = [
-            { value: 'telemetry', label: '🛡 Telemetry' },
-            { value: 'timeboost', label: '⏱ Time Boost' },
-            { value: 'preferences', label: '🎨 Preferences' },
-            { value: 'stats', label: '📊 Statistics' },
-        ];
-
         const dialogStyle = isDraggable ? {
             left: `${pos.x}px`,
             top: `${pos.y}px`,
@@ -8588,23 +8415,13 @@ var Glisse = (() => {
                             >
                                 <div className="modal__brand">
                                     <${Modal.Icon}>
-                                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                                            <circle cx="12" cy="12" r="3"></circle>
-                                            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                                        </svg>
+${SVG_ICONS.modalGear}
                                     <//>
                                     <div>
                                         <${Modal.Heading}>UpLearn Control Panel<//>
                                         ${isDraggable ? html`
                                             <div style=${{ fontSize: '10.5px', color: 'var(--lg-muted)', display: 'flex', alignItems: 'center', gap: '4px', marginTop: '1px' }}>
-                                                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                                                    <polyline points="5 9 2 12 5 15"></polyline>
-                                                    <polyline points="9 5 12 2 15 5"></polyline>
-                                                    <polyline points="15 19 12 22 9 19"></polyline>
-                                                    <polyline points="19 9 22 12 19 15"></polyline>
-                                                    <line x1="2" y1="12" x2="22" y2="12"></line>
-                                                    <line x1="12" y1="2" x2="12" y2="22"></line>
-                                                </svg>
+${SVG_ICONS.dragHandleModal}
                                                 <span>Draggable Liquid Glass</span>
                                             </div>
                                         ` : null}
@@ -8613,7 +8430,7 @@ var Glisse = (() => {
 
                                 <div className="modal__header-nav">
                                     <${Glisse.TabBar} 
-                                        items=${tabItems}
+                                        items=${SETTINGS_TAB_ITEMS}
                                         value=${activeTab}
                                         onValueChange=${handleTabClick}
                                         style=${{ '--lg-tab-width': '124px', '--lg-tab-height': '34px' }}
@@ -8628,10 +8445,7 @@ var Glisse = (() => {
                                     aria-label="Close modal"
                                     style=${{ width: '36px', height: '36px', padding: 0 }}
                                 >
-                                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
-                                        <line x1="18" y1="6" x2="6" y2="18"></line>
-                                        <line x1="6" y1="6" x2="18" y2="18"></line>
-                                    </svg>
+${SVG_ICONS.closeModal}
                                 <//>
                             <//>
 
@@ -8720,6 +8534,7 @@ var Glisse = (() => {
                 modalStateRef.current.open = true;
                 modalStateRef.current.closing = false;
                 isModalOpenGlobal = true;
+                setAccumulatedBonus(accumulatedExtraSeconds);
                 setIsClosing(false);
                 setIsModalOpen(true);
             } else {
@@ -8770,27 +8585,27 @@ var Glisse = (() => {
 
         // Real-time reactive live stats subscription for StatusPill (zero polling)
         useEffect(() => {
-            if (settings.pillMode === 'compact' || settings.pillMode === 'full') {
-                setAppStats(Object.assign({}, stats));
-                setAccumulatedBonus(accumulatedExtraSeconds);
+            const shouldSubscribe = isModalOpen || (appSettings.pillVisible && appSettings.keybindAction !== 'open-modal' && (appSettings.pillMode === 'compact' || appSettings.pillMode === 'full'));
+            if (!shouldSubscribe) {
+                return;
             }
+            setAppStats(Object.assign({}, stats));
+            setAccumulatedBonus(accumulatedExtraSeconds);
             let lastBlocked = stats.blocked;
             let lastBoosted = stats.boosted;
             let lastAcc = accumulatedExtraSeconds;
 
             return subscribeStats((st) => {
-                if (settings.pillMode === 'compact' || settings.pillMode === 'full') {
-                    const acc = accumulatedExtraSeconds;
-                    if (st.blocked !== lastBlocked || st.boosted !== lastBoosted || acc !== lastAcc) {
-                        lastBlocked = st.blocked;
-                        lastBoosted = st.boosted;
-                        lastAcc = acc;
-                        setAppStats(Object.assign({}, st));
-                        setAccumulatedBonus(acc);
-                    }
+                const acc = accumulatedExtraSeconds;
+                if (st.blocked !== lastBlocked || st.boosted !== lastBoosted || acc !== lastAcc) {
+                    lastBlocked = st.blocked;
+                    lastBoosted = st.boosted;
+                    lastAcc = acc;
+                    setAppStats(Object.assign({}, st));
+                    setAccumulatedBonus(acc);
                 }
             });
-        }, [appSettings.pillMode]);
+        }, [isModalOpen, appSettings.pillVisible, appSettings.keybindAction, appSettings.pillMode]);
 
         const handleCloseModal = useCallback(() => {
             setModalOpenState(false);
@@ -8997,7 +8812,6 @@ var Glisse = (() => {
     function bootstrap() {
         ensureUIHost();
         ensureButton();
-        initManualButtonObserver();
         initVideoAutoSkipController();
     }
     if (document.readyState === 'loading') {
@@ -9026,11 +8840,11 @@ var Glisse = (() => {
         getCurrentVideoLesson: () => currentVideoLesson,
         skipVideoNow: (force = true) => checkAndAutoSkipVideo(force),
         handleApiResponse,
-        getLatestExamPaperData: () => latestExamPaperData,
-        getLatestUserProfile: () => latestUserProfile,
-        getLatestFeatureFlags: () => latestFeatureFlags,
-        getLatestGlobalFeatureFlags: () => latestGlobalFeatureFlags,
-        getLatestQuizFeedback: () => latestQuizFeedback,
+        getLatestExamPaperData: () => null,
+        getLatestUserProfile: () => null,
+        getLatestFeatureFlags: () => null,
+        getLatestGlobalFeatureFlags: () => null,
+        getLatestQuizFeedback: () => null,
         getQueuedSeconds: () => queuedSeconds,
         setQueuedSeconds: (secs) => {
             queuedSeconds = secs;
