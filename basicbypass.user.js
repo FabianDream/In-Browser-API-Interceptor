@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UpLearn Telemetry + Fullscreen + Tab-Switch Blocker (Hardened)
 // @namespace    https://github.com/FabianDream/In-Browser-API-Interceptor
-// @version      1.6.1
+// @version      1.6.2
 // @description  Blocks telemetry, third-party trackers, WebWorker beacons, auto-fullscreen, and tab-switch/blur detection.
 // @author       FabianDream
 // @homepageURL  https://github.com/FabianDream/In-Browser-API-Interceptor
@@ -196,22 +196,24 @@
     function classifyUrl(url) {
         const str = toUrlString(url);
         const len = str.length;
-        if (len === 0) return URL_OTHER;
-
         let start = 0;
-        const c0 = str.charCodeAt(0);
+        while (start < len && str.charCodeAt(start) <= 32) start++;
+        if (start >= len) return URL_OTHER;
+
+        const c0 = str.charCodeAt(start);
         if (c0 === 47) { // '/'
-            if (str.charCodeAt(1) !== 47) return URL_TARGET_API;
-            start = 2;
+            if (str.charCodeAt(start + 1) !== 47) return URL_TARGET_API;
+            start += 2;
         } else {
             const first = c0 | 32;
             if (first < 97 || first > 122) return URL_TARGET_API;
-            const limit = len < 32 ? len : 32;
-            for (let i = 1; i < limit; i++) {
+            const limit = start + 32 < len ? start + 32 : len;
+            let schemeEnd = 0;
+            for (let i = start + 1; i < limit; i++) {
                 const ch = str.charCodeAt(i);
                 if (ch === 58) { // ':'
                     if (i + 2 < len && str.charCodeAt(i + 1) === 47 && str.charCodeAt(i + 2) === 47) {
-                        start = i + 3;
+                        schemeEnd = i + 3;
                         break;
                     }
                     return URL_OTHER;
@@ -221,33 +223,44 @@
                     return URL_TARGET_API;
                 }
             }
-            if (start === 0) return URL_TARGET_API;
+            if (schemeEnd === 0) return URL_TARGET_API;
+            start = schemeEnd;
         }
 
         let end = start;
         let colon = -1;
         let inBracket = false;
+        let hasUpper = false;
         for (; end < len; end++) {
             const c = str.charCodeAt(end);
-            if (c === 47 || c === 63 || c === 35) break; // / ? #
+            if (c === 47 || c === 63 || c === 35 || c <= 32) break; // / ? # or control/space
             if (c === 64) { // @
                 start = end + 1;
                 colon = -1;
                 inBracket = false;
+                hasUpper = false;
             } else if (c === 91) { // [
                 inBracket = true;
             } else if (c === 93) { // ]
                 inBracket = false;
             } else if (c === 58 && !inBracket && colon === -1) { // :
                 colon = end;
+            } else if (c >= 65 && c <= 90 && colon === -1) { // A-Z
+                hasUpper = true;
             }
         }
 
         if (colon !== -1) end = colon;
         while (end > start && str.charCodeAt(end - 1) === 46) end--;
-        if (end <= start) return URL_OTHER;
+        const hostLen = end - start;
+        if (hostLen <= 0) return URL_OTHER;
 
-        const host = str.slice(start, end).toLowerCase();
+        if (!hasUpper && hostLen === API_HOST.length && str.startsWith(API_HOST, start)) {
+            return URL_TARGET_API;
+        }
+
+        const rawHost = str.slice(start, end);
+        const host = hasUpper ? rawHost.toLowerCase() : rawHost;
         if (host === API_HOST) return URL_TARGET_API;
         return hostIsTelemetry(host) ? URL_TELEMETRY : URL_OTHER;
     }
@@ -260,30 +273,26 @@
     let sharedTextDecoder = null;
 
     function bodyLooksLikeLogImproperUse(body) {
-        if (!body) return false;
-        if (typeof body !== 'string') {
-            try {
-                if (body instanceof URLSearchParams) {
-                    body = body.toString();
-                } else if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) {
-                    sharedTextDecoder ||= new TextDecoder();
-                    body = sharedTextDecoder.decode(body);
-                } else if (body instanceof FormData) {
-                    for (const [key, val] of body) {
-                        if (
-                            (typeof key === 'string' && LOG_IMPROPER_USE_RE.test(key)) ||
-                            (typeof val === 'string' && LOG_IMPROPER_USE_RE.test(val))
-                        ) return true;
-                    }
-                    return false;
-                } else {
-                    return false;
-                }
-            } catch {
-                return false;
+        if (typeof body === 'string') return LOG_IMPROPER_USE_RE.test(body);
+        if (!body || typeof body !== 'object') return false;
+        try {
+            if (body instanceof URLSearchParams) {
+                return LOG_IMPROPER_USE_RE.test(body.toString());
             }
-        }
-        return LOG_IMPROPER_USE_RE.test(body);
+            if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) {
+                sharedTextDecoder ||= new TextDecoder();
+                return LOG_IMPROPER_USE_RE.test(sharedTextDecoder.decode(body));
+            }
+            if (body instanceof FormData) {
+                for (const [key, val] of body) {
+                    if (
+                        (typeof key === 'string' && LOG_IMPROPER_USE_RE.test(key)) ||
+                        (typeof val === 'string' && LOG_IMPROPER_USE_RE.test(val))
+                    ) return true;
+                }
+            }
+        } catch {}
+        return false;
     }
 
     // ============================================================
@@ -316,17 +325,19 @@
     if (typeof HTMLImageElement  !== 'undefined') hookElementProperty(HTMLImageElement.prototype,  'src',  'img');
     if (typeof HTMLLinkElement   !== 'undefined') hookElementProperty(HTMLLinkElement.prototype,   'href', 'link');
 
+    function isUrlAttribute(name) {
+        if (name === 'src' || name === 'href') return true;
+        if (typeof name !== 'string') return false;
+        const len = name.length;
+        if (len !== 3 && len !== 4) return false;
+        const low = name.toLowerCase();
+        return low === 'src' || low === 'href';
+    }
+
     const origSetAttribute = Element.prototype.setAttribute;
     Element.prototype.setAttribute = cloak(({
         setAttribute(name, value) {
-            if (
-                (name === 'src' ||
-                    name === 'href' ||
-                    (typeof name === 'string' &&
-                        ((name.length === 3 && (name.charCodeAt(0) | 32) === 115 && name.toLowerCase() === 'src') ||
-                            (name.length === 4 && (name.charCodeAt(0) | 32) === 104 && name.toLowerCase() === 'href')))) &&
-                isTelemetryUrl(value)
-            ) {
+            if (isUrlAttribute(name) && isTelemetryUrl(value)) {
                 LOG(`blocked setAttribute(${name}):`, value);
                 return;
             }
@@ -377,15 +388,16 @@
 
     const OrigBlob = window.Blob;
     if (OrigBlob) {
-        window.Blob = patchConstructor(function Blob(blobParts, options) {
-            if (!new.target) {
-                throw new TypeError("Failed to construct 'Blob': Please use the 'new' operator");
-            }
+        window.Blob = patchConstructor(function Blob(blobParts = undefined, options = undefined) {
+            if (!new.target) return OrigBlob();
             const blob = reflectConstruct(OrigBlob, arguments, new.target);
             try {
                 if (blobParts && (Array.isArray(blobParts) || typeof blobParts[Symbol.iterator] === 'function')) {
                     for (const part of blobParts) {
-                        if (typeof part === 'string' && part.length < 1e6 && TELEMETRY_CODE_RE.test(part)) {
+                        if (
+                            (typeof part === 'string' && part.length < 1e6 && TELEMETRY_CODE_RE.test(part)) ||
+                            (typeof part === 'object' && part !== null && wsHas.call(telemetryBlobs, part))
+                        ) {
                             wsAdd.call(telemetryBlobs, blob);
                             break;
                         }
@@ -399,17 +411,15 @@
     const OrigWorker = window.Worker;
     if (OrigWorker) {
         const WORKER_DUMMY_DESCS = {
-            postMessage:    { value: cloak(({ postMessage() {} }).postMessage), writable: true, configurable: true },
+            postMessage:    { value: cloak(({ postMessage(message) {} }).postMessage), writable: true, configurable: true },
             terminate:      { value: cloak(({ terminate() {} }).terminate), writable: true, configurable: true },
             onerror:        { value: null, writable: true, configurable: true },
             onmessage:      { value: null, writable: true, configurable: true },
             onmessageerror: { value: null, writable: true, configurable: true },
         };
 
-        window.Worker = patchConstructor(function Worker(scriptURL, options) {
-            if (!new.target) {
-                throw new TypeError("Failed to construct 'Worker': Please use the 'new' operator");
-            }
+        window.Worker = patchConstructor(function Worker(scriptURL, options = undefined) {
+            if (!new.target) return OrigWorker();
             const urlStr = toUrlString(scriptURL);
             if (
                 setHas.call(telemetryBlobUrls, urlStr) ||
@@ -431,7 +441,7 @@
             extensions:     { value: '', writable: true, configurable: true },
             bufferedAmount: { value: 0, writable: true, configurable: true },
             binaryType:     { value: 'blob', writable: true, configurable: true },
-            send:           { value: cloak(({ send() {} }).send), writable: true, configurable: true },
+            send:           { value: cloak(({ send(data) {} }).send), writable: true, configurable: true },
             close:          { value: cloak(({ close() { this.readyState = 3; } }).close), writable: true, configurable: true },
             onopen:         { value: null, writable: true, configurable: true },
             onerror:        { value: null, writable: true, configurable: true },
@@ -439,10 +449,16 @@
             onmessage:      { value: null, writable: true, configurable: true },
         };
 
-        window.WebSocket = patchConstructor(function WebSocket(url, protocols) {
-            if (!new.target) {
-                throw new TypeError("Failed to construct 'WebSocket': Please use the 'new' operator");
-            }
+        function dispatchDummyWsEvent(target, evt, prop) {
+            try { target.dispatchEvent(evt); } catch {}
+            try {
+                const handler = target[prop];
+                if (typeof handler === 'function') handler.call(target, evt);
+            } catch {}
+        }
+
+        window.WebSocket = patchConstructor(function WebSocket(url, protocols = undefined) {
+            if (!new.target) return OrigWebSocket();
             const urlStr = toUrlString(url);
             if (isTelemetryUrl(urlStr)) {
                 LOG('blocked WebSocket connection:', urlStr);
@@ -453,17 +469,12 @@
                     configurable: true,
                 });
                 setTimeout(() => {
-                    try {
-                        dummy.readyState = 3;
-                        const err = new Event('error');
-                        dummy.dispatchEvent(err);
-                        if (typeof dummy.onerror === 'function') dummy.onerror.call(dummy, err);
-                        const closeEvt = typeof CloseEvent !== 'undefined'
-                            ? new CloseEvent('close', { code: 1006, reason: 'Blocked' })
-                            : new Event('close');
-                        dummy.dispatchEvent(closeEvt);
-                        if (typeof dummy.onclose === 'function') dummy.onclose.call(dummy, closeEvt);
-                    } catch {}
+                    dummy.readyState = 3;
+                    dispatchDummyWsEvent(dummy, new Event('error'), 'onerror');
+                    const closeEvt = typeof CloseEvent !== 'undefined'
+                        ? new CloseEvent('close', { code: 1006, reason: 'Blocked' })
+                        : new Event('close');
+                    dispatchDummyWsEvent(dummy, closeEvt, 'onclose');
                 }, 0);
                 return dummy;
             }
@@ -477,7 +488,7 @@
     const origFetch = typeof window.fetch === 'function' ? window.fetch : null;
     if (origFetch) {
         window.fetch = cloak(({
-            fetch(input, init) {
+            fetch(input, init = undefined) {
                 try {
                     const kind = classifyUrl(input);
                     if (kind === URL_TELEMETRY) {
@@ -489,17 +500,13 @@
                         const body = init && init.body;
                         let asyncSource = null;
 
-                        if (typeof body === 'string') {
-                            if (LOG_IMPROPER_USE_RE.test(body)) {
+                        if (body != null) {
+                            if (bodyLooksLikeLogImproperUse(body)) {
                                 LOG('dropped LogImproperUse (fetch)');
                                 return Promise.resolve(syntheticOk());
                             }
-                        } else if (body != null) {
                             if (typeof body.text === 'function') {
                                 asyncSource = body;
-                            } else if (bodyLooksLikeLogImproperUse(body)) {
-                                LOG('dropped LogImproperUse (fetch)');
-                                return Promise.resolve(syntheticOk());
                             }
                         } else if (typeof Request !== 'undefined' && input instanceof Request && input.body != null && !input.bodyUsed) {
                             asyncSource = input.clone();
@@ -623,7 +630,7 @@
         }).open);
 
         OrigXHR.prototype.send = cloak(({
-            send(body) {
+            send(body = undefined) {
                 try {
                     const st = wmGet.call(xhrState, this);
                     if (st) {
@@ -659,7 +666,7 @@
     if (typeof navigator.sendBeacon === 'function') {
         const origBeacon = navigator.sendBeacon;
         navigator.sendBeacon = cloak(({
-            sendBeacon(url, data) {
+            sendBeacon(url, data = undefined) {
                 try {
                     const kind = classifyUrl(url);
                     if (kind === URL_TELEMETRY) {
@@ -680,6 +687,7 @@
     // 5. FULLSCREEN, VISIBILITY, FOCUS & EVENT SUPPRESSION
     // ============================================================
     const DocProto  = typeof Document !== 'undefined' ? Document.prototype : null;
+    const WinProto  = typeof Window !== 'undefined' ? Window.prototype : null;
     const docTarget = DocProto || document;
 
     const DOC_SPOOF_SPECS = [
@@ -711,8 +719,8 @@
         'webkitfullscreenerror',
     ]);
 
-    const PROTECTED_DOC_PROPS = new Set(['hasFocus']);
-    const PROTECTED_WIN_PROPS = new Set();
+    const PROTECTED_DOC_PROPS = new Set(['hasFocus', 'addEventListener']);
+    const PROTECTED_WIN_PROPS = new Set(['addEventListener']);
 
     const docSpoofDescs = {
         hasFocus: {
@@ -722,6 +730,7 @@
             configurable: true,
         },
     };
+    const winSpoofDescs = {};
 
     for (let i = 0; i < DOC_SPOOF_SPECS.length; i++) {
         const [prop, val] = DOC_SPOOF_SPECS[i];
@@ -749,7 +758,7 @@
         }
         if (inWin) {
             setAdd.call(PROTECTED_WIN_PROPS, prop);
-            try { origDefineProperty(window, prop, desc); } catch {}
+            winSpoofDescs[prop] = desc;
         }
     }
 
@@ -757,6 +766,14 @@
         origDefineProperties(docTarget, docSpoofDescs);
     } catch {
         try { origDefineProperties(document, docSpoofDescs); } catch {}
+    }
+
+    try {
+        origDefineProperties(window, winSpoofDescs);
+    } catch {
+        for (const prop of Object.keys(winSpoofDescs)) {
+            try { origDefineProperty(window, prop, winSpoofDescs[prop]); } catch {}
+        }
     }
 
     const FS_METHODS = [
@@ -795,7 +812,7 @@
     const rawWin       = (winDesc && winDesc.value) || window;
 
     const patchedAddEventListener = cloak(({
-        addEventListener(type, listener, options) {
+        addEventListener(type, listener, options = undefined) {
             if (
                 (this === document || this === rawWin || this === window || this == null) &&
                 setHas.call(SUPPRESSED_EVENTS, type)
@@ -843,7 +860,7 @@
     // ============================================================
     function getProtectedSet(target) {
         if (target === document || target === DocProto) return PROTECTED_DOC_PROPS;
-        if (target === window || target === rawWin) return PROTECTED_WIN_PROPS;
+        if (target === window || target === rawWin || (WinProto !== null && target === WinProto)) return PROTECTED_WIN_PROPS;
         return null;
     }
 
