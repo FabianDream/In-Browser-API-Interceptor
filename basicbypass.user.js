@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UpLearn Telemetry + Fullscreen + Tab-Switch Blocker (Hardened)
 // @namespace    https://github.com/FabianDream/In-Browser-API-Interceptor
-// @version      1.6.2
+// @version      1.6.3
 // @description  Blocks telemetry, third-party trackers, WebWorker beacons, auto-fullscreen, and tab-switch/blur detection.
 // @author       FabianDream
 // @homepageURL  https://github.com/FabianDream/In-Browser-API-Interceptor
