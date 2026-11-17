@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UpLearn i think
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
-// @version      3.9.2
+// @version      3.9.3
 // @description  hi
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
