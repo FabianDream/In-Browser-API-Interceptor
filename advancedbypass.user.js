@@ -1,9 +1,8 @@
 // ==UserScript==
-// @name         UpLearn Telemetry Blocker & TimeSpent Booster
+// @name         UpLearn i think
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
 // @version      3.9.2
-// @description  Configurable telemetry blocking with detailed verbose logging, aggressive console-noise suppression, dedicated LogImproperUse logging, full request body capture, Jitsu packet inspection, Jitsu suppress toggle; unified GraphQL data stream, windowed multitasking feature flag transformer, local LogEvent & private search handlers, native stealth cloaking; random-range time boost; inline manual "Add time" question button for all question types; full video watch completion toggle; auto-skip video to 1 second before completion; add full video duration to timeSpent; dark mode; full control panel UI
-// @author       you
+// @description  hi
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
 // @grant        none
@@ -46,6 +45,7 @@
     const mapDel               = Map.prototype.delete;
     const mapKeys              = Map.prototype.keys;
     const sharedTextDecoder    = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
+    const sharedTextEncoder    = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
     const rawWin               = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || (window && window.window) || window;
 
     const cloakedFns = new WeakMap();
@@ -68,6 +68,17 @@
                 configurable: true,
             });
         } catch {}
+        const staticProps = origGetOwnPropNames(Orig);
+        for (let i = 0; i < staticProps.length; i++) {
+            const prop = staticProps[i];
+            if (prop === 'length' || prop === 'name' || prop === 'prototype' || prop === 'arguments' || prop === 'caller') continue;
+            if (!origGetOwnPropDesc(Patched, prop)) {
+                try {
+                    const desc = origGetOwnPropDesc(Orig, prop);
+                    if (desc) origDefineProperty(Patched, prop, desc);
+                } catch {}
+            }
+        }
         return cloak(Patched, name);
     }
 
@@ -167,6 +178,8 @@
         blockDomElements:          true,
         suppressConsoleNoise:      true,
         timeBoostEnabled:          true,
+        dynamicTimeEnabled:        true,
+        predictFinalCallEnabled:   true,
         extraSecondsMin:           30,
         extraSecondsMax:           90,
         manualTimeButtonEnabled:   true,
@@ -196,6 +209,8 @@
     ]);
 
     const BOOLEAN_SETTING_KEYS = [
+        'dynamicTimeEnabled',
+        'predictFinalCallEnabled',
         'manualTimeButtonEnabled',
         'manualTimeStacksWithAuto',
         'fullVideoWatchedEnabled',
@@ -526,7 +541,20 @@
 
     function matchAnyTelemetryService(url) {
         if (!url) return null;
-        if (typeof url === 'string' && url.charCodeAt(0) === 47 && url.charCodeAt(1) !== 47) return null;
+        if (typeof url === 'string') {
+            const c0 = url.charCodeAt(0);
+            if (c0 === 47 && url.charCodeAt(1) !== 47) return null;
+            if (c0 === 35 || c0 === 63) return null; // '#...' or '?...'
+            if (url.length >= 5 && url.charCodeAt(4) === 58) {
+                const c0l = c0 | 32;
+                if (
+                    (c0l === 100 && (url.charCodeAt(1) | 32) === 97 && (url.charCodeAt(2) | 32) === 116 && (url.charCodeAt(3) | 32) === 97) ||
+                    (c0l === 98 && (url.charCodeAt(1) | 32) === 108 && (url.charCodeAt(2) | 32) === 111 && (url.charCodeAt(3) | 32) === 98)
+                ) {
+                    return null;
+                }
+            }
+        }
         const h = hostOf(url);
         if (!h) return null;
         if (h === API_HOST || h === getPageHost()) return null;
@@ -557,13 +585,17 @@
         return found;
     }
 
-    function isServiceMatchBlocked(m) {
-        if (!m) return false;
+    function isServiceEnabledIn(cfg, key) {
+        if (!cfg) return false;
         // Jitsu is controlled by settings.suppressJitsu (synced with telemetryServices.jitsu and presets)
-        if (m.key === 'jitsu') {
-            return !!(settings.suppressJitsu && (!settings.telemetryServices || settings.telemetryServices.jitsu !== false));
+        if (key === 'jitsu') {
+            return !!(cfg.suppressJitsu && (!cfg.telemetryServices || cfg.telemetryServices.jitsu !== false));
         }
-        return !!(settings.telemetryServices && settings.telemetryServices[m.key]);
+        return !!(cfg.telemetryServices && cfg.telemetryServices[key]);
+    }
+
+    function isServiceMatchBlocked(m) {
+        return !!m && isServiceEnabledIn(settings, m.key);
     }
 
     function matchTelemetryService(url) {
@@ -647,6 +679,7 @@
         groupExtra: 0, fullscreenBlocked: 0, consoleSuppressed: 0,
         logImproperUseBlocked: 0, jitsuPackets: 0, manualBoosted: 0,
         videosMaxed: 0, videosSkipped: 0, videoTimeAdded: 0,
+        finalCallsModified: 0, questionsIdentified: 0,
     };
 
     const statsListeners = new Set();
@@ -698,13 +731,13 @@
         return new RegExp(parts.join('|'), 'i');
     })();
 
+    const COMBINED_NOISE_RE = new RegExp(ALWAYS_NOISE_RE.source + '|' + JITSU_NOISE_RE.source, 'i');
+
     function textMatchesNoise(text) {
         if (typeof text !== 'string' || !text) return false;
-        if (ALWAYS_NOISE_RE.test(text)) return true;
         // If Jitsu is being ALLOWED (suppressJitsu === false), don't silence its own
         // log lines — the user asked to see what it's doing.
-        if (settings.suppressJitsu && JITSU_NOISE_RE.test(text)) return true;
-        return false;
+        return settings.suppressJitsu ? COMBINED_NOISE_RE.test(text) : ALWAYS_NOISE_RE.test(text);
     }
 
     function argsAreNoise(args, startIndex = 0) {
@@ -768,9 +801,9 @@
         return b.slice(0, max) + `… [+${b.length - max} more chars]`;
     }
 
-    function reportBlock(kind, url, details) {
+    function reportBlock(kind, url, details, matchedSvc) {
         if (settings.logLevel === 'silent') return;
-        const m = matchTelemetryService(url);
+        const m = matchedSvc !== undefined ? matchedSvc : matchTelemetryService(url);
         const svcLabel = m ? m.label : 'unmatched';
         const host = m ? m.host : hostOf(url);
 
@@ -1015,17 +1048,21 @@
             const setterName = 'set ' + prop;
             const setter = ({
                 [setterName](val) {
-                    if (settings.blockDomElements && isTelemetryUrl(val)) {
-                        bumpStat('blocked');
-                        reportBlock(`<${tag}>.${prop} assignment`, toUrlString(val), { element: tag });
-                        return '';
-                    }
-                    if (settings.logLevel === 'verbose' && val) {
-                        const m = matchAnyTelemetryService(val);
-                        if (m && !settings.telemetryServices[m.key]) {
-                            reportAllow(`<${tag}>.${prop}`, toUrlString(val), `service "${m.label}" disabled`);
-                        } else if (m && m.key === 'jitsu' && !settings.suppressJitsu) {
-                            reportAllow(`<${tag}>.${prop}`, toUrlString(val), `service "${m.label}" not suppressed`);
+                    const anyM = (settings.blockDomElements || settings.logLevel === 'verbose') && val
+                        ? matchAnyTelemetryService(val)
+                        : null;
+                    if (anyM) {
+                        if (settings.blockDomElements && isServiceMatchBlocked(anyM)) {
+                            bumpStat('blocked');
+                            reportBlock(`<${tag}>.${prop} assignment`, toUrlString(val), { element: tag }, anyM);
+                            return '';
+                        }
+                        if (settings.logLevel === 'verbose') {
+                            if (!settings.telemetryServices[anyM.key]) {
+                                reportAllow(`<${tag}>.${prop}`, toUrlString(val), `service "${anyM.label}" disabled`);
+                            } else if (anyM.key === 'jitsu' && !settings.suppressJitsu) {
+                                reportAllow(`<${tag}>.${prop}`, toUrlString(val), `service "${anyM.label}" not suppressed`);
+                            }
                         }
                     }
                     if (arguments.length === 1) return desc.set.call(this, val);
@@ -1073,12 +1110,15 @@
         const origSetAttribute = Element.prototype.setAttribute;
         const patchedSetAttribute = ({
             setAttribute(qualifiedName, value) {
-                if (settings.blockDomElements && isSrcOrHref(qualifiedName) && isTelemetryUrl(value)) {
-                    bumpStat('blocked');
-                    reportBlock(`setAttribute("${qualifiedName}")`, toUrlString(value), {
-                        element: this.tagName ? this.tagName.toLowerCase() : 'unknown',
-                    });
-                    return;
+                if (settings.blockDomElements && isSrcOrHref(qualifiedName)) {
+                    const m = matchTelemetryService(value);
+                    if (m) {
+                        bumpStat('blocked');
+                        reportBlock(`setAttribute("${qualifiedName}")`, toUrlString(value), {
+                            element: this.tagName ? this.tagName.toLowerCase() : 'unknown',
+                        }, m);
+                        return;
+                    }
                 }
                 if (arguments.length === 2) return origSetAttribute.call(this, qualifiedName, value);
                 return reflectApply(origSetAttribute, this, arguments);
@@ -1098,13 +1138,14 @@
             const rawTag = el.tagName;
             if (rawTag === 'SCRIPT' || rawTag === 'IFRAME') {
                 const src = el.src || (typeof el.getAttribute === 'function' ? el.getAttribute('src') : '');
-                if (isTelemetryUrl(src)) {
+                const m = matchTelemetryService(src);
+                if (m) {
                     bumpStat('blocked');
                     const tag = rawTag.toLowerCase();
                     reportBlock(`DOM injection (<${tag}>)`, src, {
                         element: tag,
                         nodeId: el.id || '(none)',
-                    });
+                    }, m);
                     el.remove();
                     return true;
                 }
@@ -1124,7 +1165,9 @@
                 const added = m.addedNodes;
                 for (let j = 0; j < added.length; j++) {
                     const node = added[j];
-                    if (!node || node.nodeType !== 1 || node === uiHostEl) continue;
+                    if (!node || node.nodeType !== 1 || node === uiHostEl || node.id === MANUAL_BUTTON_ID) continue;
+                    const isHtmlNode = !node.namespaceURI || node.namespaceURI === 'http://www.w3.org/1999/xhtml';
+                    if (!isHtmlNode) continue;
 
                     if (blockDom) {
                         if (!checkAndBlockTelemetryElement(node)) {
@@ -1147,8 +1190,9 @@
                     const removed = m.removedNodes;
                     for (let j = 0; j < removed.length; j++) {
                         const node = removed[j];
-                        if (!node || node.nodeType !== 1 || node === uiHostEl) continue;
-                        if (isRelevantQuestionMutationNode(node)) {
+                        if (!node || node.nodeType !== 1 || node === uiHostEl || node.id === MANUAL_BUTTON_ID) continue;
+                        const isHtmlNode = !node.namespaceURI || node.namespaceURI === 'http://www.w3.org/1999/xhtml';
+                        if (isHtmlNode && isRelevantQuestionMutationNode(node)) {
                             needButtonCheck = false;
                             scheduleEnsureButton();
                             break;
@@ -1166,6 +1210,18 @@
     // ============================================================
     // WEBSOCKET BLOCKER
     // ============================================================
+    const EVENT_TARGET_FALLBACK_DESCS = typeof EventTarget !== 'undefined' && EventTarget.prototype ? {
+        addEventListener:    { value: EventTarget.prototype.addEventListener, writable: true, configurable: true },
+        removeEventListener: { value: EventTarget.prototype.removeEventListener, writable: true, configurable: true },
+        dispatchEvent:       { value: EventTarget.prototype.dispatchEvent, writable: true, configurable: true },
+    } : null;
+
+    function ensureDummyEventTarget(dummy) {
+        if (typeof dummy.dispatchEvent !== 'function' && EVENT_TARGET_FALLBACK_DESCS) {
+            origDefineProperties(dummy, EVENT_TARGET_FALLBACK_DESCS);
+        }
+    }
+
     try {
         const OrigWebSocket = window.WebSocket;
         if (OrigWebSocket) {
@@ -1178,9 +1234,10 @@
                     throw new TypeError("Failed to construct 'WebSocket': Please use the 'new' operator");
                 }
                 const urlStr = toUrlString(url);
-                if (settings.blockWebSockets && isTelemetryUrl(urlStr)) {
+                const wsMatch = settings.blockWebSockets ? matchTelemetryService(urlStr) : null;
+                if (wsMatch) {
                     bumpStat('blocked');
-                    reportBlock('WebSocket', urlStr, { protocols: protocols || '(none)' });
+                    reportBlock('WebSocket', urlStr, { protocols: protocols || '(none)' }, wsMatch);
                     const dummy = reflectConstruct(EventTarget, [], new.target || OrigWebSocket);
                     origDefineProperties(dummy, {
                         readyState:     { value: wsClosedState, enumerable: true, configurable: true },
@@ -1196,13 +1253,7 @@
                         onclose:        { value: null, writable: true, enumerable: true, configurable: true },
                         onmessage:      { value: null, writable: true, enumerable: true, configurable: true },
                     });
-                    if (typeof dummy.dispatchEvent !== 'function' && typeof EventTarget !== 'undefined') {
-                        origDefineProperties(dummy, {
-                            addEventListener:    { value: EventTarget.prototype.addEventListener, writable: true, configurable: true },
-                            removeEventListener: { value: EventTarget.prototype.removeEventListener, writable: true, configurable: true },
-                            dispatchEvent:       { value: EventTarget.prototype.dispatchEvent, writable: true, configurable: true },
-                        });
-                    }
+                    ensureDummyEventTarget(dummy);
                     setTimeout(() => {
                         try {
                             const errEv = new Event('error');
@@ -1224,20 +1275,7 @@
                 return reflectConstruct(OrigWebSocket, arguments, new.target);
             };
 
-            patchConstructor(OrigWebSocket, PatchedWebSocket, 'WebSocket');
-            // Preserve all own static constants (CONNECTING, OPEN, CLOSING, CLOSED) and descriptors
-            const staticProps = origGetOwnPropNames(OrigWebSocket);
-            for (let i = 0; i < staticProps.length; i++) {
-                const prop = staticProps[i];
-                if (prop === 'length' || prop === 'name' || prop === 'prototype' || prop === 'arguments' || prop === 'caller') continue;
-                if (!origGetOwnPropDesc(PatchedWebSocket, prop)) {
-                    try {
-                        const desc = origGetOwnPropDesc(OrigWebSocket, prop);
-                        if (desc) origDefineProperty(PatchedWebSocket, prop, desc);
-                    } catch {}
-                }
-            }
-            window.WebSocket = PatchedWebSocket;
+            window.WebSocket = patchConstructor(OrigWebSocket, PatchedWebSocket, 'WebSocket');
             VLOG('WebSocket hook installed');
         }
     } catch (e) { WARN('websocket patch failed', e); }
@@ -1370,13 +1408,7 @@
                     reportBlock('WebWorker', urlStr);
                     const dummy = reflectConstruct(EventTarget, [], new.target || OrigWorker);
                     origDefineProperties(dummy, WORKER_DUMMY_DESCS);
-                    if (typeof dummy.dispatchEvent !== 'function' && typeof EventTarget !== 'undefined') {
-                        origDefineProperties(dummy, {
-                            addEventListener:    { value: EventTarget.prototype.addEventListener, writable: true, configurable: true },
-                            removeEventListener: { value: EventTarget.prototype.removeEventListener, writable: true, configurable: true },
-                            dispatchEvent:       { value: EventTarget.prototype.dispatchEvent, writable: true, configurable: true },
-                        });
-                    }
+                    ensureDummyEventTarget(dummy);
                     return dummy;
                 }
                 return reflectConstruct(OrigWorker, arguments, new.target);
@@ -1449,10 +1481,16 @@
     if (settings.darkMode) ensureDarkModeStyles();
     applyDarkMode();
 
-    try {
-        const obs = new MutationObserver(applyDarkMode);
-        obs.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
-    } catch {}
+    let darkObserverAttached = false;
+    function ensureDarkObserver() {
+        if (darkObserverAttached || !document.documentElement) return;
+        try {
+            const obs = new MutationObserver(applyDarkMode);
+            obs.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+            darkObserverAttached = true;
+        } catch {}
+    }
+    ensureDarkObserver();
 
     // ============================================================
     // REQUEST BODY CLASSIFICATION & MUTATION INTERCEPTION
@@ -1490,12 +1528,8 @@
         return null;
     }
 
-    function getBlockedMutationKind(body) {
-        return getBlockedMutationKindFromText(extractSyncBodyText(body));
-    }
-
     const REQ_TRANSFORM_RE = /\b(?:GetFeatureFlags|GetFeatureFlagsEnabledGlobally|currentUser)\b/i;
-    const REQ_INGEST_RE = /\b(?:GetVideoLesson|AnswerInVideoQuestion|videoLesson|subsection)\b/i;
+    const REQ_INGEST_RE = /\b(?:GetVideoLesson|GetProgressQuizGroup|GetStrengthenQuiz|GetSpacedPracticeQuizGroup|GetSubsectionDiagnosticQuiz|GetExamHowToLesson|GetExamPaper|GetExamPracticeSessionReview|GetExamQuestion|GetSubsectionSummary|GetSubsectionOverviewData|GetSubsectionActivity|GetCurrentActivityDetails|GetQuizContent|GetStandaloneQuestion|StartExamPracticeSession|AnswerProgressQuizQuestion|AnswerStrengthenQuizQuestion|AnswerSpacedPracticeQuizQuestion|AnswerDiagnosticQuestion|AnswerPreVideoQuestion|AnswerInVideoQuestion|AnswerExamQuestion|SaveExamQuestionMarks|SaveExamPracticeAnswers|SaveExamPracticeQuestionMarks|EvaluateQuizContentResponses|EvaluateStandaloneQuestionResponses|videoLesson|progressQuizGroup|spacedPracticeQuiz|strengthenQuiz|diagnosticQuiz|examHowToLesson|examPaper|examQuestion|subsection|quizContent|standaloneQuestion)\b/i;
 
     function classifyApiRequest(body) {
         if (!body || typeof body !== 'string' || body.length > MAX_SCAN) return 'none';
@@ -1594,7 +1628,7 @@
     // ============================================================
     // UNIFIED GRAPHQL DATA STREAM FILTER
     // ============================================================
-    const GRAPHQL_INGEST_RE = /\b(?:videoLessons?|answerInVideoQuestion)\b/;
+    const GRAPHQL_INGEST_RE = /\b(?:videoLessons?|answerInVideoQuestion|answerPreVideoQuestion|progressQuizGroup|answerProgressQuizQuestion|spacedPracticeQuiz|answerSpacedPracticeQuizQuestion|strengthenQuiz|diagnosticQuiz|answerDiagnosticQuestion|examHowToLesson|answerExamQuestion|saveExamQuestionMarks|examPaper|startExamPracticeSession|examPracticeSession|saveExamPracticeAnswers|saveExamPracticeQuestionMarks|examQuestion|quizContent|evaluateQuizContentResponses|standaloneQuestion|evaluateStandaloneQuestionResponses|subsection|experimentGroup|featureFlagsEnabledGlobally|featureFlags|currentUser)\b/;
 
     function shouldIngestGraphQLResponse(rt) {
         return typeof rt === 'string' && GRAPHQL_INGEST_RE.test(rt);
@@ -1615,7 +1649,6 @@
         'AnswerStrengthenQuizQuestion',
         'AnswerExamQuestion',
         'SaveExamQuestionMarks',
-        'SaveExamPracticeAnswers',
         'SaveExamPracticeQuestionMarks',
     ]);
 
@@ -1626,6 +1659,7 @@
         'CompleteDiagnosticQuizSession',
         'CompleteExamQuestionWalkthrough',
         'CompleteExamPracticeSession',
+        'SaveExamPracticeAnswers',
     ]);
 
     const KNOWN_LESSON_OPS = new Set([
@@ -1634,13 +1668,16 @@
         'CompleteArticleLesson',
     ]);
 
-    const OP_ANSWER_QUESTION_RE   = /^Answer.*Question$/i;
-    const OP_SAVE_EXAM_RE         = /^SaveExam/i;
-    const QSTR_ANSWER_QUESTION_RE = /answer[A-Za-z0-9]*Question/i;
-    const QSTR_SAVE_EXAM_RE       = /saveExam[A-Za-z0-9]*/i;
+    const OP_ANSWER_QUESTION_RE    = /^Answer.*Question$/i;
+    const OP_SAVE_EXAM_RE          = /^SaveExam.*Marks$/i;
+    const QSTR_ANSWER_QUESTION_RE  = /answer[A-Za-z0-9]*Question/i;
+    const QSTR_SAVE_EXAM_RE        = /saveExam[A-Za-z0-9]*Marks/i;
 
-    const OP_COMPLETE_GROUP_RE    = /^Complete.*(Quiz|Group|Session|Walkthrough)$/i;
-    const QSTR_COMPLETE_GROUP_RE  = /complete[A-Za-z0-9]*(Quiz|Group|Session|Walkthrough)/i;
+    const OP_COMPLETE_GROUP_RE     = /^Complete.*(Quiz|Group|Session|Walkthrough)$/i;
+    const QSTR_COMPLETE_GROUP_RE   = /complete[A-Za-z0-9]*(Quiz|Group|Session|Walkthrough)|saveExamPracticeAnswers/i;
+
+    const OP_COMPLETE_LESSON_RE    = /^Complete(VideoLesson|SubsectionSummary|ArticleLesson)$/i;
+    const QSTR_COMPLETE_LESSON_RE  = /\bcomplete(VideoLesson|SubsectionSummary|ArticleLesson)\b/i;
 
     function isQuestionAnswerOp(opName, qStr) {
         if (KNOWN_QUESTION_OPS.has(opName)) return true;
@@ -1658,6 +1695,15 @@
         if (OP_COMPLETE_GROUP_RE.test(opName)) return true;
         if (qStr) {
             if (QSTR_COMPLETE_GROUP_RE.test(qStr)) return true;
+        }
+        return false;
+    }
+
+    function isLessonCompletionOp(opName, qStr) {
+        if (KNOWN_LESSON_OPS.has(opName)) return true;
+        if (OP_COMPLETE_LESSON_RE.test(opName)) return true;
+        if (qStr) {
+            if (QSTR_COMPLETE_LESSON_RE.test(qStr)) return true;
         }
         return false;
     }
@@ -1756,18 +1802,820 @@
     }
 
     /* ------------------------------------------------------------
+     * Question Content Analyzer, Session Context & Final Call Predictor
+     * ------------------------------------------------------------ */
+    const QUESTION_REGISTRY_MAX = 500;
+    const questionRegistry      = new Map();
+    const questionAliasMap      = new Map();
+    let activeSession           = null;
+    let lastSubmittedQuestionId = null;
+    let contextRevision         = 0;
+
+    let latestExamPaperData        = null;
+    let latestUserProfile          = null;
+    let latestFeatureFlags         = null;
+    let latestGlobalFeatureFlags   = null;
+    let latestQuizFeedback         = null;
+
+    function bumpContextRevision() {
+        contextRevision += 1;
+        notifyStatsChange();
+    }
+
+    const HTML_TAG_RE       = /<[^>]*>/g;
+    const HTML_ENTITY_RE    = /&(?:nbsp|amp|lt|gt|quot|#39);/gi;
+    const LATEX_CMD_RE      = /\\(?:frac|sqrt|times|div|cdot|pm|text|mathrm|mathbf)\b/g;
+    const LATEX_MARKER_RE   = /[$\\{}[\]]/g;
+    const MATH_TOKEN_RE     = /(\$\$[\s\S]*?\$\$|\$[^$]+\$|\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\]|\\(?:frac|sqrt|int|sum|cdot|times|div|pm|leq|geq|neq|approx|theta|alpha|beta|gamma|Delta|pi|sin|cos|tan|log|ln|lim|vec|hat|bar|overline)\b|\^[{\w-]|\b\d+(?:\.\d+)?\s*[×÷+\-=]\s*\d+)/g;
+    const HTML_ENTITY_MAP   = { '&nbsp;': ' ', '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" };
+    const replaceHtmlEntity = (m) => HTML_ENTITY_MAP[m.toLowerCase()] || m;
+
+    function stripMarkupToPlainText(str) {
+        if (str == null) return '';
+        let s = String(str);
+        if (!s) return '';
+        if (s.indexOf('<') !== -1) s = s.replace(HTML_TAG_RE, ' ');
+        if (s.indexOf('&') !== -1) s = s.replace(HTML_ENTITY_RE, replaceHtmlEntity);
+        if (s.indexOf('\\') !== -1) s = s.replace(LATEX_CMD_RE, ' ');
+        return s.replace(LATEX_MARKER_RE, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function countWordsInClean(clean) {
+        const len = clean.length;
+        if (len === 0) return 0;
+        let words = 1;
+        for (let i = 0; i < len; i++) {
+            if (clean.charCodeAt(i) === 32) words++;
+        }
+        return words;
+    }
+
+    function countWords(str) {
+        return countWordsInClean(stripMarkupToPlainText(str));
+    }
+
+    function countMathTokens(str) {
+        if (str == null) return 0;
+        const noTags = String(str).replace(HTML_TAG_RE, ' ');
+        MATH_TOKEN_RE.lastIndex = 0;
+        let count = 0;
+        while (MATH_TOKEN_RE.exec(noTags) !== null) count++;
+        return count;
+    }
+
+    function countDropdownOptions(raw) {
+        if (!raw) return 0;
+        if (Array.isArray(raw)) {
+            let n = 0;
+            for (let i = 0; i < raw.length; i++) {
+                n += Array.isArray(raw[i]) ? raw[i].length : 1;
+            }
+            return n;
+        }
+        if (typeof raw === 'string') {
+            try {
+                const parsed = JSON.parse(raw);
+                return countDropdownOptions(parsed);
+            } catch {
+                return raw.split(',').filter(Boolean).length;
+            }
+        }
+        if (typeof raw === 'object') {
+            return Object.keys(raw).length;
+        }
+        return 0;
+    }
+
+    function setBoundedMapEntry(map, key, value, maxSize) {
+        if (key == null) return;
+        const k = String(key);
+        if (map.has(k)) {
+            map.delete(k);
+        } else if (map.size >= maxSize) {
+            map.delete(map.keys().next().value);
+        }
+        map.set(k, value);
+    }
+
+    function lookupQuestion(id) {
+        if (id == null) return null;
+        const key = String(id);
+        if (!key) return null;
+        const direct = questionRegistry.get(key);
+        if (direct) return direct;
+        const aliased = questionAliasMap.get(key);
+        if (aliased) return questionRegistry.get(aliased) || null;
+        return null;
+    }
+
+    const ORIGIN_MULTIPLIER_MAP = {
+        pre_video: 0.75,
+        in_video: 0.75,
+        diagnostic: 0.95,
+        strengthen: 1.05,
+        spaced: 1.05,
+        progress: 1.0,
+        exam_walkthrough: 1.0,
+        exam_paper: 1.0,
+        exam_question: 1.0,
+        standalone: 1.0,
+    };
+
+    function computeExamPartWork(answerType, marks, lines) {
+        const aType = String(answerType || '').toUpperCase();
+        if (aType === 'MULTIPLE_CHOICE') return 32 * marks;
+        if (aType === 'MATH') return 68 * marks;
+        return 62 * marks + lines * 2.5;
+    }
+
+    function computeQuizPartWork(type, optionCount, blankFieldCount, mathCount) {
+        switch (type) {
+            case 'EngageQuestion':              return 14;
+            case 'DropdownQuestion':            return 20 + (optionCount || 0) * 2.5;
+            case 'MultipleChoiceQuestion':      return 24 + (optionCount || 0) * 3.5;
+            case 'MultiMultipleChoiceQuestion': return 34 + (optionCount || 0) * 4.5;
+            case 'TextQuestion':                return 32;
+            case 'MultipleInputQuestion':       return 22 + Math.max(1, blankFieldCount || 0) * 11;
+            case 'ChemistryQuestion':           return 48 + (mathCount || 0) * 4;
+            case 'NumericalQuestion':           return 52 + (mathCount || 0) * 4;
+            case 'MathsQuestion':               return 58 + (mathCount || 0) * 5;
+            case 'DrawQuestion':                return 54;
+            default:                            return 35;
+        }
+    }
+
+    function computeBaseQuestionSeconds(desc) {
+        if (!desc) return 35;
+        const readingTime = Math.min(45, Math.ceil((desc.wordCount || 0) / 3.0)) + (desc.imageCount || 0) * 7;
+        let workTime = 0;
+
+        if ((desc.marksAvailable || 0) > 0) {
+            const parts = Array.isArray(desc.examParts) && desc.examParts.length > 0 ? desc.examParts : null;
+            if (parts) {
+                let partsSum = 0;
+                for (let i = 0; i < parts.length; i++) {
+                    const p = parts[i];
+                    const m = (typeof p.marksAvailable === 'number' && p.marksAvailable > 0) ? p.marksAvailable : 0;
+                    const lines = Number(p.linesForAnswer) || 0;
+                    partsSum += computeExamPartWork(p.answerType, m || 1, lines);
+                }
+                workTime = partsSum > 0 ? partsSum : (62 * desc.marksAvailable + (desc.linesForAnswer || 0) * 2.5);
+            } else {
+                workTime = computeExamPartWork(
+                    desc.answerTypes && desc.answerTypes[0],
+                    desc.marksAvailable,
+                    desc.linesForAnswer || 0
+                );
+            }
+            const extraPct = Number(desc.additionalExamTimePercentage) || 0;
+            const totalExam = (readingTime + workTime) * (1 + extraPct / 100);
+            return Math.max(8, Math.round(totalExam));
+        }
+
+        const partDetails = Array.isArray(desc.quizParts) && desc.quizParts.length > 0 ? desc.quizParts : null;
+        if (partDetails) {
+            for (let i = 0; i < partDetails.length; i++) {
+                const p = partDetails[i];
+                workTime += computeQuizPartWork(p.type, p.optionCount, p.blankFieldCount, p.mathCount);
+            }
+        } else {
+            workTime = computeQuizPartWork(desc.primaryType || '', desc.optionCount, desc.blankFieldCount, desc.mathCount);
+        }
+
+        const mult = ORIGIN_MULTIPLIER_MAP[desc.origin] || 1.0;
+        return Math.max(8, Math.round((readingTime + workTime) * mult));
+    }
+
+    function analyzeQuestionNode(q, meta = {}) {
+        if (!q || typeof q !== 'object') return null;
+
+        const isExam = Array.isArray(q.parts) && !q.quizContent && !q.quizDefinition;
+        const quizContent = (!isExam && q.quizContent && typeof q.quizContent === 'object')
+            ? q.quizContent
+            : (!isExam ? q : null);
+
+        const primaryIdRaw = q.id || (quizContent && quizContent.id) || meta.lessonId;
+        if (!primaryIdRaw) return null;
+        const primaryId = String(primaryIdRaw);
+        const quizContentId = (quizContent && quizContent.id) ? String(quizContent.id) : null;
+
+        let wordCount = 0;
+        let charCount = 0;
+        let imageCount = 0;
+        let optionCount = 0;
+        let blankFieldCount = 0;
+        let partCount = 0;
+        let marksAvailable = 0;
+        let linesForAnswer = 0;
+        let mathCount = 0;
+        const partTypes = [];
+        const answerTypes = [];
+        const quizParts = [];
+        const examParts = [];
+        const textChunks = [];
+
+        const ingestRawText = (raw) => {
+            if (!raw) return 0;
+            const s = String(raw);
+            const clean = stripMarkupToPlainText(s);
+            if (clean) {
+                textChunks.push(clean);
+                wordCount += countWordsInClean(clean);
+                charCount += clean.length;
+            }
+            const mCount = countMathTokens(s);
+            mathCount += mCount;
+            return mCount;
+        };
+
+        if (isExam) {
+            partTypes.push('ExamQuestion');
+            if (q.name) ingestRawText(q.name);
+            if (q.content) ingestRawText(q.content);
+            if (typeof q.marksAvailable === 'number' && q.marksAvailable > 0) {
+                marksAvailable = q.marksAvailable;
+            }
+            const parts = Array.isArray(q.parts) ? q.parts : [];
+            partCount = parts.length || 1;
+            let summedMarks = 0;
+            for (let i = 0; i < parts.length; i++) {
+                const p = parts[i];
+                if (!p || typeof p !== 'object') continue;
+                if (p.content) ingestRawText(p.content);
+                if (p.multipleChoiceAnswer) optionCount += 4;
+                const pm = Number(p.marksAvailable) || 0;
+                const pl = Number(p.linesForAnswer) || 0;
+                summedMarks += pm;
+                linesForAnswer += pl;
+                if (p.answerType) answerTypes.push(String(p.answerType));
+                examParts.push({
+                    marksAvailable: pm,
+                    linesForAnswer: pl,
+                    answerType: p.answerType || 'LINES_OF_TEXT',
+                });
+            }
+            if (marksAvailable <= 0) marksAvailable = summedMarks;
+        } else {
+            if (quizContent && quizContent.stem) ingestRawText(quizContent.stem);
+            const qList = (quizContent && quizContent.quizDefinition && Array.isArray(quizContent.quizDefinition.questions))
+                ? quizContent.quizDefinition.questions
+                : [];
+            partCount = qList.length || 1;
+
+            for (let i = 0; i < qList.length; i++) {
+                const part = qList[i];
+                if (!part || typeof part !== 'object') continue;
+                const pType = part.__typename || 'QuizQuestion';
+                partTypes.push(pType);
+
+                let pMath = 0;
+                if (part.question) pMath += ingestRawText(part.question);
+                if (part.description) pMath += ingestRawText(part.description);
+                if (part.beforeText) ingestRawText(part.beforeText);
+                if (part.afterText) ingestRawText(part.afterText);
+
+                if (part.image) imageCount += 1;
+                if (part.topImage) imageCount += 1;
+                if (part.drawOn) imageCount += 1;
+
+                let pOpts = 0;
+                if (Array.isArray(part.options)) {
+                    pOpts = part.options.length;
+                    optionCount += pOpts;
+                    for (let j = 0; j < part.options.length; j++) {
+                        const opt = part.options[j];
+                        if (!opt) continue;
+                        if (opt.text) ingestRawText(opt.text);
+                        if (opt.image) imageCount += 1;
+                    }
+                }
+                if (part.dropdownOptions != null) {
+                    const dCount = countDropdownOptions(part.dropdownOptions);
+                    pOpts += dCount;
+                    optionCount += dCount;
+                }
+
+                let pBlanks = 0;
+                if (Array.isArray(part.questionSegments)) {
+                    for (let j = 0; j < part.questionSegments.length; j++) {
+                        const seg = part.questionSegments[j];
+                        if (!seg) continue;
+                        if (seg.text) ingestRawText(seg.text);
+                        if (seg.type === 'MultipleInputQuestionBlank' || seg.__typename === 'MultipleInputQuestionBlank' || seg.fieldIndex != null) {
+                            pBlanks += 1;
+                        }
+                    }
+                    blankFieldCount += pBlanks;
+                }
+
+                quizParts.push({
+                    type: pType,
+                    optionCount: pOpts,
+                    blankFieldCount: pBlanks,
+                    mathCount: pMath,
+                });
+            }
+        }
+
+        const fullText = textChunks.join(' ').replace(/\s+/g, ' ').trim();
+        const stemText = fullText.slice(0, 260);
+        const stemSnippet = fullText.slice(0, 72);
+        const stemNeedle = stemText.toLowerCase().slice(0, 64).trim();
+
+        const existing = questionRegistry.get(primaryId);
+        const parsedTrigger = parseDurationToSeconds(q.triggerTime);
+        const parsedResume = parseDurationToSeconds(q.postQuestionResumeTime);
+
+        const desc = {
+            id: primaryId,
+            quizContentId,
+            lessonId: meta.lessonId ? String(meta.lessonId) : (existing ? existing.lessonId : null),
+            origin: meta.origin || (existing ? existing.origin : 'unknown'),
+            sessionId: meta.sessionId ? String(meta.sessionId) : (existing ? existing.sessionId : null),
+            questionNumber: q.questionNumber != null ? q.questionNumber : (meta.questionNumber != null ? meta.questionNumber : (existing ? existing.questionNumber : null)),
+            indexInSession: meta.indexInSession != null ? meta.indexInSession : (existing ? existing.indexInSession : null),
+            triggerTime: (parsedTrigger != null && isFinite(parsedTrigger)) ? parsedTrigger : (existing ? existing.triggerTime : null),
+            postQuestionResumeTime: (parsedResume != null && isFinite(parsedResume)) ? parsedResume : (existing ? existing.postQuestionResumeTime : null),
+            partTypes,
+            primaryType: partTypes[0] || (isExam ? 'ExamQuestion' : 'QuizQuestion'),
+            answerTypes,
+            quizParts,
+            examParts,
+            wordCount,
+            charCount,
+            imageCount,
+            optionCount,
+            blankFieldCount,
+            partCount,
+            marksAvailable,
+            linesForAnswer,
+            mathCount,
+            additionalExamTimePercentage: Number(meta.additionalExamTimePercentage) || (existing ? existing.additionalExamTimePercentage : 0),
+            stemText,
+            stemSnippet,
+            stemNeedle,
+            recommendedSeconds: 0,
+            attempts: existing ? existing.attempts : 0,
+            answered: existing ? existing.answered : false,
+            correct: existing ? existing.correct : null,
+            skipped: existing ? existing.skipped : false,
+            lastSubmittedTimeSeconds: existing ? existing.lastSubmittedTimeSeconds : 0,
+            lastExtraTimeSeconds: existing ? existing.lastExtraTimeSeconds : 0,
+            lastAnsweredAt: existing ? existing.lastAnsweredAt : 0,
+            _countedIdentified: existing ? existing._countedIdentified : false,
+        };
+
+        desc.recommendedSeconds = computeBaseQuestionSeconds(desc);
+
+        setBoundedMapEntry(questionRegistry, primaryId, desc, QUESTION_REGISTRY_MAX);
+        if (quizContentId && quizContentId !== primaryId) {
+            setBoundedMapEntry(questionAliasMap, quizContentId, primaryId, QUESTION_REGISTRY_MAX);
+        }
+        if (desc.lessonId && desc.lessonId !== primaryId) {
+            setBoundedMapEntry(questionAliasMap, desc.lessonId, primaryId, QUESTION_REGISTRY_MAX);
+        }
+
+        if (!desc._countedIdentified) {
+            desc._countedIdentified = true;
+            bumpStat('questionsIdentified');
+        }
+        return desc;
+    }
+
+    function updatePredictedFinalCall(session) {
+        if (!session) return null;
+        let predictedOp = session.predictedOp || null;
+        let varsPreview = Object.assign({}, session.variablesTemplate || {});
+        let predictedSeconds = 0;
+
+        if (session.sessionType === 'VideoLesson') {
+            predictedOp = 'CompleteVideoLesson';
+            const dur = session.durationSeconds || knownLessonDurations.get(session.sessionId) || 0;
+            const qExtra = settings.predictFinalCallEnabled ? (session.totalExtraQuestionSeconds || 0) : 0;
+            predictedSeconds = round3((settings.addVideoDurationToTimeSpent ? dur : 0) + qExtra + (queuedSeconds || 0));
+            varsPreview.lessonId = session.sessionId;
+            varsPreview.timeSpent = predictedSeconds;
+            varsPreview.percentWatched = settings.fullVideoWatchedEnabled ? 1 : 0;
+        } else if (session.sessionType === 'SubsectionSummary') {
+            predictedOp = 'CompleteSubsectionSummary';
+            const dur = session.durationSeconds || knownLessonDurations.get(session.sessionId) || 0;
+            predictedSeconds = round3((settings.addVideoDurationToTimeSpent ? dur : 0) + (queuedSeconds || 0));
+            varsPreview.subsectionSummaryId = session.sessionId;
+            varsPreview.timeSpent = predictedSeconds;
+            varsPreview.percentWatched = settings.fullVideoWatchedEnabled ? 1 : 0;
+        } else if (session.sessionType === 'ArticleLesson') {
+            predictedOp = 'CompleteArticleLesson';
+            const dur = session.durationSeconds || knownLessonDurations.get(session.sessionId) || 0;
+            predictedSeconds = round3(dur + (queuedSeconds || 0));
+            varsPreview.lessonId = session.sessionId;
+            varsPreview.timeSpent = predictedSeconds;
+        } else if (session.sessionType === 'ExamQuestionWalkthrough') {
+            predictedOp = 'CompleteExamQuestionWalkthrough';
+            const dur = session.durationSeconds || knownLessonDurations.get(session.sessionId) || 0;
+            const ans = round3(session.answeringSubmittedSeconds || 0);
+            const mark = round3(session.markingSubmittedSeconds || 0);
+            const watch = settings.addVideoDurationToTimeSpent ? dur : 0;
+            predictedSeconds = round3(ans + mark + watch + (queuedSeconds || 0));
+            varsPreview.lessonId = session.sessionId;
+            varsPreview.timeSpentAnswering = toIso(ans);
+            varsPreview.timeSpentMarking = toIso(mark);
+            if (watch > 0) varsPreview.timeSpentWatching = toIso(watch);
+            if (settings.fullVideoWatchedEnabled) varsPreview.percentWatched = 1;
+        } else if (session.sessionType === 'ExamPracticeSession') {
+            predictedOp = session.phase === 'answers_saved' ? 'CompleteExamPracticeSession' : 'SaveExamPracticeAnswers';
+            const bonus = (session.totalExtraQuestionSeconds || accumulatedExtraSeconds || 0) + (queuedSeconds || 0);
+            predictedSeconds = round3(Math.max(session.totalSubmittedQuestionSeconds || 0, bonus));
+            if (session.sessionId) varsPreview.sessionId = session.sessionId;
+            if (predictedOp === 'SaveExamPracticeAnswers') {
+                varsPreview.timeSpent = toIso(predictedSeconds);
+            } else {
+                varsPreview = { id: session.sessionId || null };
+            }
+        } else {
+            const bonus = (session.totalExtraQuestionSeconds || accumulatedExtraSeconds || 0) + (queuedSeconds || 0);
+            predictedSeconds = round3(Math.max(session.totalSubmittedQuestionSeconds || 0, bonus));
+            varsPreview.timeSpent = toIso(predictedSeconds);
+        }
+
+        session.predictedOp = predictedOp;
+        session.predictedFinalCall = {
+            operationName: predictedOp,
+            sessionType: session.sessionType,
+            sessionId: session.sessionId || null,
+            predictedTotalSeconds: predictedSeconds,
+            totalExtraQuestionSeconds: round3(session.totalExtraQuestionSeconds || 0),
+            totalSubmittedQuestionSeconds: round3(session.totalSubmittedQuestionSeconds || 0),
+            variablesPreview: varsPreview,
+        };
+        return session.predictedFinalCall;
+    }
+
+    function initOrUpdateSession(cfg) {
+        const prev = activeSession;
+        const sameSession = prev && prev.sessionType === cfg.sessionType && prev.sessionId === cfg.sessionId && !prev.completed;
+
+        const session = {
+            sessionType: cfg.sessionType,
+            sessionId: cfg.sessionId ? String(cfg.sessionId) : '',
+            title: cfg.title || (sameSession ? prev.title : ''),
+            moduleUniqueCode: cfg.moduleUniqueCode || (sameSession ? prev.moduleUniqueCode : ''),
+            subsectionUniqueCode: cfg.subsectionUniqueCode || (sameSession ? prev.subsectionUniqueCode : ''),
+            durationSeconds: Number(cfg.durationSeconds) || (sameSession ? prev.durationSeconds : 0),
+            additionalExamTimePercentage: Number(cfg.additionalExamTimePercentage) || 0,
+            questionIds: Array.isArray(cfg.questionIds) ? cfg.questionIds : [],
+            preVideoQuestionIds: Array.isArray(cfg.preVideoQuestionIds) ? cfg.preVideoQuestionIds : [],
+            inVideoQuestions: Array.isArray(cfg.inVideoQuestions) ? cfg.inVideoQuestions : [],
+            currentQuestionIndex: sameSession ? prev.currentQuestionIndex : 0,
+            currentQuestionId: sameSession ? prev.currentQuestionId : (cfg.questionIds && cfg.questionIds[0]) || null,
+            predictedOp: cfg.predictedOp || null,
+            variablesTemplate: cfg.variablesTemplate || {},
+            predictedFinalCall: null,
+            totalOriginalQuestionSeconds: sameSession ? prev.totalOriginalQuestionSeconds : 0,
+            totalExtraQuestionSeconds: sameSession ? prev.totalExtraQuestionSeconds : 0,
+            totalSubmittedQuestionSeconds: sameSession ? prev.totalSubmittedQuestionSeconds : 0,
+            answeringSubmittedSeconds: sameSession ? prev.answeringSubmittedSeconds : 0,
+            answeringExtraSeconds: sameSession ? prev.answeringExtraSeconds : 0,
+            markingSubmittedSeconds: sameSession ? prev.markingSubmittedSeconds : 0,
+            markingExtraSeconds: sameSession ? prev.markingExtraSeconds : 0,
+            phase: sameSession ? prev.phase : (cfg.phase || 'answering'),
+            completed: false,
+            updatedAt: Date.now(),
+        };
+
+        if (session.questionIds.length > 0 && (!session.currentQuestionId || !session.questionIds.includes(session.currentQuestionId))) {
+            session.currentQuestionIndex = 0;
+            session.currentQuestionId = session.questionIds[0];
+        }
+
+        if (!sameSession) {
+            accumulatedExtraSeconds = 0;
+            accumulatedQuestionCount = 0;
+            lastSubmittedQuestionId = null;
+        }
+
+        activeSession = session;
+        updatePredictedFinalCall(session);
+        bumpContextRevision();
+        if (!editing) updateLabel();
+        VLOG(`[session] ${session.sessionType} (${session.sessionId || 'anon'}) · ${session.questionIds.length} q · predicted final: ${session.predictedOp}`);
+        return session;
+    }
+
+    function extractVisibleQuizTextFromDom() {
+        try {
+            if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return '';
+            const containers = document.querySelectorAll('[role="dialog"], .quiz-content, [data-testid*="question"], [data-testid*="quiz"], .question');
+            let combined = '';
+            for (let i = 0; i < containers.length; i++) {
+                const el = containers[i];
+                if (!el || (uiHostEl && (el === uiHostEl || uiHostEl.contains(el)))) continue;
+                if (!isElementVisible(el)) continue;
+                const txt = stripMarkupToPlainText(el.textContent || '');
+                if (txt.length > combined.length) combined = txt;
+            }
+            return combined.toLowerCase();
+        } catch {
+            return '';
+        }
+    }
+
+    function identifyCurrentQuestion(vars, opName, qStr) {
+        // Mode 1: Request interception with explicit GraphQL variables
+        if (vars && typeof vars === 'object') {
+            const candidates = [];
+            if (vars.questionId != null) candidates.push(vars.questionId);
+            if (vars.question != null) {
+                if (typeof vars.question === 'string' || typeof vars.question === 'number') {
+                    candidates.push(vars.question);
+                } else if (typeof vars.question === 'object') {
+                    if (vars.question.id != null) candidates.push(vars.question.id);
+                    if (vars.question.questionId != null) candidates.push(vars.question.questionId);
+                    if (vars.question.quizContent && vars.question.quizContent.id != null) candidates.push(vars.question.quizContent.id);
+                }
+            }
+            if (vars.quizContentId != null) candidates.push(vars.quizContentId);
+            if (vars.standaloneQuestionId != null) candidates.push(vars.standaloneQuestionId);
+            if (vars.lessonId != null) candidates.push(vars.lessonId);
+
+            for (let i = 0; i < candidates.length; i++) {
+                const desc = lookupQuestion(candidates[i]);
+                if (desc) {
+                    if (activeSession) {
+                        activeSession.currentQuestionId = desc.id;
+                        const idx = activeSession.questionIds.indexOf(desc.id);
+                        if (idx !== -1) activeSession.currentQuestionIndex = idx;
+                    }
+                    return desc;
+                }
+            }
+            return null;
+        }
+
+        // Mode 2: Live page inspection
+        if (!activeSession) return null;
+
+        if (activeSession.sessionType === 'VideoLesson') {
+            const video = findActiveVideoElement();
+            if (video && isFinite(video.currentTime)) {
+                const ct = video.currentTime;
+                if (ct < 1.0 && activeSession.preVideoQuestionIds.length > 0) {
+                    for (let i = 0; i < activeSession.preVideoQuestionIds.length; i++) {
+                        const pq = lookupQuestion(activeSession.preVideoQuestionIds[i]);
+                        if (pq && !pq.answered) return pq;
+                    }
+                }
+                const ivqs = activeSession.inVideoQuestions || [];
+                for (let i = 0; i < ivqs.length; i++) {
+                    const iq = ivqs[i];
+                    if (iq && iq.triggerTime != null && Math.abs(ct - iq.triggerTime) <= 4.0) {
+                        const qDesc = lookupQuestion(iq.id);
+                        if (qDesc && !qDesc.answered) return qDesc;
+                    }
+                }
+            }
+        }
+
+        const qIds = activeSession.questionIds || [];
+        if (qIds.length > 0) {
+            const domText = extractVisibleQuizTextFromDom();
+            if (domText.length >= 16) {
+                let bestMatch = null;
+                let bestScore = 0;
+                for (let i = 0; i < qIds.length; i++) {
+                    const qDesc = lookupQuestion(qIds[i]);
+                    if (!qDesc || !qDesc.stemText) continue;
+                    const needle = qDesc.stemNeedle ?? qDesc.stemText.toLowerCase().slice(0, 64).trim();
+                    if (needle.length >= 16 && domText.includes(needle)) {
+                        if (needle.length > bestScore) {
+                            bestScore = needle.length;
+                            bestMatch = qDesc;
+                        }
+                    } else if (needle.length >= 24) {
+                        const prefix = needle.slice(0, 24);
+                        if (domText.includes(prefix) && prefix.length > bestScore) {
+                            bestScore = prefix.length;
+                            bestMatch = qDesc;
+                        }
+                    }
+                }
+                if (bestMatch) {
+                    const idx = qIds.indexOf(bestMatch.id);
+                    if (idx !== -1) activeSession.currentQuestionIndex = idx;
+                    activeSession.currentQuestionId = bestMatch.id;
+                    return bestMatch;
+                }
+            }
+
+            const idx = Math.max(0, Math.min(activeSession.currentQuestionIndex || 0, qIds.length - 1));
+            const indexedQ = lookupQuestion(qIds[idx]);
+            if (indexedQ) return indexedQ;
+            for (let i = 0; i < qIds.length; i++) {
+                const candidate = lookupQuestion(qIds[i]);
+                if (candidate && !candidate.answered && !candidate.skipped) return candidate;
+            }
+            return lookupQuestion(qIds[qIds.length - 1]);
+        }
+
+        return activeSession.currentQuestionId ? lookupQuestion(activeSession.currentQuestionId) : null;
+    }
+
+    function inspectDomQuestionComplexity() {
+        try {
+            if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return null;
+            const domText = extractVisibleQuizTextFromDom();
+            const wc = countWords(domText);
+            const radios = document.querySelectorAll('input[type="radio"]').length;
+            const checks = document.querySelectorAll('input[type="checkbox"]').length;
+            const textInputs = document.querySelectorAll('input[type="text"], input[type="number"], textarea, math-field').length;
+            let primaryType = 'QuizQuestion';
+            if (checks > 1) primaryType = 'MultiMultipleChoiceQuestion';
+            else if (radios > 1) primaryType = 'MultipleChoiceQuestion';
+            else if (textInputs > 1) primaryType = 'MultipleInputQuestion';
+            else if (textInputs === 1) primaryType = 'TextQuestion';
+
+            const fallbackDesc = {
+                id: 'dom-fallback',
+                primaryType,
+                wordCount: wc,
+                imageCount: 0,
+                optionCount: radios + checks,
+                blankFieldCount: textInputs,
+                partCount: 1,
+                marksAvailable: 0,
+                linesForAnswer: 0,
+                mathCount: countMathTokens(domText),
+                origin: 'progress',
+                attempts: 0,
+            };
+            fallbackDesc.recommendedSeconds = computeBaseQuestionSeconds(fallbackDesc);
+            return fallbackDesc;
+        } catch {
+            return null;
+        }
+    }
+
+    function computeDynamicExtraSeconds(questionDesc, origSeconds, opName, qStr) {
+        const isMarking = OP_SAVE_EXAM_RE.test(opName || '') || QSTR_SAVE_EXAM_RE.test(qStr || '');
+        const desc = questionDesc || inspectDomQuestionComplexity();
+
+        let baseTarget = 35;
+        if (isMarking) {
+            const marks = (desc && desc.marksAvailable) ? desc.marksAvailable : 2;
+            const parts = (desc && desc.partCount) ? desc.partCount : 1;
+            baseTarget = Math.max(18, marks * 18 + parts * 6);
+        } else {
+            const rec = (desc && desc.recommendedSeconds > 0) ? desc.recommendedSeconds : 35;
+            const attempts = (desc && desc.attempts) ? desc.attempts : 0;
+            const retryFactor = attempts > 0 ? Math.max(0.35, Math.pow(0.55, attempts)) : 1.0;
+            baseTarget = rec * retryFactor;
+        }
+
+        const minRange = Math.min(settings.extraSecondsMin, settings.extraSecondsMax);
+        const maxRange = Math.max(settings.extraSecondsMin, settings.extraSecondsMax);
+        const avgRange = (minRange + maxRange) / 2;
+        const scale = Math.min(4.0, Math.max(0.35, avgRange / 60));
+        const jitter = 0.88 + Math.random() * 0.24;
+        const targetSeconds = baseTarget * scale * jitter;
+
+        const orig = Math.max(0, Number(origSeconds) || 0);
+        let extra;
+        if (orig < targetSeconds) {
+            const minFloor = Math.min(minRange, Math.max(8, Math.round(targetSeconds * 0.35)));
+            extra = Math.max(targetSeconds - orig, minFloor);
+        } else {
+            extra = Math.max(5, Math.round(targetSeconds * (0.18 + Math.random() * 0.12)));
+        }
+        return round3(extra);
+    }
+
+    function processAnswerMutationResponse(mutationKey, payload) {
+        if (!payload) return;
+        latestQuizFeedback = { type: mutationKey, timestamp: Date.now(), payload };
+
+        if (mutationKey === 'answerInVideoQuestion') {
+            lastQuestionAnsweredAt = Date.now();
+            waitingForPostAnswerResume = true;
+        }
+
+        if (mutationKey === 'answerExamQuestion') {
+            if (activeSession && activeSession.sessionType === 'ExamQuestionWalkthrough') {
+                activeSession.phase = 'marking';
+                updatePredictedFinalCall(activeSession);
+            }
+            bumpContextRevision();
+            if (!editing) updateLabel();
+            return;
+        }
+
+        if (mutationKey === 'saveExamQuestionMarks') {
+            if (activeSession && activeSession.sessionType === 'ExamQuestionWalkthrough') {
+                activeSession.phase = 'marked';
+                updatePredictedFinalCall(activeSession);
+            }
+            bumpContextRevision();
+            if (!editing) updateLabel();
+            return;
+        }
+
+        if (mutationKey === 'saveExamPracticeAnswers') {
+            if (activeSession && activeSession.sessionType === 'ExamPracticeSession') {
+                activeSession.phase = 'answers_saved';
+                updatePredictedFinalCall(activeSession);
+            }
+            bumpContextRevision();
+            if (!editing) updateLabel();
+            return;
+        }
+
+        if (mutationKey === 'saveExamPracticeQuestionMarks') {
+            if (activeSession && activeSession.sessionType === 'ExamPracticeSession') {
+                updatePredictedFinalCall(activeSession);
+            }
+            bumpContextRevision();
+            if (!editing) updateLabel();
+            return;
+        }
+
+        const responses = Array.isArray(payload.responses) ? payload.responses : [];
+        const allCorrect = responses.length > 0 && responses.every((r) => r && (r.correct === true || r.correct === 'CORRECT'));
+
+        const qId = lastSubmittedQuestionId || (activeSession && activeSession.currentQuestionId);
+        const qDesc = qId ? lookupQuestion(qId) : null;
+        if (qDesc) {
+            qDesc.answered = true;
+            if (allCorrect) qDesc.correct = true;
+            else if (responses.length > 0 && qDesc.correct !== true) qDesc.correct = false;
+        }
+
+        if (activeSession && activeSession.questionIds.length > 0) {
+            const qIds = activeSession.questionIds;
+            let curIdx = qDesc ? qIds.indexOf(qDesc.id) : activeSession.currentQuestionIndex;
+            if (curIdx < 0) curIdx = activeSession.currentQuestionIndex || 0;
+
+            if (payload.questionToSkipTo != null) {
+                let targetIdx = -1;
+                for (let i = 0; i < qIds.length; i++) {
+                    const candidate = lookupQuestion(qIds[i]);
+                    if (candidate && candidate.questionNumber === payload.questionToSkipTo) {
+                        targetIdx = i;
+                        break;
+                    }
+                }
+                if (targetIdx === -1 && typeof payload.questionToSkipTo === 'number') {
+                    const fallbackIdx = payload.questionToSkipTo - 1;
+                    if (fallbackIdx >= 0 && fallbackIdx < qIds.length) targetIdx = fallbackIdx;
+                }
+                if (targetIdx !== -1) {
+                    for (let i = curIdx + 1; i < targetIdx; i++) {
+                        const midQ = lookupQuestion(qIds[i]);
+                        if (midQ) midQ.skipped = true;
+                    }
+                    activeSession.currentQuestionIndex = targetIdx;
+                    activeSession.currentQuestionId = qIds[targetIdx];
+                }
+            } else if (
+                allCorrect ||
+                activeSession.sessionType === 'DiagnosticQuiz' ||
+                mutationKey === 'answerInVideoQuestion' ||
+                mutationKey === 'answerPreVideoQuestion'
+            ) {
+                let nextIdx = -1;
+                for (let i = curIdx + 1; i < qIds.length; i++) {
+                    const cand = lookupQuestion(qIds[i]);
+                    if (!cand || (!cand.answered && !cand.skipped)) {
+                        nextIdx = i;
+                        break;
+                    }
+                }
+                if (nextIdx === -1) {
+                    for (let i = 0; i < qIds.length; i++) {
+                        const cand = lookupQuestion(qIds[i]);
+                        if (!cand || (!cand.answered && !cand.skipped)) {
+                            nextIdx = i;
+                            break;
+                        }
+                    }
+                }
+                if (nextIdx !== -1) {
+                    activeSession.currentQuestionIndex = nextIdx;
+                    activeSession.currentQuestionId = qIds[nextIdx];
+                }
+            }
+
+            updatePredictedFinalCall(activeSession);
+        }
+
+        bumpContextRevision();
+        if (!editing) updateLabel();
+    }
+
+    /* ------------------------------------------------------------
      * Video Lesson State & Auto-Skip Progression
      * ------------------------------------------------------------ */
     const knownLessonDurations = new Map();
     function recordLessonDuration(id, dur) {
         if (!id || !dur) return;
-        const key = String(id);
-        if (knownLessonDurations.has(key)) {
-            knownLessonDurations.delete(key);
-        } else if (knownLessonDurations.size >= 200) {
-            knownLessonDurations.delete(knownLessonDurations.keys().next().value);
-        }
-        knownLessonDurations.set(key, dur);
+        setBoundedMapEntry(knownLessonDurations, id, dur, 200);
     }
     let currentVideoLesson                 = null;
     let lastSkippedTarget                  = null;
@@ -1786,6 +2634,20 @@
         }, 1500);
     }
 
+    const ANSWER_RESPONSE_KEYS = [
+        'answerProgressQuizQuestion',
+        'answerSpacedPracticeQuizQuestion',
+        'answerDiagnosticQuestion',
+        'answerPreVideoQuestion',
+        'answerInVideoQuestion',
+        'answerExamQuestion',
+        'saveExamQuestionMarks',
+        'saveExamPracticeAnswers',
+        'saveExamPracticeQuestionMarks',
+        'evaluateQuizContentResponses',
+        'evaluateStandaloneQuestionResponses',
+    ];
+
     function handleApiResponse(data) {
         if (!data || typeof data !== 'object') return;
         if (Array.isArray(data)) {
@@ -1795,18 +2657,169 @@
         const d = data.data || data;
         if (!d || typeof d !== 'object') return;
 
-        // 0. Subsection overview videoLessons durations
-        if (d.subsection && Array.isArray(d.subsection.videoLessons)) {
-            for (const item of d.subsection.videoLessons) {
-                if (!item || !item.id) continue;
-                const itemDur = parseDurationToSeconds(item.length) || parseDurationToSeconds(item.duration) || 0;
-                if (itemDur > 0) {
-                    recordLessonDuration(item.id, itemDur);
+        // Capture global feature flags & user profile/flags if present
+        if ('featureFlagsEnabledGlobally' in d) {
+            latestGlobalFeatureFlags = d.featureFlagsEnabledGlobally;
+        }
+        if (d.currentUser && typeof d.currentUser === 'object') {
+            if (d.currentUser.email || d.currentUser.roles || d.currentUser.enrolments) {
+                latestUserProfile = d.currentUser;
+            }
+            if (d.currentUser.featureFlags !== undefined || d.currentUser.student || d.currentUser.managedSchool) {
+                latestFeatureFlags = d.currentUser.featureFlags !== undefined ? d.currentUser.featureFlags : d.currentUser;
+            }
+        }
+
+        // 0. Subsection overview lesson durations (video, article, examHowTo, summary)
+        if (d.subsection && typeof d.subsection === 'object') {
+            const sub = d.subsection;
+            const lessonLists = [sub.videoLessons, sub.articleLessons, sub.examHowToLessons];
+            for (let l = 0; l < lessonLists.length; l++) {
+                const list = lessonLists[l];
+                if (!Array.isArray(list)) continue;
+                for (let i = 0; i < list.length; i++) {
+                    const item = list[i];
+                    if (!item || !item.id) continue;
+                    const itemDur = parseDurationToSeconds(item.length) || parseDurationToSeconds(item.duration) || 0;
+                    if (itemDur > 0) recordLessonDuration(item.id, itemDur);
+                }
+            }
+            if (sub.summary && sub.summary.id) {
+                const sumVidDur = parseDurationToSeconds(sub.summary.wistiaVideoDuration) || 0;
+                if (sumVidDur > 0) recordLessonDuration(sub.summary.id, sumVidDur);
+            }
+        }
+
+        // 0b. Experiment group activity metadata
+        if (d.experimentGroup && Array.isArray(d.experimentGroup.activities)) {
+            for (const actWrap of d.experimentGroup.activities) {
+                const act = actWrap && actWrap.activity;
+                if (!act || !act.id) continue;
+                const dur = parseDurationToSeconds(act.length) || 0;
+                if (dur > 0) recordLessonDuration(act.id, dur);
+                if (act.__typename === 'ArticleLesson') {
+                    const artDur = dur || Math.max(45, Math.ceil(countWords(act.extraContent) / 3.0));
+                    recordLessonDuration(act.id, artDur);
+                    initOrUpdateSession({
+                        sessionType: 'ArticleLesson',
+                        sessionId: act.id,
+                        title: act.title || 'Article Lesson',
+                        durationSeconds: artDur,
+                        predictedOp: 'CompleteArticleLesson',
+                        variablesTemplate: { lessonId: String(act.id) },
+                    });
                 }
             }
         }
 
-        // 1. GetVideoLesson response
+        // 1. GetProgressQuizGroup response
+        if (d.progressQuizGroup && d.progressQuizGroup.id) {
+            const pg = d.progressQuizGroup;
+            const rawQs = Array.isArray(pg.progressQuizQuestions) ? pg.progressQuizQuestions : [];
+            const qIds = [];
+            for (let i = 0; i < rawQs.length; i++) {
+                const desc = analyzeQuestionNode(rawQs[i], {
+                    origin: 'progress',
+                    sessionId: pg.id,
+                    indexInSession: i,
+                });
+                if (desc) qIds.push(desc.id);
+            }
+            initOrUpdateSession({
+                sessionType: 'ProgressQuizGroup',
+                sessionId: pg.id,
+                title: pg.name || 'Progress Quiz',
+                moduleUniqueCode: pg.module && pg.module.uniqueCode,
+                subsectionUniqueCode: pg.subsection && pg.subsection.uniqueCode,
+                questionIds: qIds,
+                predictedOp: 'CompleteProgressQuizGroup',
+                variablesTemplate: { progressQuizGroupId: String(pg.id) },
+            });
+        }
+
+        // 2. GetStrengthenQuiz response
+        if (d.subsection && d.subsection.strengthenQuiz && d.subsection.strengthenQuiz.id) {
+            const sub = d.subsection;
+            const sq = sub.strengthenQuiz;
+            const rawQs = Array.isArray(sq.questions) ? sq.questions : [];
+            const qIds = [];
+            for (let i = 0; i < rawQs.length; i++) {
+                const desc = analyzeQuestionNode(rawQs[i], {
+                    origin: 'strengthen',
+                    sessionId: sq.id,
+                    indexInSession: i,
+                    questionNumber: i + 1,
+                });
+                if (desc) qIds.push(desc.id);
+            }
+            initOrUpdateSession({
+                sessionType: 'StrengthenQuiz',
+                sessionId: sq.id,
+                title: sub.name ? `${sub.name} (Strengthen)` : 'Strengthen Quiz',
+                moduleUniqueCode: sub.module && sub.module.uniqueCode,
+                subsectionUniqueCode: sub.uniqueCode,
+                questionIds: qIds,
+                predictedOp: 'CompleteStrengthenQuiz',
+                variablesTemplate: { strengthenQuizSessionId: String(sq.id) },
+            });
+        }
+
+        // 3. GetSpacedPracticeQuizGroup response (only when questions array is present)
+        if (d.spacedPracticeQuiz && Array.isArray(d.spacedPracticeQuiz.questions)) {
+            const sp = d.spacedPracticeQuiz;
+            const modCode = (sp.module && sp.module.uniqueCode) || '';
+            const subCode = (sp.subsection && sp.subsection.uniqueCode) || '';
+            const spSessionId = `${modCode}:${subCode}` || 'spaced-practice';
+            const qIds = [];
+            for (let i = 0; i < sp.questions.length; i++) {
+                const desc = analyzeQuestionNode(sp.questions[i], {
+                    origin: 'spaced',
+                    sessionId: spSessionId,
+                    indexInSession: i,
+                    questionNumber: i + 1,
+                });
+                if (desc) qIds.push(desc.id);
+            }
+            initOrUpdateSession({
+                sessionType: 'SpacedPracticeQuiz',
+                sessionId: spSessionId,
+                title: (sp.subsection && sp.subsection.name) ? `${sp.subsection.name} (Spaced)` : 'Spaced Practice Quiz',
+                moduleUniqueCode: modCode,
+                subsectionUniqueCode: subCode,
+                questionIds: qIds,
+                predictedOp: 'CompleteSpacedPracticeQuiz',
+                variablesTemplate: { moduleUniqueCode: modCode, subsectionUniqueCode: subCode },
+            });
+        }
+
+        // 4. GetSubsectionDiagnosticQuiz response
+        if (d.subsection && d.subsection.diagnosticQuiz && d.subsection.diagnosticQuiz.id) {
+            const sub = d.subsection;
+            const dq = sub.diagnosticQuiz;
+            const rawQs = Array.isArray(dq.questions) ? dq.questions : [];
+            const qIds = [];
+            for (let i = 0; i < rawQs.length; i++) {
+                const desc = analyzeQuestionNode(rawQs[i], {
+                    origin: 'diagnostic',
+                    sessionId: dq.id,
+                    indexInSession: i,
+                    questionNumber: i + 1,
+                });
+                if (desc) qIds.push(desc.id);
+            }
+            initOrUpdateSession({
+                sessionType: 'DiagnosticQuiz',
+                sessionId: dq.id,
+                title: sub.name ? `${sub.name} (Diagnostic)` : 'Diagnostic Quiz',
+                moduleUniqueCode: sub.module && sub.module.uniqueCode,
+                subsectionUniqueCode: sub.uniqueCode,
+                questionIds: qIds,
+                predictedOp: 'CompleteDiagnosticQuizSession',
+                variablesTemplate: { diagnosticQuizSessionId: String(dq.id) },
+            });
+        }
+
+        // 5. GetVideoLesson response
         if (d.videoLesson) {
             const vl = d.videoLesson;
             if (vl && vl.id) {
@@ -1816,22 +2829,230 @@
                     recordLessonDuration(lessonId, dur);
                 }
 
+                const preQs = Array.isArray(vl.preVideoQuestions) ? vl.preVideoQuestions : [];
+                const inQs = Array.isArray(vl.inVideoQuizQuestions) ? vl.inVideoQuizQuestions : [];
+                const qIds = [];
+                const preIds = [];
+                const inMeta = [];
+
+                for (let i = 0; i < preQs.length; i++) {
+                    const desc = analyzeQuestionNode(preQs[i], {
+                        origin: 'pre_video',
+                        sessionId: lessonId,
+                        lessonId,
+                        indexInSession: qIds.length,
+                    });
+                    if (desc) {
+                        preIds.push(desc.id);
+                        qIds.push(desc.id);
+                    }
+                }
+                for (let i = 0; i < inQs.length; i++) {
+                    const desc = analyzeQuestionNode(inQs[i], {
+                        origin: 'in_video',
+                        sessionId: lessonId,
+                        lessonId,
+                        indexInSession: qIds.length,
+                    });
+                    if (desc) {
+                        qIds.push(desc.id);
+                        inMeta.push({
+                            id: desc.id,
+                            triggerTime: desc.triggerTime,
+                            postQuestionResumeTime: desc.postQuestionResumeTime,
+                        });
+                    }
+                }
+                inMeta.sort((a, b) => {
+                    if (a.triggerTime == null && b.triggerTime == null) return 0;
+                    if (a.triggerTime == null) return 1;
+                    if (b.triggerTime == null) return -1;
+                    return a.triggerTime - b.triggerTime;
+                });
+
                 currentVideoLesson = {
                     id: lessonId,
                     uniqueCode: vl.uniqueCode ? String(vl.uniqueCode) : '',
                     title: vl.title || '',
                     duration: dur,
+                    preVideoQuestionIds: preIds,
+                    inVideoQuestions: inMeta,
                 };
+
+                initOrUpdateSession({
+                    sessionType: 'VideoLesson',
+                    sessionId: lessonId,
+                    title: vl.title || 'Video Lesson',
+                    moduleUniqueCode: vl.module && vl.module.uniqueCode,
+                    subsectionUniqueCode: vl.subsection && vl.subsection.uniqueCode,
+                    durationSeconds: dur,
+                    questionIds: qIds,
+                    preVideoQuestionIds: preIds,
+                    inVideoQuestions: inMeta,
+                    predictedOp: 'CompleteVideoLesson',
+                    variablesTemplate: { lessonId, percentWatched: 1 },
+                });
+
                 if (settings.autoSkipVideoEnabled) {
                     checkAndAutoSkipVideo(false);
                 }
             }
         }
 
-        // 2. In-video question response
-        if (d.answerInVideoQuestion) {
-            lastQuestionAnsweredAt = Date.now();
-            waitingForPostAnswerResume = true;
+        // 6. GetExamHowToLesson response (Exam Question Walkthrough)
+        if (d.examHowToLesson && d.examHowToLesson.id) {
+            const ehl = d.examHowToLesson;
+            const lessonId = String(ehl.id);
+            const dur = parseDurationToSeconds(ehl.duration) || 0;
+            if (dur > 0) recordLessonDuration(lessonId, dur);
+
+            const extraTimePct = (ehl.module && ehl.module.currentUserEnrolment && ehl.module.currentUserEnrolment.additionalExamTimePercentage) || 0;
+            const qIds = [];
+            if (ehl.examQuestion) {
+                const desc = analyzeQuestionNode(ehl.examQuestion, {
+                    origin: 'exam_walkthrough',
+                    sessionId: lessonId,
+                    lessonId,
+                    indexInSession: 0,
+                    additionalExamTimePercentage: extraTimePct,
+                });
+                if (desc) qIds.push(desc.id);
+            }
+
+            initOrUpdateSession({
+                sessionType: 'ExamQuestionWalkthrough',
+                sessionId: lessonId,
+                title: ehl.title || 'Exam Question Walkthrough',
+                moduleUniqueCode: ehl.module && ehl.module.uniqueCode,
+                subsectionUniqueCode: ehl.subsection && ehl.subsection.uniqueCode,
+                durationSeconds: dur,
+                additionalExamTimePercentage: extraTimePct,
+                questionIds: qIds,
+                predictedOp: 'CompleteExamQuestionWalkthrough',
+                variablesTemplate: { lessonId },
+            });
+        }
+
+        // 7. GetExamPaper & StartExamPracticeSession
+        if (d.examPaper && d.examPaper.id) {
+            const ep = d.examPaper;
+            latestExamPaperData = ep;
+            const dur = parseDurationToSeconds(ep.duration) || 0;
+            const extraTimePct = (ep.module && ep.module.currentUserEnrolment && ep.module.currentUserEnrolment.additionalExamTimePercentage) || 0;
+            const rawQs = Array.isArray(ep.questions) ? ep.questions : [];
+            const qIds = [];
+            for (let i = 0; i < rawQs.length; i++) {
+                const desc = analyzeQuestionNode(rawQs[i], {
+                    origin: 'exam_paper',
+                    sessionId: ep.id,
+                    indexInSession: i,
+                    questionNumber: i + 1,
+                    additionalExamTimePercentage: extraTimePct,
+                });
+                if (desc) qIds.push(desc.id);
+            }
+            const existingSessionId = (activeSession && activeSession.sessionType === 'ExamPracticeSession' && activeSession.sessionId)
+                ? activeSession.sessionId
+                : ep.id;
+            initOrUpdateSession({
+                sessionType: 'ExamPracticeSession',
+                sessionId: existingSessionId,
+                title: ep.name || 'Exam Paper',
+                moduleUniqueCode: ep.module && ep.module.uniqueCode,
+                durationSeconds: dur,
+                additionalExamTimePercentage: extraTimePct,
+                questionIds: qIds,
+                predictedOp: 'SaveExamPracticeAnswers',
+                variablesTemplate: { sessionId: String(existingSessionId) },
+            });
+        }
+
+        if (d.startExamPracticeSession && d.startExamPracticeSession.id) {
+            const sid = String(d.startExamPracticeSession.id);
+            if (activeSession && activeSession.sessionType === 'ExamPracticeSession') {
+                activeSession.sessionId = sid;
+                activeSession.variablesTemplate = { sessionId: sid };
+                updatePredictedFinalCall(activeSession);
+                bumpContextRevision();
+            } else {
+                initOrUpdateSession({
+                    sessionType: 'ExamPracticeSession',
+                    sessionId: sid,
+                    title: 'Exam Practice Session',
+                    questionIds: [],
+                    predictedOp: 'SaveExamPracticeAnswers',
+                    variablesTemplate: { sessionId: sid },
+                });
+            }
+        }
+
+        // 8. GetSubsectionSummary response (distinguished from overview by article / wistiaVideoId / summaryOnly)
+        if (
+            d.subsection &&
+            d.subsection.summary &&
+            d.subsection.summary.id &&
+            ('article' in d.subsection.summary || 'wistiaVideoId' in d.subsection.summary || 'summaryOnly' in d.subsection)
+        ) {
+            const sub = d.subsection;
+            const sum = sub.summary;
+            let dur = parseDurationToSeconds(sum.wistiaVideoDuration) || 0;
+            if (dur <= 0 && sum.article && Array.isArray(sum.article.parts)) {
+                let words = 0;
+                for (let i = 0; i < sum.article.parts.length; i++) {
+                    words += countWords(sum.article.parts[i] && sum.article.parts[i].content);
+                }
+                if (words > 0) dur = Math.max(45, Math.ceil(words / 3.0));
+            }
+            if (dur > 0) recordLessonDuration(sum.id, dur);
+            initOrUpdateSession({
+                sessionType: 'SubsectionSummary',
+                sessionId: sum.id,
+                title: sub.name ? `${sub.name} (Summary)` : 'Subsection Summary',
+                moduleUniqueCode: sub.module && sub.module.uniqueCode,
+                subsectionUniqueCode: sub.uniqueCode,
+                durationSeconds: dur,
+                predictedOp: 'CompleteSubsectionSummary',
+                variablesTemplate: { subsectionSummaryId: String(sum.id), percentWatched: 1 },
+            });
+        }
+
+        // 9. GetSubsectionActivity ArticleLesson response
+        if (d.subsection && d.subsection.activity && d.subsection.activity.__typename === 'ArticleLesson' && d.subsection.activity.id) {
+            const sub = d.subsection;
+            const act = sub.activity;
+            let dur = knownLessonDurations.get(String(act.id)) || 0;
+            if (dur <= 0 && act.extraContent) {
+                const words = countWords(act.extraContent);
+                if (words > 0) dur = Math.max(45, Math.ceil(words / 3.0));
+            }
+            if (dur > 0) recordLessonDuration(act.id, dur);
+            initOrUpdateSession({
+                sessionType: 'ArticleLesson',
+                sessionId: act.id,
+                title: act.title || 'Article Lesson',
+                moduleUniqueCode: sub.module && sub.module.uniqueCode,
+                subsectionUniqueCode: sub.uniqueCode,
+                durationSeconds: dur,
+                predictedOp: 'CompleteArticleLesson',
+                variablesTemplate: { lessonId: String(act.id) },
+            });
+        }
+
+        // 10. Standalone ExamQuestion / QuizContent / StandaloneQuestion
+        if (d.examQuestion && d.examQuestion.id) {
+            analyzeQuestionNode(d.examQuestion, { origin: 'exam_question' });
+        }
+        if (d.quizContent && d.quizContent.id) {
+            analyzeQuestionNode(d.quizContent, { origin: 'standalone' });
+        }
+        if (d.standaloneQuestion && d.standaloneQuestion.id) {
+            analyzeQuestionNode(d.standaloneQuestion, { origin: 'standalone' });
+        }
+
+        // 11. Answer / Marking mutation responses
+        for (let i = 0; i < ANSWER_RESPONSE_KEYS.length; i++) {
+            const k = ANSWER_RESPONSE_KEYS[i];
+            if (d[k]) processAnswerMutationResponse(k, d[k]);
         }
     }
 
@@ -2075,7 +3296,6 @@
             checkAndAutoSkipVideo(false);
         }
     }
-    const startVideoAutoSkipController = initVideoAutoSkipController;
 
     /* ------------------------------------------------------------
      * Manual "Add Time" Button UI & Styles
@@ -2281,6 +3501,24 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     let pulseTimer = null;
     const stopPropagation = (e) => e.stopPropagation();
 
+    function buildButtonContextSuffix() {
+        const q = identifyCurrentQuestion();
+        const pred = activeSession && activeSession.predictedFinalCall;
+        const parts = [];
+        if (q) {
+            const idxNum = (activeSession && activeSession.questionIds && activeSession.questionIds.length > 0)
+                ? (activeSession.questionIds.indexOf(q.id) + 1) || ((activeSession.currentQuestionIndex || 0) + 1)
+                : 0;
+            const totalQ = (activeSession && activeSession.questionIds) ? activeSession.questionIds.length : 0;
+            const prefix = (idxNum > 0 && totalQ > 0) ? `Q${idxNum}/${totalQ} ` : '';
+            parts.push(`Active: ${prefix}${q.primaryType || 'Question'} (~${q.recommendedSeconds}s)`);
+        }
+        if (pred && pred.operationName) {
+            parts.push(`Predicted final: ${pred.operationName}`);
+        }
+        return parts.length > 0 ? ` [${parts.join(' · ')}]` : '';
+    }
+
     function updateLabel(btn, pulse) {
         if (editing) return;          // never clobber the input
         btn = btn || document.getElementById(MANUAL_BUTTON_ID);
@@ -2296,9 +3534,10 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             btn.classList.toggle('us-active', nextActive);
         }
 
+        const ctxSuffix = buildButtonContextSuffix();
         const nextTitle = (queuedSeconds !== null)
-            ? 'Extra: +' + toIso(queuedSeconds) + ' (added on top of UpLearn\'s own timeSpent). Click to edit.'
-            : 'Set extra time added on top of UpLearn\'s own timeSpent';
+            ? 'Extra: +' + toIso(queuedSeconds) + ' (added on top of UpLearn\'s own timeSpent). Click to edit.' + ctxSuffix
+            : 'Set extra time added on top of UpLearn\'s own timeSpent' + ctxSuffix;
         if (btn.title !== nextTitle) {
             btn.title = nextTitle;
         }
@@ -2432,8 +3671,14 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         btn.setAttribute('tabindex', '0');
         btn.addEventListener('click',   onButtonClick,   true);
         btn.addEventListener('keydown', onButtonKeyDown, false);
+        let btnRect = null;
+        const refreshRect = () => { btnRect = btn.getBoundingClientRect(); };
+        btn.addEventListener('pointerenter', refreshRect);
+        btn.addEventListener('pointerdown', refreshRect);
+        btn.addEventListener('pointerleave', () => { btnRect = null; });
         btn.addEventListener('pointermove', (e) => {
-            const r = btn.getBoundingClientRect();
+            const r = btnRect || (btnRect = btn.getBoundingClientRect());
+            if (!r.width || !r.height) return;
             btn.style.setProperty('--lg-x', `${((e.clientX - r.left) / r.width) * 100}%`);
             btn.style.setProperty('--lg-y', `${((e.clientY - r.top) / r.height) * 100}%`);
         });
@@ -2514,33 +3759,8 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     }
 
     let manualBtnScheduled = false;
-    function scheduleEnsureButton(mutations) {
+    function scheduleEnsureButton() {
         if (!settings.manualTimeButtonEnabled || manualBtnScheduled) return;
-        if (mutations && Array.isArray(mutations)) {
-            let hasRelevantElementChange = false;
-            for (let i = 0; i < mutations.length; i++) {
-                const m = mutations[i];
-                if (m.type === 'childList') {
-                    const added = m.addedNodes;
-                    for (let j = 0; j < added.length; j++) {
-                        if (isRelevantQuestionMutationNode(added[j])) {
-                            hasRelevantElementChange = true;
-                            break;
-                        }
-                    }
-                    if (hasRelevantElementChange) break;
-                    const removed = m.removedNodes;
-                    for (let j = 0; j < removed.length; j++) {
-                        if (isRelevantQuestionMutationNode(removed[j])) {
-                            hasRelevantElementChange = true;
-                            break;
-                        }
-                    }
-                    if (hasRelevantElementChange) break;
-                }
-            }
-            if (!hasRelevantElementChange) return;
-        }
         manualBtnScheduled = true;
         setTimeout(() => {
             manualBtnScheduled = false;
@@ -2553,7 +3773,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     /* ------------------------------------------------------------
      * Body Rewriting & Network Injection
      * ------------------------------------------------------------ */
-    const TIME_SPENT_RE = /timeSpent|completeVideoLesson/i;
+    const TIME_SPENT_RE = /timeSpent|completeVideoLesson|completeSubsectionSummary|completeArticleLesson|completeExamQuestionWalkthrough|completeProgressQuizGroup|completeStrengthenQuiz|completeSpacedPracticeQuiz|completeDiagnosticQuizSession|saveExamPractice|completeExamPracticeSession/i;
 
     function resolveTimeField(vars) {
         if (vars.timeSpent != null) return 'timeSpent';
@@ -2570,10 +3790,37 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         return typeof rawVal === 'number' ? round3(newTotal) : String(round3(newTotal));
     }
 
-    function computeManualExtra() {
-        return (settings.manualTimeStacksWithAuto && settings.timeBoostEnabled)
-            ? queuedSeconds + pickExtraSeconds()
-            : queuedSeconds;
+    function computeManualExtra(questionDesc, origSeconds, opName, qStr) {
+        if (settings.manualTimeStacksWithAuto && settings.timeBoostEnabled) {
+            const autoExtra = settings.dynamicTimeEnabled
+                ? computeDynamicExtraSeconds(questionDesc, origSeconds, opName, qStr)
+                : pickExtraSeconds();
+            return queuedSeconds + autoExtra;
+        }
+        return queuedSeconds;
+    }
+
+    function estimateArticleDurationSeconds() {
+        try {
+            if (typeof document !== 'undefined' && typeof document.querySelector === 'function') {
+                const el = document.querySelector('main, article, [class*="article"], #react-content');
+                if (el && el.textContent) {
+                    const words = countWords(el.textContent);
+                    if (words > 20) return Math.min(420, Math.max(45, Math.ceil(words / 3.0)));
+                }
+            }
+        } catch {}
+        return 0;
+    }
+
+    function completeSessionAccumulators(sessionToComplete) {
+        if (sessionToComplete) {
+            sessionToComplete.completed = true;
+            sessionToComplete.totalExtraQuestionSeconds = 0;
+            sessionToComplete.totalSubmittedQuestionSeconds = 0;
+        }
+        accumulatedExtraSeconds = 0;
+        accumulatedQuestionCount = 0;
     }
 
     function maybeBumpTimeSpent(body, source) {
@@ -2581,7 +3828,8 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
         const boostActive = settings.timeBoostEnabled || queuedSeconds !== null || accumulatedExtraSeconds > 0;
         const videoActive = settings.fullVideoWatchedEnabled || settings.addVideoDurationToTimeSpent;
-        if (!boostActive && !videoActive) return { body, changed: false };
+        const predictActive = settings.predictFinalCallEnabled !== false;
+        if (!boostActive && !videoActive && !predictActive) return { body, changed: false };
 
         if (!TIME_SPENT_RE.test(body)) return { body, changed: false };
 
@@ -2601,113 +3849,315 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 ? obj.query
                 : (typeof obj.mutation === 'string' ? obj.mutation : '');
 
-            const isVideo = opName === VIDEO_OP ||
-                qStr.includes(VIDEO_OP) ||
-                qStr.includes('completeVideoLesson');
+            const isQuestion = isQuestionAnswerOp(opName, qStr);
+            const identifiedQ = isQuestion ? identifyCurrentQuestion(vars, opName, qStr) : null;
+            if (identifiedQ) {
+                lastSubmittedQuestionId = identifiedQ.id;
+            }
 
-            if (isVideo) {
-                let videoTouched = false;
+            // 1. CompleteExamQuestionWalkthrough (has timeSpentAnswering, timeSpentMarking, timeSpentWatching, percentWatched)
+            const isWalkthrough = opName === 'CompleteExamQuestionWalkthrough' || qStr.includes('completeExamQuestionWalkthrough');
+            if (isWalkthrough) {
                 const lessonId = String(vars.lessonId || '');
+                const qDesc = lookupQuestion(lessonId) || identifyCurrentQuestion();
+                const matchSession = (activeSession && activeSession.sessionType === 'ExamQuestionWalkthrough' && (!lessonId || activeSession.sessionId === lessonId))
+                    ? activeSession
+                    : null;
 
-                // 1. Force 100% full watched
-                if (settings.fullVideoWatchedEnabled) {
-                    const beforePercent = vars.percentWatched;
-                    const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
-                    if (beforePercent !== targetPercent) {
-                        vars.percentWatched = targetPercent;
-                        bumpStat('videosMaxed');
-                        videoTouched = true;
-                        changed = true;
-
-                        LOG(`[${source}] ${VIDEO_OP}: percentWatched ${beforePercent} → ${targetPercent} (lessonId: ${lessonId || 'unknown'})`);
-                        nativeConsole.log(
-                            `[UpLearn Video] ${VIDEO_OP} lessonId=${lessonId || 'unknown'} original percentWatched=${beforePercent} → ${targetPercent}`
-                        );
-                    }
-                }
-
-                // 2. Add video duration to timeSpent
-                let vidDuration = (lessonId && knownLessonDurations.get(lessonId)) || 0;
-                if (vidDuration <= 0 && currentVideoLesson && (currentVideoLesson.id === lessonId || !lessonId)) {
-                    vidDuration = currentVideoLesson.duration || 0;
-                }
+                let vidDuration = (lessonId && knownLessonDurations.get(lessonId)) || (matchSession ? matchSession.durationSeconds : 0) || 0;
                 if (vidDuration <= 0) {
                     const activeVid = findActiveVideoElement();
                     if (activeVid && isFinite(activeVid.duration) && activeVid.duration > 0) {
                         vidDuration = Math.round(activeVid.duration);
                     }
                 }
-                if (vidDuration <= 0 && currentVideoLesson && currentVideoLesson.duration > 0) {
-                    vidDuration = currentVideoLesson.duration;
+
+                let totalAdded = 0;
+                let manualConsumed = false;
+
+                if (vars.timeSpentAnswering != null) {
+                    const rawAns = vars.timeSpentAnswering;
+                    const origAns = parseDurationToSeconds(rawAns);
+                    if (origAns !== null) {
+                        let targetAns = origAns;
+                        if (matchSession && matchSession.answeringSubmittedSeconds > 0) {
+                            targetAns = origAns + (matchSession.answeringExtraSeconds || 0);
+                            if (settings.predictFinalCallEnabled !== false) {
+                                targetAns = Math.max(targetAns, matchSession.answeringSubmittedSeconds);
+                            }
+                        } else if (settings.timeBoostEnabled) {
+                            const extraAns = settings.dynamicTimeEnabled
+                                ? computeDynamicExtraSeconds(qDesc, origAns, 'AnswerExamQuestion', '')
+                                : pickExtraSeconds();
+                            targetAns = origAns + extraAns;
+                        }
+                        if (queuedSeconds !== null && vars.timeSpentMarking == null) {
+                            targetAns += computeManualExtra(qDesc, origAns, 'AnswerExamQuestion', '');
+                            manualResetNeeded = true;
+                            manualConsumed = true;
+                        }
+                        targetAns = round3(targetAns);
+                        if (targetAns > origAns) {
+                            vars.timeSpentAnswering = formatUpdatedDuration(rawAns, targetAns);
+                            totalAdded += (targetAns - origAns);
+                            changed = true;
+                        }
+                    }
+                }
+
+                if (vars.timeSpentMarking != null) {
+                    const rawMark = vars.timeSpentMarking;
+                    const origMark = parseDurationToSeconds(rawMark);
+                    if (origMark !== null) {
+                        let targetMark = origMark;
+                        if (matchSession && matchSession.markingSubmittedSeconds > 0) {
+                            targetMark = origMark + (matchSession.markingExtraSeconds || 0);
+                            if (settings.predictFinalCallEnabled !== false) {
+                                targetMark = Math.max(targetMark, matchSession.markingSubmittedSeconds);
+                            }
+                        } else if (settings.timeBoostEnabled) {
+                            const extraMark = settings.dynamicTimeEnabled
+                                ? computeDynamicExtraSeconds(qDesc, origMark, 'SaveExamQuestionMarks', '')
+                                : pickExtraSeconds();
+                            targetMark = origMark + extraMark;
+                        }
+                        if (queuedSeconds !== null && !manualConsumed) {
+                            targetMark += computeManualExtra(qDesc, origMark, 'SaveExamQuestionMarks', '');
+                            manualResetNeeded = true;
+                            manualConsumed = true;
+                        }
+                        targetMark = round3(targetMark);
+                        if (targetMark > origMark) {
+                            vars.timeSpentMarking = formatUpdatedDuration(rawMark, targetMark);
+                            totalAdded += (targetMark - origMark);
+                            changed = true;
+                        }
+                    }
+                }
+
+                if (settings.addVideoDurationToTimeSpent && vidDuration > 0) {
+                    if (vars.timeSpentWatching != null) {
+                        const rawWatch = vars.timeSpentWatching;
+                        const origWatch = parseDurationToSeconds(rawWatch) || 0;
+                        vars.timeSpentWatching = formatUpdatedDuration(rawWatch, origWatch + vidDuration);
+                        bumpStat('videoTimeAdded', vidDuration);
+                        changed = true;
+                    } else if (!qStr || qStr.includes('$timeSpentWatching')) {
+                        vars.timeSpentWatching = toIso(vidDuration);
+                        bumpStat('videoTimeAdded', vidDuration);
+                        changed = true;
+                    }
+                }
+
+                if (settings.fullVideoWatchedEnabled && vars.percentWatched !== undefined) {
+                    const beforePercent = vars.percentWatched;
+                    const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
+                    if (beforePercent !== targetPercent) {
+                        vars.percentWatched = targetPercent;
+                        bumpStat('videosMaxed');
+                        changed = true;
+                    }
+                }
+
+                if (totalAdded > 0) {
+                    bumpStat('groupExtra', round3(totalAdded));
+                }
+                if (changed) {
+                    bumpStat('seen');
+                    bumpStat('finalCallsModified');
+                    LOG(`[${source}] CompleteExamQuestionWalkthrough synced: ans=${vars.timeSpentAnswering}, mark=${vars.timeSpentMarking}, watch=${vars.timeSpentWatching}, pct=${vars.percentWatched}`);
+                }
+                completeSessionAccumulators(matchSession);
+                bumpContextRevision();
+                return;
+            }
+
+            // 2. Lesson & Summary completion calls (CompleteVideoLesson, CompleteSubsectionSummary, CompleteArticleLesson)
+            if (isLessonCompletionOp(opName, qStr)) {
+                const isVideo = opName === VIDEO_OP || qStr.includes(VIDEO_OP) || qStr.includes('completeVideoLesson');
+                const isSummary = opName === 'CompleteSubsectionSummary' || qStr.includes('completeSubsectionSummary');
+                const isArticle = opName === 'CompleteArticleLesson' || qStr.includes('completeArticleLesson');
+                const lessonId = String(vars.lessonId || vars.subsectionSummaryId || '');
+                const displayOp = opName || (isVideo ? VIDEO_OP : (isSummary ? 'CompleteSubsectionSummary' : 'CompleteArticleLesson'));
+
+                let lessonTouched = false;
+
+                // 2a. Force 100% full watched (Video & Summary)
+                if ((isVideo || isSummary) && settings.fullVideoWatchedEnabled && vars.percentWatched !== undefined) {
+                    const beforePercent = vars.percentWatched;
+                    const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
+                    if (beforePercent !== targetPercent) {
+                        vars.percentWatched = targetPercent;
+                        bumpStat('videosMaxed');
+                        lessonTouched = true;
+                        changed = true;
+
+                        LOG(`[${source}] ${displayOp}: percentWatched ${beforePercent} → ${targetPercent} (id: ${lessonId || 'unknown'})`);
+                        if (isVideo) {
+                            nativeConsole.log(
+                                `[UpLearn Video] ${VIDEO_OP} lessonId=${lessonId || 'unknown'} original percentWatched=${beforePercent} → ${targetPercent}`
+                            );
+                        }
+                    }
+                }
+
+                // 2b. Resolve duration and combine with session question bonuses
+                let knownDur = (lessonId && knownLessonDurations.get(lessonId)) || 0;
+                if (knownDur <= 0 && activeSession && (!lessonId || activeSession.sessionId === lessonId)) {
+                    knownDur = activeSession.durationSeconds || 0;
+                }
+                if (isVideo) {
+                    if (knownDur <= 0 && currentVideoLesson && (currentVideoLesson.id === lessonId || !lessonId)) {
+                        knownDur = currentVideoLesson.duration || 0;
+                    }
+                    if (knownDur <= 0) {
+                        const activeVid = findActiveVideoElement();
+                        if (activeVid && isFinite(activeVid.duration) && activeVid.duration > 0) {
+                            knownDur = Math.round(activeVid.duration);
+                        }
+                    }
+                    if (knownDur <= 0 && currentVideoLesson && currentVideoLesson.duration > 0) {
+                        knownDur = currentVideoLesson.duration;
+                    }
+                } else if (isArticle && knownDur <= 0) {
+                    knownDur = estimateArticleDurationSeconds();
                 }
 
                 const rawTimeSpent = vars.timeSpent;
-                const origTimeSpent = Number(rawTimeSpent) || 0;
-                let extraTime = (settings.addVideoDurationToTimeSpent && vidDuration > 0) ? vidDuration : 0;
+                const origTimeSpent = (typeof rawTimeSpent === 'number' && isFinite(rawTimeSpent))
+                    ? rawTimeSpent
+                    : (parseDurationToSeconds(rawTimeSpent) || 0);
+
+                let extraTime = 0;
+                if ((isVideo || isSummary) && settings.addVideoDurationToTimeSpent && knownDur > 0) {
+                    extraTime += knownDur;
+                } else if (isArticle && settings.timeBoostEnabled) {
+                    extraTime += (knownDur > 0)
+                        ? knownDur
+                        : (settings.dynamicTimeEnabled ? computeDynamicExtraSeconds(null, origTimeSpent, displayOp, qStr) : pickExtraSeconds());
+                }
+
+                const matchVidSession = (isVideo && activeSession && activeSession.sessionType === 'VideoLesson' && (!lessonId || activeSession.sessionId === lessonId))
+                    ? activeSession
+                    : null;
+                if (isVideo && settings.predictFinalCallEnabled !== false) {
+                    const qExtra = matchVidSession ? (matchVidSession.totalExtraQuestionSeconds || 0) : accumulatedExtraSeconds;
+                    if (qExtra > 0) {
+                        extraTime += qExtra;
+                    }
+                }
 
                 if (queuedSeconds !== null) {
-                    extraTime += computeManualExtra();
+                    extraTime += computeManualExtra(null, origTimeSpent, displayOp, qStr);
                     manualResetNeeded = true;
                 }
 
-                if (extraTime > 0) {
-                    const newTimeSpent = round3(origTimeSpent + extraTime);
-                    vars.timeSpent = (typeof rawTimeSpent === 'string') ? String(newTimeSpent) : newTimeSpent;
-                    if (settings.addVideoDurationToTimeSpent && vidDuration > 0) {
-                        bumpStat('videoTimeAdded', vidDuration);
+                let newTimeSpent = round3(origTimeSpent + extraTime);
+                if (matchVidSession && settings.predictFinalCallEnabled !== false && matchVidSession.totalSubmittedQuestionSeconds > 0) {
+                    const floorTotal = round3(matchVidSession.totalSubmittedQuestionSeconds + (settings.addVideoDurationToTimeSpent ? knownDur : 0));
+                    if (newTimeSpent < floorTotal) {
+                        newTimeSpent = floorTotal;
                     }
-                    videoTouched = true;
+                }
+
+                if (rawTimeSpent !== undefined && newTimeSpent > origTimeSpent) {
+                    vars.timeSpent = formatUpdatedDuration(rawTimeSpent, newTimeSpent);
+
+                    if ((isVideo || isSummary) && settings.addVideoDurationToTimeSpent && knownDur > 0) {
+                        bumpStat('videoTimeAdded', knownDur);
+                    }
+                    lessonTouched = true;
                     changed = true;
 
-                    LOG(`[${source}] ${VIDEO_OP}: timeSpent ${rawTimeSpent} (+${formatSeconds(extraTime)}) → ${vars.timeSpent} (lessonId: ${lessonId || 'unknown'})`);
-                    nativeConsole.log(
-                        `[UpLearn Video] ${VIDEO_OP} lessonId=${lessonId || 'unknown'} original timeSpent=${rawTimeSpent} (+${formatSeconds(extraTime)}) → ${vars.timeSpent}`
-                    );
+                    const deltaLogged = round3(newTimeSpent - origTimeSpent);
+                    LOG(`[${source}] ${displayOp}: timeSpent ${rawTimeSpent} (+${formatSeconds(deltaLogged)}) → ${vars.timeSpent} (id: ${lessonId || 'unknown'})`);
+                    if (isVideo) {
+                        nativeConsole.log(
+                            `[UpLearn Video] ${VIDEO_OP} lessonId=${lessonId || 'unknown'} original timeSpent=${rawTimeSpent} (+${formatSeconds(deltaLogged)}) → ${vars.timeSpent}`
+                        );
+                    }
                 }
 
-                if (videoTouched) {
+                if (lessonTouched) {
                     bumpStat('seen');
+                    bumpStat('finalCallsModified');
                 }
+                completeSessionAccumulators(activeSession && (!lessonId || activeSession.sessionId === lessonId) ? activeSession : null);
+                bumpContextRevision();
                 return;
             }
 
             const timeField = resolveTimeField(vars);
 
-            // Group / Session completion operations
-            if (boostActive && isQuizGroupOp(opName, qStr)) {
-                if (timeField) {
+            // 3. Quiz Group / Session completion final calls
+            if (isQuizGroupOp(opName, qStr)) {
+                const isExamPracticeComplete = opName === 'CompleteExamPracticeSession' || qStr.includes('completeExamPracticeSession');
+                const isSaveExamAnswers = opName === 'SaveExamPracticeAnswers' || qStr.includes('saveExamPracticeAnswers');
+
+                if (isExamPracticeComplete && !timeField) {
+                    completeSessionAccumulators(activeSession && activeSession.sessionType === 'ExamPracticeSession' ? activeSession : null);
+                    bumpContextRevision();
+                    return;
+                }
+
+                if (timeField && (boostActive || predictActive)) {
                     const rawVal = vars[timeField];
                     const total = parseDurationToSeconds(rawVal);
                     if (total !== null) {
-                        let bonus = accumulatedExtraSeconds;
+                        const useSessionBonus = activeSession && (activeSession.totalExtraQuestionSeconds > 0 || activeSession.totalSubmittedQuestionSeconds > 0);
+                        let bonus = useSessionBonus ? activeSession.totalExtraQuestionSeconds : accumulatedExtraSeconds;
                         let isManual = false;
+
+                        if (bonus === 0 && settings.timeBoostEnabled && settings.predictFinalCallEnabled !== false) {
+                            const activeQ = identifyCurrentQuestion();
+                            bonus = settings.dynamicTimeEnabled
+                                ? computeDynamicExtraSeconds(activeQ, total, opName, qStr)
+                                : pickExtraSeconds();
+                        }
+
                         if (queuedSeconds !== null) {
                             isManual = true;
-                            bonus += computeManualExtra();
+                            bonus += computeManualExtra(identifyCurrentQuestion(), total, opName, qStr);
                             manualResetNeeded = true;
                         }
 
                         if (bonus > 0) {
-                            vars[timeField] = formatUpdatedDuration(rawVal, total + bonus);
-                            bumpStat('groupExtra', bonus);
-                            changed = true;
-                            const count = accumulatedQuestionCount;
-                            LOG(`[${source}] ${opName || 'QuizGroup'}: ${rawVal} → ${vars[timeField]} ` +
-                                `(+${bonus}s${count > 0 ? ` from ${count} question(s)` : ''}${isManual ? ' [manual]' : ''})`);
-                            VLOG('group bonus applied; per-question accumulator reset', { bonus, count, opName });
+                            let finalTotal = round3(total + bonus);
+                            if (settings.predictFinalCallEnabled !== false && activeSession && activeSession.totalSubmittedQuestionSeconds > 0) {
+                                const minTotal = round3(activeSession.totalSubmittedQuestionSeconds + Math.min(bonus, 12));
+                                if (finalTotal < minTotal) finalTotal = minTotal;
+                            }
+                            const addedDelta = round3(finalTotal - total);
+                            if (addedDelta > 0) {
+                                vars[timeField] = formatUpdatedDuration(rawVal, finalTotal);
+                                bumpStat('groupExtra', addedDelta);
+                                bumpStat('finalCallsModified');
+                                changed = true;
+                                const count = accumulatedQuestionCount;
+                                LOG(`[${source}] ${opName || 'QuizGroup'}: ${rawVal} → ${vars[timeField]} ` +
+                                    `(+${addedDelta}s${count > 0 ? ` from ${count} question(s)` : ''}${isManual ? ' [manual]' : ''})`);
+                                VLOG('group bonus applied; per-question accumulator reset', { bonus: addedDelta, count, opName });
+                            }
                         }
                     }
+
                     const prevAcc = accumulatedExtraSeconds;
-                    accumulatedExtraSeconds = 0;
-                    accumulatedQuestionCount = 0;
+                    if (activeSession && isSaveExamAnswers) {
+                        accumulatedExtraSeconds = 0;
+                        accumulatedQuestionCount = 0;
+                        activeSession.phase = 'answers_saved';
+                        updatePredictedFinalCall(activeSession);
+                    } else {
+                        completeSessionAccumulators(activeSession);
+                    }
                     if (!changed && prevAcc > 0) notifyStatsChange();
+                    bumpContextRevision();
                 }
                 return;
             }
 
-            // Per-question operations (and any other question/lesson operation with timeSpent)
+            // 4. Per-question operations
             if (boostActive && timeField) {
-                const isQuestion = isQuestionAnswerOp(opName, qStr);
                 const hasManual = queuedSeconds !== null;
                 if (!hasManual && !isQuestion && !KNOWN_LESSON_OPS.has(opName)) {
                     return;
@@ -2722,37 +4172,68 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
                 if (hasManual) {
                     isManual = true;
-                    extra = computeManualExtra();
+                    extra = computeManualExtra(identifiedQ, total, opName, qStr);
                 } else if (settings.timeBoostEnabled) {
-                    extra = pickExtraSeconds();
+                    extra = settings.dynamicTimeEnabled
+                        ? computeDynamicExtraSeconds(identifiedQ, total, opName, qStr)
+                        : pickExtraSeconds();
                 } else {
                     return;
                 }
 
                 if (extra > 0) {
-                    vars[timeField] = formatUpdatedDuration(rawVal, total + extra);
-                    accumulatedExtraSeconds += extra;
+                    const newSubmitted = round3(total + extra);
+                    vars[timeField] = formatUpdatedDuration(rawVal, newSubmitted);
+                    accumulatedExtraSeconds = round3(accumulatedExtraSeconds + extra);
                     accumulatedQuestionCount += 1;
+
+                    if (identifiedQ) {
+                        identifiedQ.attempts = (identifiedQ.attempts || 0) + 1;
+                        identifiedQ.lastSubmittedTimeSeconds = newSubmitted;
+                        identifiedQ.lastExtraTimeSeconds = extra;
+                        identifiedQ.lastAnsweredAt = Date.now();
+                    }
+
+                    if (activeSession) {
+                        activeSession.totalOriginalQuestionSeconds = round3((activeSession.totalOriginalQuestionSeconds || 0) + total);
+                        activeSession.totalExtraQuestionSeconds = round3((activeSession.totalExtraQuestionSeconds || 0) + extra);
+                        activeSession.totalSubmittedQuestionSeconds = round3((activeSession.totalSubmittedQuestionSeconds || 0) + newSubmitted);
+
+                        if (opName === 'AnswerExamQuestion' || qStr.includes('answerExamQuestion')) {
+                            activeSession.answeringSubmittedSeconds = round3((activeSession.answeringSubmittedSeconds || 0) + newSubmitted);
+                            activeSession.answeringExtraSeconds = round3((activeSession.answeringExtraSeconds || 0) + extra);
+                        } else if (opName === 'SaveExamQuestionMarks' || qStr.includes('saveExamQuestionMarks')) {
+                            activeSession.markingSubmittedSeconds = round3((activeSession.markingSubmittedSeconds || 0) + newSubmitted);
+                            activeSession.markingExtraSeconds = round3((activeSession.markingExtraSeconds || 0) + extra);
+                        }
+                        updatePredictedFinalCall(activeSession);
+                    }
+
                     bumpStat('seen');
                     bumpStat('boosted');
                     if (isManual) {
                         bumpStat('manualBoosted');
                         manualResetNeeded = true;
                     }
+                    bumpContextRevision();
                     changed = true;
 
                     const displayOp = opName || 'Question';
+                    const qLabel = identifiedQ ? ` [${identifiedQ.primaryType}, rec ${identifiedQ.recommendedSeconds}s]` : '';
                     if (isManual) {
-                        LOG(`[${source}] ${displayOp} (manual time): ${rawVal} (+${formatSeconds(queuedSeconds)}${settings.manualTimeStacksWithAuto && settings.timeBoostEnabled ? ' + auto' : ''}) → ${vars[timeField]} ` +
+                        LOG(`[${source}] ${displayOp}${qLabel} (manual time): ${rawVal} (+${formatSeconds(queuedSeconds)}${settings.manualTimeStacksWithAuto && settings.timeBoostEnabled ? ' + auto' : ''}) → ${vars[timeField]} ` +
                             `(accumulated ${accumulatedExtraSeconds}s / ${accumulatedQuestionCount} q)`);
                         nativeConsole.log(
                             `[UpLearn timeSpent] ${displayOp} original=${rawVal} (+${formatSeconds(extra)}) → ${vars[timeField]}`
                         );
                     } else {
-                        LOG(`[${source}] ${displayOp}: ${rawVal} → ${vars[timeField]} ` +
+                        LOG(`[${source}] ${displayOp}${qLabel}: ${rawVal} → ${vars[timeField]} ` +
                             `(+${extra}s, accumulated ${accumulatedExtraSeconds}s / ${accumulatedQuestionCount} q)`);
                         VLOG('boost roll', {
                             opName: displayOp,
+                            questionId: identifiedQ ? identifiedQ.id : null,
+                            questionType: identifiedQ ? identifiedQ.primaryType : null,
+                            dynamic: settings.dynamicTimeEnabled,
                             rolled: extra,
                             range: `[${settings.extraSecondsMin}–${settings.extraSecondsMax}]`,
                             newAccumulated: accumulatedExtraSeconds,
@@ -2790,8 +4271,9 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     };
 
     function withCapturedFetchBody(input, init, onBody, onFallback) {
+        if (settings.logLevel === 'silent') return onBody(null);
         const bodyStr = init && init.body != null ? extractSyncBodyText(init.body) : null;
-        if (bodyStr == null && settings.logLevel !== 'silent' && typeof Request !== 'undefined' && input instanceof Request) {
+        if (bodyStr == null && typeof Request !== 'undefined' && input instanceof Request) {
             try {
                 const ct = (input.headers.get('content-type') || '').toLowerCase();
                 if (ct.includes('application/json') || ct.includes('text/')) {
@@ -2891,7 +4373,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                                     bumpStat('jitsuPackets');
                                     reportJitsuPacket('fetch · BLOCKED', url, capturedBody);
                                 } else {
-                                    reportBlock('fetch', url, { method, body: capturedBody });
+                                    reportBlock('fetch', url, { method, body: capturedBody }, anyMatch);
                                 }
                                 return new Response('{}', JSON_OK_INIT);
                             }));
@@ -2955,8 +4437,8 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                                 const { body: newBody, changed } = maybeBumpTimeSpent(body, 'fetch');
                                 if (changed) {
                                     const wasBuffer = typeof ArrayBuffer !== 'undefined' && (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body));
-                                    const encodedBody = (wasBuffer && typeof TextEncoder !== 'undefined')
-                                        ? new TextEncoder().encode(newBody)
+                                    const encodedBody = (wasBuffer && sharedTextEncoder)
+                                        ? sharedTextEncoder.encode(newBody)
                                         : newBody;
                                     init = Object.assign({}, init, { body: encodedBody });
                                     bodyChanged = true;
@@ -3043,6 +4525,30 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         }, 0);
     }
 
+    function handleSyncTelemetryMatch(anyMatch, source, url, method, rawBody, allowBlock) {
+        const silent = settings.logLevel === 'silent';
+        if (allowBlock && isServiceMatchBlocked(anyMatch)) {
+            const bodyStr = silent ? '' : describeBody(rawBody);
+            if (anyMatch.key === 'jitsu') {
+                bumpStat('jitsuPackets');
+                if (!silent) reportJitsuPacket(`${source} · BLOCKED`, url, bodyStr);
+            } else if (!silent) {
+                const details = method ? { method, body: bodyStr } : { body: bodyStr };
+                reportBlock(source, url, details, anyMatch);
+            }
+            bumpStat('blocked');
+            return true;
+        }
+
+        if (anyMatch.key === 'jitsu') {
+            bumpStat('jitsuPackets');
+            if (!silent) reportJitsuPacket(source, url, describeBody(rawBody));
+        } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
+            reportAllow(source, url, `service "${anyMatch.label}" disabled in settings`);
+        }
+        return false;
+    }
+
     const OrigXHR = window.XMLHttpRequest;
     const xhrInfoMap = new WeakMap();
 
@@ -3102,26 +4608,9 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
                     const anyMatch = matchAnyTelemetryService(url);
                     if (anyMatch) {
-                        // ---- Telemetry block ----
-                        if (isServiceMatchBlocked(anyMatch)) {
-                            const bodyStr = describeBody(body);
-                            if (anyMatch.key === 'jitsu') {
-                                bumpStat('jitsuPackets');
-                                reportJitsuPacket('XHR · BLOCKED', url, bodyStr);
-                            } else {
-                                reportBlock('XHR', url, { method, body: bodyStr });
-                            }
-                            bumpStat('blocked');
+                        if (handleSyncTelemetryMatch(anyMatch, 'XHR', url, method, body, true)) {
                             mockBlockedXHR(this, '{}', () => ({}), info, sentSeq);
                             return;
-                        }
-
-                        // ---- Jitsu allowed: log packet, then pass through ----
-                        if (anyMatch.key === 'jitsu') {
-                            bumpStat('jitsuPackets');
-                            reportJitsuPacket('XHR', url, describeBody(body));
-                        } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
-                            reportAllow('XHR', url, `service "${anyMatch.label}" disabled in settings`);
                         }
                     } else if (isTargetApi(url)) {
                         if (method === 'POST') bumpStat('apiPosts');
@@ -3138,9 +4627,9 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                             reqKind = classifyApiRequest(bodyText);
                             const { body: newBody, changed } = maybeBumpTimeSpent(bodyText, 'xhr');
                             if (changed) {
-                                body = (typeof body === 'string' || typeof TextEncoder === 'undefined')
+                                body = (typeof body === 'string' || !sharedTextEncoder)
                                     ? newBody
-                                    : new TextEncoder().encode(newBody);
+                                    : sharedTextEncoder.encode(newBody);
                                 bodyChanged = true;
                             }
                         }
@@ -3239,23 +4728,8 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                     const urlStr = toUrlString(url);
                     const anyMatch = matchAnyTelemetryService(urlStr);
                     if (anyMatch) {
-                        if (settings.blockSendBeacon && isServiceMatchBlocked(anyMatch)) {
-                            const bodyStr = describeBody(data);
-                            if (anyMatch.key === 'jitsu') {
-                                bumpStat('jitsuPackets');
-                                reportJitsuPacket('sendBeacon · BLOCKED', urlStr, bodyStr);
-                            } else {
-                                reportBlock('sendBeacon', urlStr, { body: bodyStr });
-                            }
-                            bumpStat('blocked');
+                        if (handleSyncTelemetryMatch(anyMatch, 'sendBeacon', urlStr, null, data, settings.blockSendBeacon)) {
                             return true;
-                        }
-
-                        if (anyMatch.key === 'jitsu') {
-                            bumpStat('jitsuPackets');
-                            reportJitsuPacket('sendBeacon', urlStr, describeBody(data));
-                        } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
-                            reportAllow('sendBeacon', urlStr, `service "${anyMatch.label}" disabled in settings`);
                         }
                     } else if (isTargetApi(urlStr)) {
                         const bodyText = extractSyncBodyText(data);
@@ -3483,7 +4957,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 const getter = ({
                     [getterName]() {
                         if (settings.spoofVisibility) return null;
-                        if (desc && desc.get) return reflectApply(desc.get, this, arguments);
+                        if (desc && desc.get) return desc.get.call(this);
                         return fallbackVal;
                     }
                 })[getterName];
@@ -3493,7 +4967,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                             VLOG(`suppressed assignment to "${prop}"`);
                             return;
                         }
-                        if (desc && desc.set) reflectApply(desc.set, this, arguments);
+                        if (desc && desc.set) desc.set.call(this, v);
                         else fallbackVal = v;
                     }
                 })[setterName];
@@ -5635,6 +7109,16 @@ function getEffectiveTheme(thm) {
         }
 
         switch (key) {
+            case 'dynamicTimeEnabled':
+                LOG('dynamic question time calculation ' + (value ? 'ENABLED' : 'DISABLED'));
+                updateLabel();
+                break;
+            case 'predictFinalCallEnabled':
+                LOG('final API call prediction & sync ' + (value ? 'ENABLED' : 'DISABLED'));
+                if (activeSession) updatePredictedFinalCall(activeSession);
+                bumpContextRevision();
+                updateLabel();
+                break;
             case 'manualTimeButtonEnabled':
                 LOG('manual "Add time" button ' + (value ? 'ENABLED' : 'DISABLED'));
                 if (!value) removeButton();
@@ -5647,7 +7131,7 @@ function getEffectiveTheme(thm) {
                 LOG('full video watch toggle (percentWatched=1) ' + (value ? 'ENABLED' : 'DISABLED'));
                 break;
             case 'autoSkipVideoEnabled':
-                if (value) startVideoAutoSkipController();
+                if (value) initVideoAutoSkipController();
                 LOG('auto-skip video to questions / completion ' + (value ? 'ENABLED' : 'DISABLED'));
                 break;
             case 'addVideoDurationToTimeSpent':
@@ -5726,9 +7210,14 @@ var Glisse = (() => {
   }
   const jsxs = jsx;
 
-  function cx(...names) {
-    return names.filter(Boolean).join(" ");
+  function cx(a, b, c, d) {
+    let out = a || "";
+    if (b) out = out ? out + " " + b : b;
+    if (c) out = out ? out + " " + c : c;
+    if (d) out = out ? out + " " + d : d;
+    return out;
   }
+  const isRealDocHidden = () => (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : document.hidden);
   var moving = /* @__PURE__ */ new Set();
   var frame = 0;
   var last = 0;
@@ -5790,13 +7279,14 @@ var Glisse = (() => {
       paint: () => paint(s.value),
       set(target, instant = false) {
         s.target = target;
-        if (instant || document.hidden || prefersReducedMotion()) {
+        if (instant || isRealDocHidden() || prefersReducedMotion()) {
           s.value = target;
           s.velocity = 0;
           moving.delete(s);
           paint(target);
           return;
         }
+        if (s.value === target && s.velocity === 0 && !moving.has(s)) return;
         moving.add(s);
         if (!frame) {
           last = Number(document.timeline?.currentTime ?? performance.now());
@@ -6063,6 +7553,7 @@ var Glisse = (() => {
       outShine = ((aByte << 24) | (b << 16) | (g << 8) | r) >>> 0;
     }
 
+    let templateBezelRowOffset = -1;
     for (let y = 0; y < h; y++) {
       const py = (y + 0.5) - halfH;
       const qy = Math.abs(py) - innerH;
@@ -6094,6 +7585,18 @@ var Glisse = (() => {
           flatStart = 0;
           flatEnd = 0;
         }
+      }
+
+      if (qyNegBezel && templateBezelRowOffset !== -1) {
+        if (flatStart > 0) {
+          shineU32.copyWithin(rowPixelOffset, templateBezelRowOffset, templateBezelRowOffset + flatStart);
+          if (fieldU32) fieldU32.copyWithin(rowPixelOffset, templateBezelRowOffset, templateBezelRowOffset + flatStart);
+        }
+        if (flatEnd < w) {
+          shineU32.copyWithin(rowPixelOffset + flatEnd, templateBezelRowOffset + flatEnd, templateBezelRowOffset + w);
+          if (fieldU32) fieldU32.copyWithin(rowPixelOffset + flatEnd, templateBezelRowOffset + flatEnd, templateBezelRowOffset + w);
+        }
+        continue;
       }
 
       // Left [0, flatStart) and right [flatEnd, w) edge/corner segments
@@ -6136,6 +7639,9 @@ var Glisse = (() => {
           if (fieldU32 && outField !== 0xFF808080) fieldU32[pixelIdx] = outField;
         }
       }
+      if (qyNegBezel && templateBezelRowOffset === -1) {
+        templateBezelRowOffset = rowPixelOffset;
+      }
     }
 
     let displacement = null;
@@ -6165,7 +7671,7 @@ var Glisse = (() => {
   }
 
   function cacheLens(key, result) {
-    if (lenses.size >= 50) {
+    if (lenses.size >= 64) {
       const oldestKey = lenses.keys().next().value;
       const oldest = lenses.get(oldestKey);
       if (oldest && oldest.filterNode && oldest.filterNode.parentNode) {
@@ -7013,21 +8519,14 @@ var Glisse = (() => {
     const springs = useRef(null);
     useImperativeHandle(forwardedRef, () => ref.current);
     useEffect(() => {
-      latest.current = {
-        checked,
-        setChecked,
-        travel
-      };
+      latest.current.checked = checked;
+      latest.current.setChecked = setChecked;
       springs.current?.position.set(checked ? 1 : 0);
       springs.current?.color.set(checked ? 1 : 0);
     }, [
       checked,
-      setChecked,
-      travel
+      setChecked
     ]);
-    useEffect(() => {
-      springs.current?.position.paint();
-    }, [travel]);
     useEffect(() => {
       const el = ref.current;
       const fill = fillRef.current;
@@ -7340,7 +8839,7 @@ var Glisse = (() => {
       settle(true);
     };
     const onVisibilityChange = () => {
-      if (document.hidden) reset();
+      if (isRealDocHidden()) reset();
     };
     const observer = new ResizeObserver(() => {
       measure();
@@ -7897,9 +9396,7 @@ ${SVG_ICONS.checkSelect}
             for (const key in TELEMETRY_SERVICES) {
                 total++;
                 const svc = TELEMETRY_SERVICES[key];
-                const checked = key === 'jitsu'
-                    ? !!(currentSettings.suppressJitsu && (!currentSettings.telemetryServices || currentSettings.telemetryServices.jitsu !== false))
-                    : !!(currentSettings.telemetryServices && currentSettings.telemetryServices[key]);
+                const checked = isServiceEnabledIn(currentSettings, key);
                 if (checked) active++;
                 if (!q || svc.label.toLowerCase().includes(q) || svc.hosts.some(h => h.includes(q))) {
                     list.push({ key, svc, checked });
@@ -7910,9 +9407,7 @@ ${SVG_ICONS.checkSelect}
 
         const handleToggleService = useCallback((key) => {
             const current = currentSettings.telemetryServices || {};
-            const curVal = key === 'jitsu'
-                ? !!(currentSettings.suppressJitsu && current[key] !== false)
-                : !!current[key];
+            const curVal = isServiceEnabledIn(currentSettings, key);
             const next = !curVal;
             const updated = Object.assign({}, current, { [key]: next });
             LOG(`service "${TELEMETRY_SERVICES[key].label}" ${next ? 'ENABLED' : 'DISABLED'}`);
@@ -8089,6 +9584,7 @@ ${SVG_ICONS.checkSelect}
     const TimeBoostTab = React.memo(({
         currentSettings,
         accumulatedBonus,
+        sessionContext,
         onUpdateSetting,
         onAddManualBonus,
         onClearBonus,
@@ -8124,6 +9620,8 @@ ${SVG_ICONS.checkSelect}
         }, [maxStr, currentSettings.extraSecondsMin, currentSettings.extraSecondsMax, onUpdateSetting]);
 
         const updateTimeBoost = useCallback((v) => onUpdateSetting('timeBoostEnabled', v), [onUpdateSetting]);
+        const updateDynamicTime = useCallback((v) => onUpdateSetting('dynamicTimeEnabled', v), [onUpdateSetting]);
+        const updatePredictFinal = useCallback((v) => onUpdateSetting('predictFinalCallEnabled', v), [onUpdateSetting]);
         const updateManualBtn = useCallback((v) => onUpdateSetting('manualTimeButtonEnabled', v), [onUpdateSetting]);
         const updateManualStack = useCallback((v) => onUpdateSetting('manualTimeStacksWithAuto', v), [onUpdateSetting]);
         const updateFullVideo = useCallback((v) => onUpdateSetting('fullVideoWatchedEnabled', v), [onUpdateSetting]);
@@ -8140,6 +9638,17 @@ ${SVG_ICONS.checkSelect}
         const rangeHint = (currentSettings.extraSecondsMin === currentSettings.extraSecondsMax)
             ? `Every question receives +${currentSettings.extraSecondsMin}s bonus.`
             : `Each question rolls a random +${currentSettings.extraSecondsMin}–${currentSettings.extraSecondsMax}s bonus.`;
+
+        const ctx = sessionContext || {};
+        const qContextDesc = ctx.hasSession
+            ? `${ctx.sessionTitle || ctx.sessionType}${ctx.questionLabel ? ` · ${ctx.questionLabel}` : ''}${ctx.questionSnippet ? ` — "${ctx.questionSnippet}"` : ''}`
+            : 'Open a quiz, video, summary, or exam lesson to detect active questions';
+        const qContextBadge = ctx.questionType
+            ? `${ctx.questionType}${ctx.questionRecommendedSeconds ? ` · ~${ctx.questionRecommendedSeconds}s` : ''}`
+            : (ctx.hasSession ? (ctx.completed ? 'Completed' : 'Standby') : 'None');
+        const predDesc = ctx.predictedOp
+            ? `Intercepts and syncs ${ctx.predictedOp} when this ${ctx.sessionType || 'activity'} finishes`
+            : 'Waiting for an active quiz, lesson, or exam session';
 
         return html`
             <div className="grid-2col">
@@ -8161,6 +9670,23 @@ ${SVG_ICONS.checkSelect}
                             >
                                 <${Switch.Label}>Enable question time boost<//>
                                 <${Switch.Description}>Injects calculated time bonuses into question answering and quiz completion API calls<//>
+                            <//>
+
+                            <${Switch} 
+                                isSelected=${currentSettings.dynamicTimeEnabled !== false}
+                                onChange=${updateDynamicTime}
+                                isDisabled=${!currentSettings.timeBoostEnabled}
+                            >
+                                <${Switch.Label}>Dynamic question time calculation<//>
+                                <${Switch.Description}>Adapts time per question based on type, word count, math/blanks, marks, and retries<//>
+                            <//>
+
+                            <${Switch} 
+                                isSelected=${currentSettings.predictFinalCallEnabled !== false}
+                                onChange=${updatePredictFinal}
+                            >
+                                <${Switch.Label}>Predict & sync final completion call<//>
+                                <${Switch.Description}>Tracks active session and syncs final quiz, walkthrough, and video completion payloads<//>
                             <//>
 
                             <${FieldRow}>
@@ -8293,6 +9819,24 @@ ${SVG_ICONS.checkSelect}
                             <${Card.Description}>Real-time quiz bonus accumulated in this session to inject into UpLearn summaries.<//>
                         <//>
                         <${Card.Content}>
+                            <${FieldRow}>
+                                <label>Active Question Context
+                                    <small>${qContextDesc}</small>
+                                </label>
+                                <${Badge} variant="soft" color=${ctx.questionType ? 'accent' : 'default'}>
+                                    ${qContextBadge}
+                                <//>
+                            <//>
+                            <${FieldRow}>
+                                <label>Predicted Final API Call
+                                    <small>${predDesc}</small>
+                                </label>
+                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+                                    <${Badge} variant="soft" color=${ctx.predictedOp ? 'success' : 'default'}>
+                                        ${ctx.predictedOp ? `${ctx.predictedOp}${ctx.predictedTotalSeconds > 0 ? ` (~${formatSeconds(ctx.predictedTotalSeconds)})` : ''}` : 'None'}
+                                    <//>
+                                </div>
+                            <//>
                             <${FieldRow}>
                                 <label>Accumulated Time Bonus
                                     <small>Currently queued bonus to be credited on submission</small>
@@ -8725,6 +10269,14 @@ ${SVG_ICONS.resetPill}
                                     <span className="stat-card__label">Video Time Added</span>
                                     <span className="stat-card__value">+${formatSeconds(tabStats.videoTimeAdded || 0)}</span>
                                 </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Qs Identified</span>
+                                    <span className="stat-card__value">${tabStats.questionsIdentified || 0}</span>
+                                </div>
+                                <div className="stat-card">
+                                    <span className="stat-card__label">Final Calls Synced</span>
+                                    <span className="stat-card__value">${tabStats.finalCallsModified || 0}</span>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -8741,12 +10293,20 @@ ${SVG_ICONS.resetPill}
     ];
 
     // Glisse SettingsModal (No traffic lights, authentic Glisse TabBar & Buttons)
+    const getDefaultModalDims = () => ({
+        w: Math.min(920, window.innerWidth * 0.92),
+        h: Math.min(680, window.innerHeight * 0.86),
+    });
+    const clampModalCoord = (val, size, viewport) =>
+        Math.min(Math.max(10, Math.round(val)), Math.max(10, viewport - size - 10));
+
     const SettingsModal = React.memo(({
         isOpen,
         isClosing,
         onClose,
         currentSettings,
         accumulatedBonus,
+        sessionContext,
         isCapturingKeybind,
         onStartCaptureKeybind,
         onClearKeybind,
@@ -8763,24 +10323,19 @@ ${SVG_ICONS.resetPill}
         const isDraggable = Boolean(currentSettings && currentSettings.draggableUI);
 
         const [pos, setPos] = useState(() => {
+            const { w, h } = getDefaultModalDims();
             try {
                 const saved = localStorage.getItem('__ul_win_pos');
                 if (saved) {
                     const p = JSON.parse(saved);
                     if (typeof p.x === 'number' && typeof p.y === 'number') {
-                        const w = Math.min(920, window.innerWidth * 0.92);
-                        const h = Math.min(680, window.innerHeight * 0.86);
-                        const maxX = Math.max(10, window.innerWidth - w - 10);
-                        const maxY = Math.max(10, window.innerHeight - h - 10);
                         return {
-                            x: Math.min(Math.max(10, Math.round(p.x)), maxX),
-                            y: Math.min(Math.max(10, Math.round(p.y)), maxY),
+                            x: clampModalCoord(p.x, w, window.innerWidth),
+                            y: clampModalCoord(p.y, h, window.innerHeight),
                         };
                     }
                 }
             } catch {}
-            const w = Math.min(920, window.innerWidth * 0.92);
-            const h = Math.min(680, window.innerHeight * 0.86);
             return {
                 x: Math.max(10, Math.round((window.innerWidth - w) / 2)),
                 y: Math.max(10, Math.round((window.innerHeight - h) / 2)),
@@ -8798,12 +10353,9 @@ ${SVG_ICONS.resetPill}
             if (!isDraggable) return;
             const handleResize = () => {
                 setPos((prev) => {
-                    const w = Math.min(920, window.innerWidth * 0.92);
-                    const h = Math.min(680, window.innerHeight * 0.86);
-                    const maxX = Math.max(10, window.innerWidth - w - 10);
-                    const maxY = Math.max(10, window.innerHeight - h - 10);
-                    const nextX = Math.min(Math.max(10, prev.x), maxX);
-                    const nextY = Math.min(Math.max(10, prev.y), maxY);
+                    const { w, h } = getDefaultModalDims();
+                    const nextX = clampModalCoord(prev.x, w, window.innerWidth);
+                    const nextY = clampModalCoord(prev.y, h, window.innerHeight);
                     if (nextX !== prev.x || nextY !== prev.y) {
                         return { x: nextX, y: nextY };
                     }
@@ -8825,8 +10377,9 @@ ${SVG_ICONS.resetPill}
 
             const dialogEl = dialogRef.current;
             const dialogRect = dialogEl ? dialogEl.getBoundingClientRect() : null;
-            const curW = dialogRect ? dialogRect.width : Math.min(920, window.innerWidth * 0.92);
-            const curH = dialogRect ? dialogRect.height : Math.min(680, window.innerHeight * 0.86);
+            const fallbackDims = dialogRect ? null : getDefaultModalDims();
+            const curW = dialogRect ? dialogRect.width : fallbackDims.w;
+            const curH = dialogRect ? dialogRect.height : fallbackDims.h;
 
             dragRef.current = {
                 startX: e.clientX,
@@ -8842,10 +10395,9 @@ ${SVG_ICONS.resetPill}
                 if (!dragRef.current) return;
                 const dx = moveEvt.clientX - dragRef.current.startX;
                 const dy = moveEvt.clientY - dragRef.current.startY;
-                const maxX = Math.max(10, window.innerWidth - dragRef.current.dialogW - 10);
-                const maxY = Math.max(10, window.innerHeight - dragRef.current.dialogH - 10);
-                const nextX = Math.min(Math.max(10, Math.round(dragRef.current.initX + dx)), maxX);
-                const nextY = Math.min(Math.max(10, Math.round(dragRef.current.initY + dy)), maxY);
+                const nextX = clampModalCoord(dragRef.current.initX + dx, dragRef.current.dialogW, window.innerWidth);
+                const nextY = clampModalCoord(dragRef.current.initY + dy, dragRef.current.dialogH, window.innerHeight);
+                if (nextX === posRef.current.x && nextY === posRef.current.y) return;
                 posRef.current = { x: nextX, y: nextY };
                 if (dialogRef.current) {
                     dialogRef.current.style.left = nextX + 'px';
@@ -8957,6 +10509,7 @@ ${SVG_ICONS.closeModal}
                                         <${TimeBoostTab} 
                                             currentSettings=${currentSettings}
                                             accumulatedBonus=${accumulatedBonus}
+                                            sessionContext=${sessionContext}
                                             onUpdateSetting=${onUpdateSetting}
                                             onAddManualBonus=${onAddManualBonus}
                                             onClearBonus=${onClearBonus}
@@ -8993,10 +10546,58 @@ ${SVG_ICONS.closeModal}
         `;
     });
 
+    function buildSessionContextSnapshot() {
+        const session = activeSession;
+        if (!session) {
+            return {
+                hasSession: false,
+                sessionType: '',
+                sessionId: '',
+                sessionTitle: '',
+                completed: false,
+                questionId: null,
+                questionLabel: '',
+                questionType: '',
+                questionRecommendedSeconds: 0,
+                questionSnippet: '',
+                predictedOp: null,
+                predictedTotalSeconds: 0,
+                contextRevision,
+            };
+        }
+        const q = !session.completed ? identifyCurrentQuestion() : null;
+        const pred = updatePredictedFinalCall(session) || session.predictedFinalCall;
+        let questionLabel = '';
+        if (q) {
+            const totalQ = Array.isArray(session.questionIds) ? session.questionIds.length : 0;
+            const rawIdx = Array.isArray(session.questionIds) ? session.questionIds.indexOf(q.id) : -1;
+            const num = rawIdx !== -1 ? (rawIdx + 1) : ((session.currentQuestionIndex || 0) + 1);
+            questionLabel = totalQ > 0 ? `Q${num}/${totalQ}` : (q.id ? `Q#${q.id}` : '');
+        } else if (Array.isArray(session.questionIds) && session.questionIds.length > 0 && !session.completed) {
+            questionLabel = `0/${session.questionIds.length}`;
+        }
+        return {
+            hasSession: true,
+            sessionType: session.sessionType || '',
+            sessionId: session.sessionId || '',
+            sessionTitle: session.title || '',
+            completed: !!session.completed,
+            questionId: q ? q.id : null,
+            questionLabel,
+            questionType: q ? (q.primaryType || 'Question') : '',
+            questionRecommendedSeconds: q ? (q.recommendedSeconds || 0) : 0,
+            questionSnippet: q ? (q.stemSnippet || '') : '',
+            predictedOp: pred ? pred.operationName : (session.predictedOp || null),
+            predictedTotalSeconds: pred ? (pred.predictedTotalSeconds || 0) : 0,
+            contextRevision,
+        };
+    }
+
     function resetAllStats() {
         for (const k in stats) stats[k] = 0;
         accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
-        notifyStatsChange();
+        if (activeSession) updatePredictedFinalCall(activeSession);
+        bumpContextRevision();
         if (reactSetStats) {
             reactSetStats(Object.assign({}, stats, { accumulated: 0 }));
         }
@@ -9008,6 +10609,7 @@ ${SVG_ICONS.closeModal}
         const [appSettings, setAppSettings] = useState(() => cloneSettings(settings));
         const [appStats, setAppStats] = useState(() => Object.assign({}, stats));
         const [accumulatedBonus, setAccumulatedBonus] = useState(accumulatedExtraSeconds);
+        const [sessionCtx, setSessionCtx] = useState(() => buildSessionContextSnapshot());
         const [isModalOpen, setIsModalOpen] = useState(false);
         const [isClosing, setIsClosing] = useState(false);
         const [isCapturing, setIsCapturing] = useState(false);
@@ -9024,6 +10626,7 @@ ${SVG_ICONS.closeModal}
                 modalStateRef.current.closing = false;
                 isModalOpenGlobal = true;
                 setAccumulatedBonus(accumulatedExtraSeconds);
+                setSessionCtx(buildSessionContextSnapshot());
                 setIsClosing(false);
                 setIsModalOpen(true);
             } else {
@@ -9072,26 +10675,38 @@ ${SVG_ICONS.closeModal}
             };
         }, [setModalOpenState]);
 
-        // Real-time reactive live stats subscription for StatusPill (zero polling)
+        // Real-time reactive live stats subscription for StatusPill / open modal context (zero polling)
         useEffect(() => {
-            const shouldSubscribe = isModalOpen || (appSettings.pillVisible && appSettings.keybindAction !== 'open-modal' && (appSettings.pillMode === 'compact' || appSettings.pillMode === 'full'));
-            if (!shouldSubscribe) {
+            const pillNeedsStats = appSettings.pillVisible && appSettings.keybindAction !== 'open-modal' && (appSettings.pillMode === 'compact' || appSettings.pillMode === 'full');
+            const pillNeedsBoost = pillNeedsStats && appSettings.pillMode === 'full';
+            if (!isModalOpen && !pillNeedsStats) {
                 return;
             }
-            setAppStats(Object.assign({}, stats));
-            setAccumulatedBonus(accumulatedExtraSeconds);
+            if (pillNeedsStats) setAppStats(Object.assign({}, stats));
+            if (isModalOpen || pillNeedsBoost) setAccumulatedBonus(accumulatedExtraSeconds);
+            if (isModalOpen) setSessionCtx(buildSessionContextSnapshot());
             let lastBlocked = stats.blocked;
             let lastBoosted = stats.boosted;
             let lastAcc = accumulatedExtraSeconds;
+            let lastCtxAcc = accumulatedExtraSeconds;
+            let lastCtxRev = contextRevision;
 
             return subscribeStats((st) => {
                 const acc = accumulatedExtraSeconds;
-                if (st.blocked !== lastBlocked || st.boosted !== lastBoosted || acc !== lastAcc) {
+                const rev = contextRevision;
+                if (pillNeedsStats && (st.blocked !== lastBlocked || (pillNeedsBoost && st.boosted !== lastBoosted))) {
                     lastBlocked = st.blocked;
                     lastBoosted = st.boosted;
-                    lastAcc = acc;
                     setAppStats(Object.assign({}, st));
+                }
+                if ((isModalOpen || pillNeedsBoost) && acc !== lastAcc) {
+                    lastAcc = acc;
                     setAccumulatedBonus(acc);
+                }
+                if (isModalOpen && (acc !== lastCtxAcc || rev !== lastCtxRev)) {
+                    lastCtxAcc = acc;
+                    lastCtxRev = rev;
+                    setSessionCtx(buildSessionContextSnapshot());
                 }
             });
         }, [isModalOpen, appSettings.pillVisible, appSettings.keybindAction, appSettings.pillMode]);
@@ -9149,12 +10764,16 @@ ${SVG_ICONS.closeModal}
 
         const handleResetStats = useCallback(() => {
             resetAllStats();
+            setSessionCtx(buildSessionContextSnapshot());
             LOG('stats reset');
         }, []);
 
         const handleAddManualBonus = useCallback((sec) => {
             accumulatedExtraSeconds += sec;
             setAccumulatedBonus(accumulatedExtraSeconds);
+            if (activeSession) updatePredictedFinalCall(activeSession);
+            bumpContextRevision();
+            setSessionCtx(buildSessionContextSnapshot());
             bumpStat('manualBoosted');
             LOG('manual bonus added: +' + sec + 's (total ' + accumulatedExtraSeconds + 's)');
         }, []);
@@ -9163,7 +10782,9 @@ ${SVG_ICONS.closeModal}
             accumulatedExtraSeconds = 0;
             accumulatedQuestionCount = 0;
             setAccumulatedBonus(0);
-            notifyStatsChange();
+            if (activeSession) updatePredictedFinalCall(activeSession);
+            bumpContextRevision();
+            setSessionCtx(buildSessionContextSnapshot());
             LOG('manual bonus cleared');
         }, []);
 
@@ -9171,8 +10792,13 @@ ${SVG_ICONS.closeModal}
         useEffect(() => {
             const syncThemeAndAccent = () => {
                 if (uiContainerEl) {
-                    uiContainerEl.setAttribute('data-theme', getEffectiveTheme(appSettings.theme));
-                    uiContainerEl.style.setProperty('--accent', appSettings.accentColor);
+                    const effectiveTheme = getEffectiveTheme(appSettings.theme);
+                    if (uiContainerEl.getAttribute('data-theme') !== effectiveTheme) {
+                        uiContainerEl.setAttribute('data-theme', effectiveTheme);
+                    }
+                    if (uiContainerEl.style.getPropertyValue('--accent') !== appSettings.accentColor) {
+                        uiContainerEl.style.setProperty('--accent', appSettings.accentColor);
+                    }
                 }
             };
             syncThemeAndAccent();
@@ -9203,6 +10829,7 @@ ${SVG_ICONS.closeModal}
                         onClose=${handleCloseModal}
                         currentSettings=${appSettings}
                         accumulatedBonus=${accumulatedBonus}
+                        sessionContext=${sessionCtx}
                         isCapturingKeybind=${isCapturing}
                         onStartCaptureKeybind=${handleStartCaptureKeybind}
                         onClearKeybind=${handleClearKeybind}
@@ -9293,6 +10920,8 @@ ${SVG_ICONS.closeModal}
     // BOOTSTRAP
     // ============================================================
     function bootstrap() {
+        ensureDarkObserver();
+        applyDarkMode();
         ensureUIHost();
         ensureButton();
         initVideoAutoSkipController();
@@ -9316,18 +10945,31 @@ ${SVG_ICONS.closeModal}
         setSuppressJitsu: (v) => { applySettingChange('suppressJitsu', !!v); },
         setManualTimeButtonEnabled: (v) => { applySettingChange('manualTimeButtonEnabled', !!v); },
         setManualTimeStacksWithAuto: (v) => { applySettingChange('manualTimeStacksWithAuto', !!v); },
+        setDynamicTimeEnabled: (v) => { applySettingChange('dynamicTimeEnabled', !!v); },
+        setPredictFinalCallEnabled: (v) => { applySettingChange('predictFinalCallEnabled', !!v); },
         setFullVideoWatchedEnabled: (v) => { applySettingChange('fullVideoWatchedEnabled', !!v); },
         setAutoSkipVideoEnabled: (v) => { applySettingChange('autoSkipVideoEnabled', !!v); },
         setAddVideoDurationToTimeSpent: (v) => { applySettingChange('addVideoDurationToTimeSpent', !!v); },
         getKnownLessonDurations: () => knownLessonDurations,
         getCurrentVideoLesson: () => currentVideoLesson,
+        getActiveSession: () => activeSession,
+        getCurrentQuestion: (vars, opName, qStr) => identifyCurrentQuestion(vars, opName, qStr),
+        getPredictedFinalCall: () => activeSession ? updatePredictedFinalCall(activeSession) : null,
+        getQuestionRegistry: () => Array.from(questionRegistry.values()),
+        calculateDynamicTime: (qOrId, origSeconds, opName, qStr) => {
+            const desc = (qOrId && typeof qOrId === 'object')
+                ? qOrId
+                : (qOrId != null ? lookupQuestion(qOrId) : identifyCurrentQuestion(null, opName, qStr));
+            return computeDynamicExtraSeconds(desc, origSeconds || 0, opName || '', qStr || '');
+        },
+        getSessionContextSnapshot: buildSessionContextSnapshot,
         skipVideoNow: (force = true) => checkAndAutoSkipVideo(force),
         handleApiResponse,
-        getLatestExamPaperData: () => null,
-        getLatestUserProfile: () => null,
-        getLatestFeatureFlags: () => null,
-        getLatestGlobalFeatureFlags: () => null,
-        getLatestQuizFeedback: () => null,
+        getLatestExamPaperData: () => latestExamPaperData,
+        getLatestUserProfile: () => latestUserProfile,
+        getLatestFeatureFlags: () => latestFeatureFlags,
+        getLatestGlobalFeatureFlags: () => latestGlobalFeatureFlags,
+        getLatestQuizFeedback: () => latestQuizFeedback,
         getQueuedSeconds: () => queuedSeconds,
         setQueuedSeconds: (secs) => {
             queuedSeconds = secs;
@@ -9349,6 +10991,8 @@ ${SVG_ICONS.closeModal}
     }
 
     LOG('=== READY | timeBoost:', settings.timeBoostEnabled,
+        '| dynamicTime:', settings.dynamicTimeEnabled,
+        '| predictFinal:', settings.predictFinalCallEnabled,
         '| range:', settings.extraSecondsMin + '–' + settings.extraSecondsMax + 's',
         '| manualTimeBtn:', settings.manualTimeButtonEnabled ? 'ON' : 'OFF',
         '| fullVideoWatched:', settings.fullVideoWatchedEnabled ? 'ON' : 'OFF',
@@ -9371,6 +11015,8 @@ ${SVG_ICONS.closeModal}
         nativeConsole.log('%cLogEvent handler:       ', CSS.muted, settings.blockLogEvent !== false ? 'ON' : 'OFF');
         nativeConsole.log('%cPrivate search mode:    ', CSS.muted, settings.privateSearchMode !== false ? 'ON' : 'OFF');
         nativeConsole.log('%cFunction cloaking:       ', CSS.muted, 'ON');
+        nativeConsole.log('%cDynamic question time:  ', CSS.muted, settings.dynamicTimeEnabled ? 'ON' : 'OFF');
+        nativeConsole.log('%cPredict final API call: ', CSS.muted, settings.predictFinalCallEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cManual time button:     ', CSS.muted, settings.manualTimeButtonEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cFull video watch:       ', CSS.muted, settings.fullVideoWatchedEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cAuto-skip video:        ', CSS.muted, settings.autoSkipVideoEnabled ? 'ON' : 'OFF');
