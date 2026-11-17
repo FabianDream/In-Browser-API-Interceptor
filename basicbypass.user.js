@@ -55,13 +55,20 @@
     const reflectConstruct     = Reflect.construct;
     const reflectOwnKeys       = Reflect.ownKeys;
 
-    const wmGet  = WeakMap.prototype.get;
-    const wmSet  = WeakMap.prototype.set;
-    const wsHas  = WeakSet.prototype.has;
-    const wsAdd  = WeakSet.prototype.add;
-    const setHas = Set.prototype.has;
-    const setAdd = Set.prototype.add;
-    const setDel = Set.prototype.delete;
+    const wmGet       = WeakMap.prototype.get;
+    const wmSet       = WeakMap.prototype.set;
+    const wsHas       = WeakSet.prototype.has;
+    const wsAdd       = WeakSet.prototype.add;
+    const setHas      = Set.prototype.has;
+    const setAdd      = Set.prototype.add;
+    const setDel      = Set.prototype.delete;
+    const mapGet      = Map.prototype.get;
+    const mapSet      = Map.prototype.set;
+    const mapDel      = Map.prototype.delete;
+    const mapKeys     = Map.prototype.keys;
+    const mapSizeDesc = origGetOwnPropDesc(Map.prototype, 'size');
+    const mapSize     = mapSizeDesc && mapSizeDesc.get;
+    const mapIterNext = Object.getPrototypeOf(new Map().keys()).next;
 
     const cloakedFns = new WeakMap();
 
@@ -133,7 +140,12 @@
     }
 
     function isPostMethod(method) {
-        return method === 'POST' || (typeof method === 'string' && method.length === 4 && method.toUpperCase() === 'POST');
+        if (method === 'POST') return true;
+        return typeof method === 'string' && method.length === 4 &&
+            (method.charCodeAt(0) | 32) === 112 &&
+            (method.charCodeAt(1) | 32) === 111 &&
+            (method.charCodeAt(2) | 32) === 115 &&
+            (method.charCodeAt(3) | 32) === 116;
     }
 
     // ============================================================
@@ -192,17 +204,25 @@
         return false;
     }
 
+    const HOST_CACHE_MAX = 256;
+    const hostKindCache  = new Map();
+
     // Unified single-pass scheme + hostname classifier
     function classifyUrl(url) {
-        const str = toUrlString(url);
+        const str = typeof url === 'string' ? url : toUrlString(url);
         const len = str.length;
+        if (len === 0) return URL_OTHER;
+        if (str.charCodeAt(0) === 47 && (len === 1 || str.charCodeAt(1) !== 47)) {
+            return URL_TARGET_API;
+        }
+
         let start = 0;
         while (start < len && str.charCodeAt(start) <= 32) start++;
         if (start >= len) return URL_OTHER;
 
         const c0 = str.charCodeAt(start);
         if (c0 === 47) { // '/'
-            if (str.charCodeAt(start + 1) !== 47) return URL_TARGET_API;
+            if (start + 1 >= len || str.charCodeAt(start + 1) !== 47) return URL_TARGET_API;
             start += 2;
         } else {
             const first = c0 | 32;
@@ -262,32 +282,47 @@
         const rawHost = str.slice(start, end);
         const host = hasUpper ? rawHost.toLowerCase() : rawHost;
         if (host === API_HOST) return URL_TARGET_API;
-        return hostIsTelemetry(host) ? URL_TELEMETRY : URL_OTHER;
+
+        let kind = mapGet.call(hostKindCache, host);
+        if (kind !== undefined) return kind;
+
+        kind = hostIsTelemetry(host) ? URL_TELEMETRY : URL_OTHER;
+        if ((mapSize ? mapSize.call(hostKindCache) : hostKindCache.size) >= HOST_CACHE_MAX) {
+            const oldest = mapIterNext.call(mapKeys.call(hostKindCache)).value;
+            if (oldest !== undefined) mapDel.call(hostKindCache, oldest);
+        }
+        mapSet.call(hostKindCache, host, kind);
+        return kind;
     }
 
     function isTelemetryUrl(url) {
         return classifyUrl(url) === URL_TELEMETRY;
     }
 
+    const MAX_BODY_SCAN       = 65536;
     const LOG_IMPROPER_USE_RE = /logimproperuse/i;
     let sharedTextDecoder = null;
 
     function bodyLooksLikeLogImproperUse(body) {
-        if (typeof body === 'string') return LOG_IMPROPER_USE_RE.test(body);
+        if (typeof body === 'string') {
+            return body.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(body);
+        }
         if (!body || typeof body !== 'object') return false;
         try {
-            if (body instanceof URLSearchParams) {
-                return LOG_IMPROPER_USE_RE.test(body.toString());
+            if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+                const s = body.toString();
+                return s.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(s);
             }
-            if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) {
+            if (ArrayBuffer.isView(body) || (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer)) {
+                if (body.byteLength > MAX_BODY_SCAN) return false;
                 sharedTextDecoder ||= new TextDecoder();
                 return LOG_IMPROPER_USE_RE.test(sharedTextDecoder.decode(body));
             }
-            if (body instanceof FormData) {
+            if (typeof FormData !== 'undefined' && body instanceof FormData) {
                 for (const [key, val] of body) {
                     if (
-                        (typeof key === 'string' && LOG_IMPROPER_USE_RE.test(key)) ||
-                        (typeof val === 'string' && LOG_IMPROPER_USE_RE.test(val))
+                        (typeof key === 'string' && key.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(key)) ||
+                        (typeof val === 'string' && val.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(val))
                     ) return true;
                 }
             }
@@ -323,15 +358,28 @@
     if (typeof HTMLScriptElement !== 'undefined') hookElementProperty(HTMLScriptElement.prototype, 'src',  'script');
     if (typeof HTMLIFrameElement !== 'undefined') hookElementProperty(HTMLIFrameElement.prototype, 'src',  'iframe');
     if (typeof HTMLImageElement  !== 'undefined') hookElementProperty(HTMLImageElement.prototype,  'src',  'img');
+    const ImageCtor = typeof Image === 'function' ? Image : window.Image;
+    if (typeof ImageCtor === 'function' && ImageCtor.prototype && (typeof HTMLImageElement === 'undefined' || ImageCtor.prototype !== HTMLImageElement.prototype)) {
+        hookElementProperty(ImageCtor.prototype, 'src', 'img');
+    }
     if (typeof HTMLLinkElement   !== 'undefined') hookElementProperty(HTMLLinkElement.prototype,   'href', 'link');
 
     function isUrlAttribute(name) {
         if (name === 'src' || name === 'href') return true;
         if (typeof name !== 'string') return false;
         const len = name.length;
-        if (len !== 3 && len !== 4) return false;
-        const low = name.toLowerCase();
-        return low === 'src' || low === 'href';
+        if (len === 3) {
+            return (name.charCodeAt(0) | 32) === 115 &&
+                   (name.charCodeAt(1) | 32) === 114 &&
+                   (name.charCodeAt(2) | 32) === 99;
+        }
+        if (len === 4) {
+            return (name.charCodeAt(0) | 32) === 104 &&
+                   (name.charCodeAt(1) | 32) === 114 &&
+                   (name.charCodeAt(2) | 32) === 101 &&
+                   (name.charCodeAt(3) | 32) === 102;
+        }
+        return false;
     }
 
     const origSetAttribute = Element.prototype.setAttribute;
@@ -386,26 +434,47 @@
         }
     }
 
+    const MEDIA_BLOB_TYPE_RE = /^(?:video|audio|image|font)\//i;
+
+    function isTelemetryBlobPart(part, options) {
+        if (typeof part === 'string') {
+            return part.length < 1e6 &&
+                !(options && typeof options.type === 'string' && MEDIA_BLOB_TYPE_RE.test(options.type)) &&
+                TELEMETRY_CODE_RE.test(part);
+        }
+        return typeof part === 'object' && part !== null && wsHas.call(telemetryBlobs, part);
+    }
+
     const OrigBlob = window.Blob;
     if (OrigBlob) {
-        window.Blob = patchConstructor(function Blob(blobParts = undefined, options = undefined) {
+        const PatchedBlob = patchConstructor(function Blob(blobParts = undefined, options = undefined) {
             if (!new.target) return OrigBlob();
-            const blob = reflectConstruct(OrigBlob, arguments, new.target);
+            const argc = arguments.length;
+            const blob = new.target === PatchedBlob
+                ? (argc === 0 ? new OrigBlob() : argc === 1 ? new OrigBlob(blobParts) : new OrigBlob(blobParts, options))
+                : reflectConstruct(OrigBlob, argc === 0 ? [] : argc === 1 ? [blobParts] : [blobParts, options], new.target);
             try {
-                if (blobParts && (Array.isArray(blobParts) || typeof blobParts[Symbol.iterator] === 'function')) {
-                    for (const part of blobParts) {
-                        if (
-                            (typeof part === 'string' && part.length < 1e6 && TELEMETRY_CODE_RE.test(part)) ||
-                            (typeof part === 'object' && part !== null && wsHas.call(telemetryBlobs, part))
-                        ) {
-                            wsAdd.call(telemetryBlobs, blob);
-                            break;
+                if (blobParts) {
+                    if (Array.isArray(blobParts)) {
+                        for (let i = 0, len = blobParts.length; i < len; i++) {
+                            if (isTelemetryBlobPart(blobParts[i], options)) {
+                                wsAdd.call(telemetryBlobs, blob);
+                                break;
+                            }
+                        }
+                    } else if (typeof blobParts[Symbol.iterator] === 'function') {
+                        for (const part of blobParts) {
+                            if (isTelemetryBlobPart(part, options)) {
+                                wsAdd.call(telemetryBlobs, blob);
+                                break;
+                            }
                         }
                     }
                 }
             } catch {}
             return blob;
         }, OrigBlob);
+        window.Blob = PatchedBlob;
     }
 
     const OrigWorker = window.Worker;
@@ -480,11 +549,35 @@
             }
             return reflectConstruct(OrigWebSocket, arguments, new.target);
         }, OrigWebSocket);
+
+        const WS_CONSTS = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
+        for (let i = 0; i < WS_CONSTS.length; i++) {
+            const k = WS_CONSTS[i];
+            const d = origGetOwnPropDesc(OrigWebSocket, k);
+            origDefineProperty(
+                window.WebSocket,
+                k,
+                d && 'value' in d
+                    ? { value: d.value, writable: !!d.writable, enumerable: !!d.enumerable, configurable: !!d.configurable }
+                    : { value: i, writable: false, enumerable: true, configurable: false }
+            );
+        }
     }
 
     // ============================================================
     // 4. FETCH / XHR / BEACON INTERCEPTORS
     // ============================================================
+    const SKIP_CONTENT_TYPE_RE = /^\s*(?:image\/|video\/|audio\/|multipart\/|application\/octet-stream\b)/i;
+
+    function shouldSkipRequestScan(req) {
+        const headers = req.headers;
+        if (!headers || typeof headers.get !== 'function') return false;
+        const cl = headers.get('content-length');
+        if (cl != null && cl !== '' && Number(cl) > MAX_BODY_SCAN) return true;
+        const ct = headers.get('content-type');
+        return !!(ct && SKIP_CONTENT_TYPE_RE.test(ct));
+    }
+
     const origFetch = typeof window.fetch === 'function' ? window.fetch : null;
     if (origFetch) {
         window.fetch = cloak(({
@@ -496,7 +589,8 @@
                         return Promise.resolve(syntheticNoContent());
                     }
 
-                    if (kind === URL_TARGET_API && isPostMethod((init && init.method) || (input && input.method))) {
+                    const method = (init && init.method) || (typeof input === 'object' && input !== null ? input.method : undefined);
+                    if (kind === URL_TARGET_API && isPostMethod(method)) {
                         const body = init && init.body;
                         let asyncSource = null;
 
@@ -505,17 +599,19 @@
                                 LOG('dropped LogImproperUse (fetch)');
                                 return Promise.resolve(syntheticOk());
                             }
-                            if (typeof body.text === 'function') {
+                            if (typeof body.text === 'function' && !(typeof body.size === 'number' && body.size > MAX_BODY_SCAN)) {
                                 asyncSource = body;
                             }
                         } else if (typeof Request !== 'undefined' && input instanceof Request && input.body != null && !input.bodyUsed) {
-                            asyncSource = input.clone();
+                            if (!shouldSkipRequestScan(input)) {
+                                asyncSource = input.clone();
+                            }
                         }
 
                         if (asyncSource) {
                             return asyncSource.text().then(
                                 (text) => {
-                                    if (LOG_IMPROPER_USE_RE.test(text)) {
+                                    if (text.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(text)) {
                                         LOG('dropped LogImproperUse (async fetch body)');
                                         return syntheticOk();
                                     }
@@ -673,7 +769,7 @@
                         LOG('blocked sendBeacon:', url);
                         return true;
                     }
-                    if (kind === URL_TARGET_API && bodyLooksLikeLogImproperUse(data)) {
+                    if (kind === URL_TARGET_API && data != null && bodyLooksLikeLogImproperUse(data)) {
                         LOG('dropped LogImproperUse (sendBeacon)');
                         return true;
                     }
@@ -686,9 +782,11 @@
     // ============================================================
     // 5. FULLSCREEN, VISIBILITY, FOCUS & EVENT SUPPRESSION
     // ============================================================
-    const DocProto  = typeof Document !== 'undefined' ? Document.prototype : null;
-    const WinProto  = typeof Window !== 'undefined' ? Window.prototype : null;
-    const docTarget = DocProto || document;
+    const DocProto         = typeof Document !== 'undefined' ? Document.prototype : null;
+    const HtmlDocProto     = typeof HTMLDocument !== 'undefined' && HTMLDocument.prototype !== DocProto ? HTMLDocument.prototype : null;
+    const WinProto         = typeof Window !== 'undefined' ? Window.prototype : null;
+    const EventTargetProto = typeof EventTarget !== 'undefined' ? EventTarget.prototype : null;
+    const docTarget        = DocProto || document;
 
     const DOC_SPOOF_SPECS = [
         ['fullscreenEnabled',       false],
@@ -721,6 +819,7 @@
 
     const PROTECTED_DOC_PROPS = new Set(['hasFocus', 'addEventListener']);
     const PROTECTED_WIN_PROPS = new Set(['addEventListener']);
+    const PROTECTED_ET_PROPS  = new Set(['addEventListener']);
 
     const docSpoofDescs = {
         hasFocus: {
@@ -734,7 +833,7 @@
 
     for (let i = 0; i < DOC_SPOOF_SPECS.length; i++) {
         const [prop, val] = DOC_SPOOF_SPECS[i];
-        if (prop in docTarget) {
+        if (prop in docTarget || prop in document) {
             setAdd.call(PROTECTED_DOC_PROPS, prop);
             docSpoofDescs[prop] = {
                 get: makeGetter(prop, val),
@@ -747,7 +846,7 @@
     for (const evt of SUPPRESSED_EVENTS) {
         if (evt === 'webkitvisibilitychange') continue;
         const prop  = 'on' + evt;
-        const inDoc = prop in docTarget;
+        const inDoc = prop in docTarget || prop in document;
         const inWin = prop in window;
         if (!inDoc && !inWin) continue;
 
@@ -765,7 +864,23 @@
     try {
         origDefineProperties(docTarget, docSpoofDescs);
     } catch {
-        try { origDefineProperties(document, docSpoofDescs); } catch {}
+        for (const prop of Object.keys(docSpoofDescs)) {
+            try {
+                origDefineProperty(docTarget, prop, docSpoofDescs[prop]);
+            } catch {
+                try { origDefineProperty(document, prop, docSpoofDescs[prop]); } catch {}
+            }
+        }
+    }
+    if (docTarget !== document) {
+        for (const prop of Object.keys(docSpoofDescs)) {
+            if (origGetOwnPropDesc(document, prop)) {
+                try { origDefineProperty(document, prop, docSpoofDescs[prop]); } catch {}
+            }
+            if (HtmlDocProto && origGetOwnPropDesc(HtmlDocProto, prop)) {
+                try { origDefineProperty(HtmlDocProto, prop, docSpoofDescs[prop]); } catch {}
+            }
+        }
     }
 
     try {
@@ -819,19 +934,37 @@
             ) {
                 return;
             }
-            return reflectApply(origProtoAdd, this, arguments);
+            if (arguments.length >= 2) {
+                return origProtoAdd.call(this, type, listener, options);
+            }
+            return arguments.length === 1
+                ? origProtoAdd.call(this, type)
+                : origProtoAdd.call(this);
         },
     }).addEventListener);
 
-    try {
-        EventTarget.prototype.addEventListener = patchedAddEventListener;
-        if (window.addEventListener !== patchedAddEventListener) {
-            window.addEventListener = patchedAddEventListener;
+    function defineAddEventListener(target, protoFallback) {
+        const desc = origGetOwnPropDesc(target, 'addEventListener') ||
+            (protoFallback && origGetOwnPropDesc(protoFallback, 'addEventListener'));
+        try {
+            origDefineProperty(target, 'addEventListener', {
+                value: patchedAddEventListener,
+                writable: true,
+                enumerable: desc ? desc.enumerable : true,
+                configurable: true,
+            });
+        } catch {
+            try { target.addEventListener = patchedAddEventListener; } catch {}
         }
-        if (document.addEventListener !== patchedAddEventListener) {
-            document.addEventListener = patchedAddEventListener;
-        }
-    } catch {}
+    }
+
+    defineAddEventListener(EventTarget.prototype, null);
+    if (window.addEventListener !== patchedAddEventListener) {
+        defineAddEventListener(window, WinProto);
+    }
+    if (document.addEventListener !== patchedAddEventListener) {
+        defineAddEventListener(document, DocProto);
+    }
 
     const killEvent = (e) => {
         if (
@@ -859,8 +992,10 @@
     // 6. PROPERTY PROTECTION & MONITORING
     // ============================================================
     function getProtectedSet(target) {
-        if (target === document || target === DocProto) return PROTECTED_DOC_PROPS;
-        if (target === window || target === rawWin || (WinProto !== null && target === WinProto)) return PROTECTED_WIN_PROPS;
+        if (!target || (typeof target !== 'object' && typeof target !== 'function')) return null;
+        if (target === document || target === DocProto || target === HtmlDocProto) return PROTECTED_DOC_PROPS;
+        if (target === window || target === rawWin || target === WinProto) return PROTECTED_WIN_PROPS;
+        if (target === EventTargetProto) return PROTECTED_ET_PROPS;
         return null;
     }
 

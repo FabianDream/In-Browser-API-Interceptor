@@ -23,22 +23,66 @@
     'use strict';
 
     // ============================================================
-    // STEALTH & CLOAKING INFRASTRUCTURE
+    // CACHED PRIMORDIALS & STEALTH CLOAKING INFRASTRUCTURE
     // ============================================================
-    const origToString = Function.prototype.toString;
+    const origDefineProperty   = Object.defineProperty;
+    const origDefineProperties = Object.defineProperties;
+    const origGetOwnPropDesc   = Object.getOwnPropertyDescriptor;
+    const origGetOwnPropNames  = Object.getOwnPropertyNames;
+    const origGetPrototypeOf   = Object.getPrototypeOf;
+    const origSetPrototypeOf   = Object.setPrototypeOf;
+    const origToString         = Function.prototype.toString;
+    const reflectApply         = Reflect.apply;
+    const reflectConstruct     = Reflect.construct;
+    const wmGet                = WeakMap.prototype.get;
+    const wmSet                = WeakMap.prototype.set;
+    const wsHas                = WeakSet.prototype.has;
+    const wsAdd                = WeakSet.prototype.add;
+    const setHas               = Set.prototype.has;
+    const setAdd               = Set.prototype.add;
+    const setDel               = Set.prototype.delete;
+    const mapGet               = Map.prototype.get;
+    const mapSet               = Map.prototype.set;
+    const mapDel               = Map.prototype.delete;
+    const mapKeys              = Map.prototype.keys;
+    const sharedTextDecoder    = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
+    const rawWin               = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || (window && window.window) || window;
+
     const cloakedFns = new WeakMap();
 
     function cloak(fn, name) {
         if (typeof fn === 'function') {
-            cloakedFns.set(fn, `function ${name || fn.name || ''}() { [native code] }`);
+            wmSet.call(cloakedFns, fn, `function ${name || fn.name || ''}() { [native code] }`);
         }
         return fn;
     }
 
-    Function.prototype.toString = function () {
-        return (typeof this === 'function' && cloakedFns.get(this)) || origToString.call(this);
-    };
-    cloak(Function.prototype.toString, 'toString');
+    function patchConstructor(Orig, Patched, name) {
+        Patched.prototype = Orig.prototype;
+        origSetPrototypeOf(Patched, Orig);
+        try {
+            origDefineProperty(Orig.prototype, 'constructor', {
+                value: Patched,
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            });
+        } catch {}
+        return cloak(Patched, name);
+    }
+
+    const patchedToString = ({
+        toString() {
+            return (typeof this === 'function' && wmGet.call(cloakedFns, this)) || origToString.call(this);
+        }
+    }).toString;
+    cloak(patchedToString, 'toString');
+    origDefineProperty(Function.prototype, 'toString', {
+        value: patchedToString,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
 
     // ============================================================
     // NATIVE CONSOLE PRESERVED (before any patching)
@@ -64,7 +108,7 @@
         sentry:          { label: 'Sentry',                         hosts: ['sentry.io'] },
         cloudflare:      { label: 'Cloudflare Insights',            hosts: ['cloudflareinsights.com'] },
         intercom:        { label: 'Intercom',                       hosts: ['intercom.io', 'intercomcdn.com'] },
-        googleAnalytics: { label: 'Google Tag Manager / Analytics', hosts: ['googletagmanager.com', 'google-analytics.com', 'googleadservices.com', 'doubleclick.net'] },
+        googleAnalytics: { label: 'Google Tag Manager / Analytics', hosts: ['googletagmanager.com', 'google-analytics.com', 'analytics.google.com', 'googleadservices.com', 'doubleclick.net'] },
         facebook:        { label: 'Facebook Pixel',                 hosts: ['facebook.net', 'facebook.com'] },
         snapchat:        { label: 'Snapchat',                       hosts: ['sc-static.net'] },
         bing:            { label: 'Bing',                           hosts: ['bat.bing.com'] },
@@ -76,6 +120,16 @@
         amplitude:       { label: 'Amplitude',                      hosts: ['amplitude.com'] },
         posthog:         { label: 'PostHog',                        hosts: ['posthog.com'] },
     };
+
+    const HOST_SERVICE_MAP = new Map();
+    for (const key in TELEMETRY_SERVICES) {
+        const svc = TELEMETRY_SERVICES[key];
+        const hosts = svc.hosts;
+        for (let i = 0; i < hosts.length; i++) {
+            const pattern = hosts[i].toLowerCase();
+            mapSet.call(HOST_SERVICE_MAP, pattern, { key, label: svc.label, pattern });
+        }
+    }
 
     function buildDefaultTelemetryServices() {
         const o = {};
@@ -350,83 +404,156 @@
     // ============================================================
     // URL / SERVICE MATCHING
     // ============================================================
-    const API_HOST    = 'web.uplearn.co.uk';
-    const API_PATH_RE = /\/api\/?$/;
+    const API_HOST               = 'web.uplearn.co.uk';
+    const HOST_SERVICE_CACHE_MAX = 256;
+    const hostServiceCache       = new Map();
 
-    const hostCache = new Map();
-    const hostServiceCache = new Map();
+    function toUrlString(url) {
+        if (typeof url === 'string') return url;
+        if (!url) return '';
+        if (typeof url === 'object') {
+            if (typeof url.href === 'string') return url.href;
+            if (typeof url.url === 'string') return url.url;
+        }
+        try { return String(url); } catch { return ''; }
+    }
 
-    function fastHostOf(url) {
-        if (!url || typeof url !== 'string') return '';
-        const len = url.length;
-        if (len === 0) return '';
-        const c0 = url.charCodeAt(0);
-        if (c0 === 47) {
-            if (len > 1 && url.charCodeAt(1) === 47) {
-                const start = 2;
-                let end = start;
-                while (end < len) {
-                    const c = url.charCodeAt(end);
-                    if (c === 47 || c === 63 || c === 35 || c === 58) break;
-                    end++;
-                }
-                return url.slice(start, end).toLowerCase();
+    let lastLocHostRaw = '';
+    let lastLocHostLower = API_HOST;
+    function getPageHost() {
+        if (typeof location !== 'undefined') {
+            const raw = location.hostname;
+            if (raw) {
+                if (raw === lastLocHostRaw) return lastLocHostLower;
+                lastLocHostRaw = raw;
+                return (lastLocHostLower = raw.toLowerCase());
             }
-            return (typeof location !== 'undefined' && location.hostname) ? location.hostname.toLowerCase() : API_HOST;
         }
-        const protoIdx = url.indexOf('://');
-        if (protoIdx !== -1) {
-            const start = protoIdx + 3;
-            let end = start;
-            while (end < len) {
-                const c = url.charCodeAt(end);
-                if (c === 47 || c === 63 || c === 35 || c === 58) break;
-                end++;
+        return API_HOST;
+    }
+
+    function isValidSchemeSlice(s, start, end) {
+        if (start >= end) return false;
+        const c0 = s.charCodeAt(start);
+        if (!((c0 >= 97 && c0 <= 122) || (c0 >= 65 && c0 <= 90))) return false;
+        for (let i = start + 1; i < end; i++) {
+            const c = s.charCodeAt(i);
+            if (!(
+                (c >= 97 && c <= 122) || (c >= 65 && c <= 90) ||
+                (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46
+            )) {
+                return false;
             }
-            return url.slice(start, end).toLowerCase();
         }
-        try { return new URL(url, (typeof location !== 'undefined' && location.href) ? location.href : undefined).hostname.toLowerCase(); }
-        catch { return ''; }
+        return true;
     }
 
     function hostOf(url) {
-        if (!url || typeof url !== 'string') return '';
-        if (url.charCodeAt(0) === 47 && url.charCodeAt(1) !== 47) {
-            return (typeof location !== 'undefined' && location.hostname) ? location.hostname.toLowerCase() : API_HOST;
+        const s = toUrlString(url);
+        const len = s.length;
+        if (len === 0) return '';
+
+        let start = 0;
+        if (s.charCodeAt(0) <= 32) {
+            while (start < len && s.charCodeAt(start) <= 32) start++;
+            if (start >= len) return '';
         }
-        let h = hostCache.get(url);
-        if (h !== undefined) return h;
-        h = fastHostOf(url);
-        if (hostCache.size >= 250) {
-            hostCache.delete(hostCache.keys().next().value);
+
+        let authStart = -1;
+        const c0 = s.charCodeAt(start);
+        if (c0 === 47) { // '/'
+            if (start + 1 < len && s.charCodeAt(start + 1) === 47) {
+                authStart = start + 2;
+            } else {
+                return getPageHost();
+            }
+        } else if (c0 === 104 && s.startsWith('https://', start)) {
+            authStart = start + 8;
+        } else if (c0 === 104 && s.startsWith('http://', start)) {
+            authStart = start + 7;
+        } else {
+            const colonIdx = s.indexOf(':', start);
+            if (colonIdx === -1) return getPageHost();
+            if (!isValidSchemeSlice(s, start, colonIdx)) return getPageHost();
+            if (colonIdx + 2 < len && s.charCodeAt(colonIdx + 1) === 47 && s.charCodeAt(colonIdx + 2) === 47) {
+                authStart = colonIdx + 3;
+            } else {
+                // Non-authority scheme (data:, blob:, javascript:, etc.)
+                return '';
+            }
         }
-        hostCache.set(url, h);
-        return h;
+
+        // Single-pass authority scan [authStart, authEnd) tracking last '@' and host ':port'
+        let atIdx = -1;
+        let authEnd = authStart;
+        let firstColon = -1;
+        let hasUpper = false;
+        while (authEnd < len) {
+            const c = s.charCodeAt(authEnd);
+            if (c === 47 || c === 63 || c === 35) break; // '/', '?', '#'
+            if (c === 64) { // '@'
+                atIdx = authEnd;
+                firstColon = -1;
+                hasUpper = false;
+            } else if (c === 58 && firstColon === -1) { // ':'
+                firstColon = authEnd;
+            } else if (c >= 65 && c <= 90) {
+                hasUpper = true;
+            }
+            authEnd++;
+        }
+
+        const hostStart = atIdx !== -1 ? atIdx + 1 : authStart;
+        if (hostStart >= authEnd) return '';
+
+        // IPv6 literal [...]
+        if (s.charCodeAt(hostStart) === 91) {
+            const closeIdx = s.indexOf(']', hostStart + 1);
+            if (closeIdx === -1 || closeIdx >= authEnd) return '';
+            if (closeIdx + 1 < authEnd && s.charCodeAt(closeIdx + 1) !== 58) return '';
+            const h6 = s.slice(hostStart, closeIdx + 1);
+            return hasUpper ? h6.toLowerCase() : h6;
+        }
+
+        let hostEnd = firstColon !== -1 ? firstColon : authEnd;
+        while (hostEnd > hostStart && s.charCodeAt(hostEnd - 1) === 46) {
+            hostEnd--;
+        }
+        if (hostEnd <= hostStart) return '';
+        const h = s.slice(hostStart, hostEnd);
+        return hasUpper ? h.toLowerCase() : h;
     }
 
     function matchAnyTelemetryService(url) {
         if (!url) return null;
+        if (typeof url === 'string' && url.charCodeAt(0) === 47 && url.charCodeAt(1) !== 47) return null;
         const h = hostOf(url);
         if (!h) return null;
-        if (h === API_HOST || (typeof location !== 'undefined' && h === location.hostname)) return null;
-        let cached = hostServiceCache.get(h);
+        if (h === API_HOST || h === getPageHost()) return null;
+
+        const cached = mapGet.call(hostServiceCache, h);
         if (cached !== undefined) return cached;
 
         let found = null;
-        outer: for (const key in TELEMETRY_SERVICES) {
-            const hosts = TELEMETRY_SERVICES[key].hosts;
-            for (let i = 0; i < hosts.length; i++) {
-                const t = hosts[i];
-                if (h === t || h.endsWith('.' + t)) {
-                    found = { key, label: TELEMETRY_SERVICES[key].label, host: h, pattern: t };
-                    break outer;
+        let entry = mapGet.call(HOST_SERVICE_MAP, h);
+        if (entry) {
+            found = { key: entry.key, label: entry.label, host: h, pattern: entry.pattern };
+        } else {
+            let dotIdx = h.indexOf('.');
+            while (dotIdx !== -1) {
+                entry = mapGet.call(HOST_SERVICE_MAP, h.slice(dotIdx + 1));
+                if (entry) {
+                    found = { key: entry.key, label: entry.label, host: h, pattern: entry.pattern };
+                    break;
                 }
+                dotIdx = h.indexOf('.', dotIdx + 1);
             }
         }
-        if (hostServiceCache.size >= 250) {
-            hostServiceCache.delete(hostServiceCache.keys().next().value);
+
+        if (hostServiceCache.size >= HOST_SERVICE_CACHE_MAX) {
+            mapDel.call(hostServiceCache, mapKeys.call(hostServiceCache).next().value);
         }
-        hostServiceCache.set(h, found);
+        mapSet.call(hostServiceCache, h, found);
         return found;
     }
 
@@ -446,28 +573,70 @@
 
     function isTelemetryUrl(url) { return !!matchTelemetryService(url); }
 
-    function isTargetApi(url) {
-        if (!url || typeof url !== 'string') return false;
+    function isApiPathnameAt(s, pathStart, len) {
+        if (pathStart < 0 || pathStart + 4 > len) return false;
         if (
-            url === '/api' ||
-            url === '/api/' ||
-            url === 'https://web.uplearn.co.uk/api' ||
-            url === 'https://web.uplearn.co.uk/api/'
+            s.charCodeAt(pathStart) !== 47 ||
+            s.charCodeAt(pathStart + 1) !== 97 ||
+            s.charCodeAt(pathStart + 2) !== 112 ||
+            s.charCodeAt(pathStart + 3) !== 105
+        ) {
+            return false;
+        }
+        const after = pathStart + 4;
+        if (after === len) return true;
+        const c = s.charCodeAt(after);
+        if (c === 63 || c === 35) return true; // '?' or '#'
+        if (c === 47) { // '/'
+            if (after + 1 === len) return true;
+            const c2 = s.charCodeAt(after + 1);
+            return c2 === 63 || c2 === 35;
+        }
+        return false;
+    }
+
+    function isTargetApi(url) {
+        const s = toUrlString(url);
+        const len = s.length;
+        if (len < 4) return false;
+        if (
+            s === '/api' ||
+            s === '/api/' ||
+            s === 'https://web.uplearn.co.uk/api' ||
+            s === 'https://web.uplearn.co.uk/api/'
         ) {
             return true;
         }
-        if (!url.includes('/api')) return false;
-        if (url.charCodeAt(0) === 47 && url.charCodeAt(1) !== 47) {
-            return API_PATH_RE.test(url.split('?')[0]);
+        let start = 0;
+        if (s.charCodeAt(0) <= 32) {
+            while (start < len && s.charCodeAt(start) <= 32) start++;
+            if (start + 4 > len) return false;
         }
-        const h = hostOf(url);
-        if (h !== API_HOST) return false;
-        const apiIdx = url.indexOf('/api');
-        if (apiIdx !== -1) {
-            const cleanPath = url.slice(apiIdx).split('?')[0];
-            return API_PATH_RE.test(cleanPath);
+        if (s.charCodeAt(start) === 47 && s.charCodeAt(start + 1) !== 47) {
+            return isApiPathnameAt(s, start, len);
         }
-        return false;
+        if (s.indexOf('/api', start) === -1) return false;
+        if (start === 0 && s.startsWith('https://web.uplearn.co.uk/api')) {
+            return isApiPathnameAt(s, 25, len);
+        }
+        if (hostOf(s) !== API_HOST) return false;
+
+        let sep = -1;
+        if (s.charCodeAt(start) === 47 && s.charCodeAt(start + 1) === 47) {
+            sep = start + 2;
+        } else {
+            const proto = s.indexOf('://', start);
+            if (proto !== -1) sep = proto + 3;
+        }
+        if (sep === -1) return false;
+
+        let pathStart = -1;
+        for (let i = sep; i < len; i++) {
+            const c = s.charCodeAt(i);
+            if (c === 47) { pathStart = i; break; }
+            if (c === 63 || c === 35) return false;
+        }
+        return isApiPathnameAt(s, pathStart, len);
     }
 
     // ============================================================
@@ -560,28 +729,30 @@
         for (let m = 0; m < methods.length; m++) {
             const method = methods[m];
             const orig = nativeConsole[method];
-            console[method] = function () {
-                if (!settings.suppressConsoleNoise) {
-                    return orig.apply(console, arguments);
+            const wrapped = ({
+                [method]() {
+                    if (!settings.suppressConsoleNoise) {
+                        return reflectApply(orig, console, arguments);
+                    }
+                    const len = arguments.length;
+                    if (len === 0) return reflectApply(orig, console, arguments);
+                    const first = arguments[0];
+                    const firstIsString = typeof first === 'string';
+                    if (firstIsString && textMatchesNoise(first)) {
+                        bumpStat('consoleSuppressed');
+                        return;
+                    }
+                    if (len === 1 && firstIsString) {
+                        return reflectApply(orig, console, arguments);
+                    }
+                    if (argsAreNoise(arguments, firstIsString ? 1 : 0)) {
+                        bumpStat('consoleSuppressed');
+                        return;
+                    }
+                    return reflectApply(orig, console, arguments);
                 }
-                const len = arguments.length;
-                if (len === 0) return orig.apply(console, arguments);
-                const first = arguments[0];
-                const firstIsString = typeof first === 'string';
-                if (firstIsString && textMatchesNoise(first)) {
-                    bumpStat('consoleSuppressed');
-                    return;
-                }
-                if (len === 1 && firstIsString) {
-                    return orig.apply(console, arguments);
-                }
-                if (argsAreNoise(arguments, firstIsString ? 1 : 0)) {
-                    bumpStat('consoleSuppressed');
-                    return;
-                }
-                return orig.apply(console, arguments);
-            };
-            cloak(console[method], method);
+            })[method];
+            console[method] = cloak(wrapped, method);
         }
         VLOG('console noise filter installed (Jitsu / Apollo / Sentry / host matches)');
     }
@@ -839,28 +1010,33 @@
     // DOM / SCRIPT/IFRAME/IMG/LINK INJECTION BLOCKER
     // ============================================================
     function hookElementProperty(proto, prop, tag) {
-        const desc = Object.getOwnPropertyDescriptor(proto, prop);
+        const desc = origGetOwnPropDesc(proto, prop);
         if (desc && desc.set) {
-            const setter = function (val) {
-                if (settings.blockDomElements && isTelemetryUrl(val)) {
-                    bumpStat('blocked');
-                    reportBlock(`<${tag}>.${prop} assignment`, val, { element: tag });
-                    return '';
-                }
-                if (settings.logLevel === 'verbose' && val) {
-                    const m = matchAnyTelemetryService(val);
-                    if (m && !settings.telemetryServices[m.key]) {
-                        reportAllow(`<${tag}>.${prop}`, val, `service "${m.label}" disabled`);
-                    } else if (m && m.key === 'jitsu' && !settings.suppressJitsu) {
-                        reportAllow(`<${tag}>.${prop}`, val, `service "${m.label}" not suppressed`);
+            const setterName = 'set ' + prop;
+            const setter = ({
+                [setterName](val) {
+                    if (settings.blockDomElements && isTelemetryUrl(val)) {
+                        bumpStat('blocked');
+                        reportBlock(`<${tag}>.${prop} assignment`, toUrlString(val), { element: tag });
+                        return '';
                     }
+                    if (settings.logLevel === 'verbose' && val) {
+                        const m = matchAnyTelemetryService(val);
+                        if (m && !settings.telemetryServices[m.key]) {
+                            reportAllow(`<${tag}>.${prop}`, toUrlString(val), `service "${m.label}" disabled`);
+                        } else if (m && m.key === 'jitsu' && !settings.suppressJitsu) {
+                            reportAllow(`<${tag}>.${prop}`, toUrlString(val), `service "${m.label}" not suppressed`);
+                        }
+                    }
+                    if (arguments.length === 1) return desc.set.call(this, val);
+                    return reflectApply(desc.set, this, arguments);
                 }
-                return desc.set.call(this, val);
-            };
-            cloak(setter, 'set ' + prop);
-            Object.defineProperty(proto, prop, {
+            })[setterName];
+            cloak(setter, setterName);
+            origDefineProperty(proto, prop, {
                 get: desc.get,
                 set: setter,
+                enumerable: desc.enumerable,
                 configurable: true,
             });
         }
@@ -895,17 +1071,26 @@
 
     try {
         const origSetAttribute = Element.prototype.setAttribute;
-        Element.prototype.setAttribute = function (name, value) {
-            if (settings.blockDomElements && isSrcOrHref(name) && isTelemetryUrl(value)) {
-                bumpStat('blocked');
-                reportBlock(`setAttribute("${name}")`, value, {
-                    element: this.tagName ? this.tagName.toLowerCase() : 'unknown',
-                });
-                return;
+        const patchedSetAttribute = ({
+            setAttribute(qualifiedName, value) {
+                if (settings.blockDomElements && isSrcOrHref(qualifiedName) && isTelemetryUrl(value)) {
+                    bumpStat('blocked');
+                    reportBlock(`setAttribute("${qualifiedName}")`, toUrlString(value), {
+                        element: this.tagName ? this.tagName.toLowerCase() : 'unknown',
+                    });
+                    return;
+                }
+                if (arguments.length === 2) return origSetAttribute.call(this, qualifiedName, value);
+                return reflectApply(origSetAttribute, this, arguments);
             }
-            return origSetAttribute.apply(this, arguments);
-        };
-        cloak(Element.prototype.setAttribute, 'setAttribute');
+        }).setAttribute;
+        cloak(patchedSetAttribute, 'setAttribute');
+        origDefineProperty(Element.prototype, 'setAttribute', {
+            value: patchedSetAttribute,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
     } catch (e) { WARN('setAttribute patch failed', e); }
 
     try {
@@ -928,14 +1113,22 @@
         }
 
         const domObserver = new MutationObserver((mutations) => {
-            if (settings.blockDomElements) {
-                for (let i = 0; i < mutations.length; i++) {
-                    const added = mutations[i].addedNodes;
-                    for (let j = 0; j < added.length; j++) {
-                        const node = added[j];
-                        if (node.nodeType !== 1) continue;
+            const blockDom = settings.blockDomElements;
+            let needButtonCheck = settings.manualTimeButtonEnabled && !manualBtnScheduled;
+            if (!blockDom && !needButtonCheck) return;
+
+            for (let i = 0; i < mutations.length; i++) {
+                const m = mutations[i];
+                if (m.type !== 'childList') continue;
+
+                const added = m.addedNodes;
+                for (let j = 0; j < added.length; j++) {
+                    const node = added[j];
+                    if (!node || node.nodeType !== 1 || node === uiHostEl) continue;
+
+                    if (blockDom) {
                         if (!checkAndBlockTelemetryElement(node)) {
-                            if (node.children && node.children.length > 0 && typeof node.querySelectorAll === 'function') {
+                            if (node.firstElementChild !== null && typeof node.querySelectorAll === 'function') {
                                 const nested = node.querySelectorAll('script[src], iframe[src]');
                                 for (let k = 0; k < nested.length; k++) {
                                     checkAndBlockTelemetryElement(nested[k]);
@@ -943,9 +1136,28 @@
                             }
                         }
                     }
+
+                    if (needButtonCheck && isRelevantQuestionMutationNode(node)) {
+                        needButtonCheck = false;
+                        scheduleEnsureButton();
+                    }
                 }
+
+                if (needButtonCheck) {
+                    const removed = m.removedNodes;
+                    for (let j = 0; j < removed.length; j++) {
+                        const node = removed[j];
+                        if (!node || node.nodeType !== 1 || node === uiHostEl) continue;
+                        if (isRelevantQuestionMutationNode(node)) {
+                            needButtonCheck = false;
+                            scheduleEnsureButton();
+                            break;
+                        }
+                    }
+                }
+
+                if (!blockDom && !needButtonCheck) break;
             }
-            scheduleEnsureButton(mutations);
         });
         domObserver.observe(document.documentElement || document, { childList: true, subtree: true });
         VLOG('DOM observer installed');
@@ -957,38 +1169,75 @@
     try {
         const OrigWebSocket = window.WebSocket;
         if (OrigWebSocket) {
-            function PatchedWebSocket(url, protocols) {
-                if (settings.blockWebSockets && isTelemetryUrl(url)) {
+            const dummyWsSend = cloak(({ send() {} }).send, 'send');
+            const dummyWsClose = cloak(({ close() {} }).close, 'close');
+            const wsClosedState = OrigWebSocket.CLOSED !== undefined ? OrigWebSocket.CLOSED : 3;
+
+            const PatchedWebSocket = function WebSocket(url, protocols = undefined) {
+                if (!new.target) {
+                    throw new TypeError("Failed to construct 'WebSocket': Please use the 'new' operator");
+                }
+                const urlStr = toUrlString(url);
+                if (settings.blockWebSockets && isTelemetryUrl(urlStr)) {
                     bumpStat('blocked');
-                    reportBlock('WebSocket', String(url), { protocols: protocols || '(none)' });
-                    const dummy = new EventTarget();
-                    dummy.readyState = OrigWebSocket.CLOSED !== undefined ? OrigWebSocket.CLOSED : 3;
-                    dummy.send = () => {};
-                    dummy.close = () => {};
+                    reportBlock('WebSocket', urlStr, { protocols: protocols || '(none)' });
+                    const dummy = reflectConstruct(EventTarget, [], new.target || OrigWebSocket);
+                    origDefineProperties(dummy, {
+                        readyState:     { value: wsClosedState, enumerable: true, configurable: true },
+                        url:            { value: urlStr, enumerable: true, configurable: true },
+                        protocol:       { value: '', enumerable: true, configurable: true },
+                        extensions:     { value: '', enumerable: true, configurable: true },
+                        bufferedAmount: { value: 0, enumerable: true, configurable: true },
+                        binaryType:     { value: 'blob', writable: true, enumerable: true, configurable: true },
+                        send:           { value: dummyWsSend, writable: true, enumerable: true, configurable: true },
+                        close:          { value: dummyWsClose, writable: true, enumerable: true, configurable: true },
+                        onopen:         { value: null, writable: true, enumerable: true, configurable: true },
+                        onerror:        { value: null, writable: true, enumerable: true, configurable: true },
+                        onclose:        { value: null, writable: true, enumerable: true, configurable: true },
+                        onmessage:      { value: null, writable: true, enumerable: true, configurable: true },
+                    });
+                    if (typeof dummy.dispatchEvent !== 'function' && typeof EventTarget !== 'undefined') {
+                        origDefineProperties(dummy, {
+                            addEventListener:    { value: EventTarget.prototype.addEventListener, writable: true, configurable: true },
+                            removeEventListener: { value: EventTarget.prototype.removeEventListener, writable: true, configurable: true },
+                            dispatchEvent:       { value: EventTarget.prototype.dispatchEvent, writable: true, configurable: true },
+                        });
+                    }
                     setTimeout(() => {
                         try {
-                            dummy.dispatchEvent(new Event('error'));
-                            dummy.dispatchEvent(new CloseEvent('close', { code: 1006, reason: 'Blocked' }));
+                            const errEv = new Event('error');
+                            if (typeof dummy.onerror === 'function') {
+                                try { dummy.onerror.call(dummy, errEv); } catch {}
+                            }
+                            dummy.dispatchEvent(errEv);
+                            const closeEv = typeof CloseEvent !== 'undefined'
+                                ? new CloseEvent('close', { code: 1006, reason: 'Blocked', wasClean: false })
+                                : Object.assign(new Event('close'), { code: 1006, reason: 'Blocked', wasClean: false });
+                            if (typeof dummy.onclose === 'function') {
+                                try { dummy.onclose.call(dummy, closeEv); } catch {}
+                            }
+                            dummy.dispatchEvent(closeEv);
                         } catch {}
                     }, 0);
                     return dummy;
                 }
-                return new OrigWebSocket(url, protocols);
-            }
-            PatchedWebSocket.prototype = OrigWebSocket.prototype;
-            // Preserve all static properties (CONNECTING, OPEN, CLOSING, CLOSED) and descriptors
-            const staticProps = Object.getOwnPropertyNames(OrigWebSocket);
+                return reflectConstruct(OrigWebSocket, arguments, new.target);
+            };
+
+            patchConstructor(OrigWebSocket, PatchedWebSocket, 'WebSocket');
+            // Preserve all own static constants (CONNECTING, OPEN, CLOSING, CLOSED) and descriptors
+            const staticProps = origGetOwnPropNames(OrigWebSocket);
             for (let i = 0; i < staticProps.length; i++) {
                 const prop = staticProps[i];
-                if (!(prop in PatchedWebSocket)) {
+                if (prop === 'length' || prop === 'name' || prop === 'prototype' || prop === 'arguments' || prop === 'caller') continue;
+                if (!origGetOwnPropDesc(PatchedWebSocket, prop)) {
                     try {
-                        const desc = Object.getOwnPropertyDescriptor(OrigWebSocket, prop);
-                        if (desc) Object.defineProperty(PatchedWebSocket, prop, desc);
+                        const desc = origGetOwnPropDesc(OrigWebSocket, prop);
+                        if (desc) origDefineProperty(PatchedWebSocket, prop, desc);
                     } catch {}
                 }
             }
             window.WebSocket = PatchedWebSocket;
-            cloak(PatchedWebSocket, 'WebSocket');
             VLOG('WebSocket hook installed');
         }
     } catch (e) { WARN('websocket patch failed', e); }
@@ -997,35 +1246,94 @@
     // WEB WORKER & BLOB TARGETED NEUTER
     // ============================================================
     const TELEMETRY_CODE_RE = /openreplay|sentry|sessionReplay|replayUploader/i;
+    const BINARY_BLOB_MIME_RE = /^(?:video|audio|image|font)\//i;
     const telemetryBlobUrls = new Set();
     const telemetryBlobs = new WeakSet();
+
+    function isTelemetryBlobPart(part, scanText) {
+        if (part && typeof part === 'object' && wsHas.call(telemetryBlobs, part)) return true;
+        return scanText && typeof part === 'string' && TELEMETRY_CODE_RE.test(part);
+    }
+
+    function isTelemetryDataUrl(urlStr) {
+        if (!urlStr || urlStr.length < 6) return false;
+        if (
+            (urlStr.charCodeAt(0) | 32) !== 100 ||
+            (urlStr.charCodeAt(1) | 32) !== 97 ||
+            (urlStr.charCodeAt(2) | 32) !== 116 ||
+            (urlStr.charCodeAt(3) | 32) !== 97 ||
+            urlStr.charCodeAt(4) !== 58
+        ) {
+            return false;
+        }
+        const commaIdx = urlStr.indexOf(',', 5);
+        if (commaIdx === -1) return false;
+        const meta = urlStr.slice(5, commaIdx);
+        let payload = urlStr.slice(commaIdx + 1);
+        if (/;base64/i.test(meta) && typeof atob === 'function') {
+            if (payload.length <= 1048576) {
+                try { payload = atob(payload); } catch { return false; }
+            }
+        } else {
+            if (TELEMETRY_CODE_RE.test(payload)) return true;
+            try { payload = decodeURIComponent(payload); } catch {}
+        }
+        return TELEMETRY_CODE_RE.test(payload);
+    }
+
     try {
         const origCreateObjectURL = (typeof URL !== 'undefined' && URL.createObjectURL) ? URL.createObjectURL : null;
         if (origCreateObjectURL) {
-            URL.createObjectURL = function (blob) {
-                const url = origCreateObjectURL.apply(this, arguments);
-                if (blob && telemetryBlobs.has(blob)) {
-                    telemetryBlobUrls.add(url);
+            const patchedCreateObjectURL = ({
+                createObjectURL(obj) {
+                    const url = arguments.length === 1
+                        ? origCreateObjectURL.call(this, obj)
+                        : reflectApply(origCreateObjectURL, this, arguments);
+                    if (obj && wsHas.call(telemetryBlobs, obj)) {
+                        setAdd.call(telemetryBlobUrls, url);
+                    }
+                    return url;
                 }
-                return url;
-            };
-            cloak(URL.createObjectURL, 'createObjectURL');
+            }).createObjectURL;
+            URL.createObjectURL = cloak(patchedCreateObjectURL, 'createObjectURL');
+        }
+
+        const origRevokeObjectURL = (typeof URL !== 'undefined' && URL.revokeObjectURL) ? URL.revokeObjectURL : null;
+        if (origRevokeObjectURL) {
+            const patchedRevokeObjectURL = ({
+                revokeObjectURL(url) {
+                    if (url != null) setDel.call(telemetryBlobUrls, toUrlString(url));
+                    if (arguments.length === 1) return origRevokeObjectURL.call(this, url);
+                    return reflectApply(origRevokeObjectURL, this, arguments);
+                }
+            }).revokeObjectURL;
+            URL.revokeObjectURL = cloak(patchedRevokeObjectURL, 'revokeObjectURL');
         }
 
         const OrigBlob = window.Blob;
         if (OrigBlob) {
-            const PatchedBlob = function (blobParts, options) {
+            const PatchedBlob = function Blob(blobParts = undefined, options = undefined) {
                 if (!new.target) {
                     throw new TypeError("Failed to construct 'Blob': Please use the 'new' operator");
                 }
-                const blob = Reflect.construct(OrigBlob, arguments, new.target);
+                const blob = reflectConstruct(OrigBlob, arguments, new.target);
                 try {
-                    const type = (options && options.type) || '';
-                    if (blob.size < 1e6 && (!type || type.includes('javascript') || type.includes('text'))) {
-                        if (blobParts && (Array.isArray(blobParts) || typeof blobParts[Symbol.iterator] === 'function')) {
+                    if (blobParts != null) {
+                        const type = options && typeof options.type === 'string' ? options.type : '';
+                        const scanText = blob.size < 1e6 &&
+                            !BINARY_BLOB_MIME_RE.test(type) &&
+                            (!type || type.includes('javascript') || type.includes('text'));
+                        if (Array.isArray(blobParts)) {
+                            for (let i = 0; i < blobParts.length; i++) {
+                                if (isTelemetryBlobPart(blobParts[i], scanText)) {
+                                    wsAdd.call(telemetryBlobs, blob);
+                                    break;
+                                }
+                            }
+                        } else if (typeof blobParts[Symbol.iterator] === 'function') {
                             for (const part of blobParts) {
-                                if (typeof part === 'string' && TELEMETRY_CODE_RE.test(part)) {
-                                    telemetryBlobs.add(blob);
+                                if (isTelemetryBlobPart(part, scanText)) {
+                                    wsAdd.call(telemetryBlobs, blob);
                                     break;
                                 }
                             }
@@ -1034,42 +1342,46 @@
                 } catch {}
                 return blob;
             };
-            PatchedBlob.prototype = OrigBlob.prototype;
-            Object.setPrototypeOf(PatchedBlob, OrigBlob);
-            window.Blob = PatchedBlob;
-            cloak(PatchedBlob, 'Blob');
+            window.Blob = patchConstructor(OrigBlob, PatchedBlob, 'Blob');
         }
 
         const OrigWorker = window.Worker;
         if (OrigWorker) {
-            const dummyNoop = () => {};
+            const dummyWorkerPost = cloak(({ postMessage() {} }).postMessage, 'postMessage');
+            const dummyWorkerTerm = cloak(({ terminate() {} }).terminate, 'terminate');
             const WORKER_DUMMY_DESCS = {
-                postMessage:    { value: dummyNoop, writable: true, configurable: true },
-                terminate:      { value: dummyNoop, writable: true, configurable: true },
+                postMessage:    { value: dummyWorkerPost, writable: true, configurable: true },
+                terminate:      { value: dummyWorkerTerm, writable: true, configurable: true },
                 onerror:        { value: null, writable: true, configurable: true },
                 onmessage:      { value: null, writable: true, configurable: true },
                 onmessageerror: { value: null, writable: true, configurable: true },
             };
 
-            const PatchedWorker = function (scriptURL, options) {
+            const PatchedWorker = function Worker(scriptURL, options = undefined) {
                 if (!new.target) {
                     throw new TypeError("Failed to construct 'Worker': Please use the 'new' operator");
                 }
-                const urlStr = typeof scriptURL === 'string' ? scriptURL : String(scriptURL || '');
-                if (settings.telemetryPreset !== 'off' && (telemetryBlobUrls.has(urlStr) || isTelemetryUrl(scriptURL))) {
+                const urlStr = toUrlString(scriptURL);
+                if (
+                    settings.telemetryPreset !== 'off' &&
+                    (setHas.call(telemetryBlobUrls, urlStr) || isTelemetryUrl(urlStr) || isTelemetryDataUrl(urlStr))
+                ) {
                     bumpStat('blocked');
                     reportBlock('WebWorker', urlStr);
-                    const dummy = new EventTarget();
-                    Object.setPrototypeOf(dummy, (new.target && new.target.prototype) || OrigWorker.prototype);
-                    Object.defineProperties(dummy, WORKER_DUMMY_DESCS);
+                    const dummy = reflectConstruct(EventTarget, [], new.target || OrigWorker);
+                    origDefineProperties(dummy, WORKER_DUMMY_DESCS);
+                    if (typeof dummy.dispatchEvent !== 'function' && typeof EventTarget !== 'undefined') {
+                        origDefineProperties(dummy, {
+                            addEventListener:    { value: EventTarget.prototype.addEventListener, writable: true, configurable: true },
+                            removeEventListener: { value: EventTarget.prototype.removeEventListener, writable: true, configurable: true },
+                            dispatchEvent:       { value: EventTarget.prototype.dispatchEvent, writable: true, configurable: true },
+                        });
+                    }
                     return dummy;
                 }
-                return Reflect.construct(OrigWorker, arguments, new.target);
+                return reflectConstruct(OrigWorker, arguments, new.target);
             };
-            PatchedWorker.prototype = OrigWorker.prototype;
-            Object.setPrototypeOf(PatchedWorker, OrigWorker);
-            window.Worker = PatchedWorker;
-            cloak(PatchedWorker, 'Worker');
+            window.Worker = patchConstructor(OrigWorker, PatchedWorker, 'Worker');
         }
     } catch (e) { WARN('worker/blob patch failed', e); }
 
@@ -1148,22 +1460,38 @@
     const MAX_SCAN = 65536;
     const BLOCKED_OPS_RE = /\b(logImproperUse|logEvent|logLessonSearch|logVideoSearchRequest)\b/i;
 
-    function getBlockedMutationKind(body) {
-        if (!body) return null;
-        if (typeof body !== 'string') {
-            try {
-                if (body instanceof URLSearchParams) body = body.toString();
-                else return null;
-            } catch { return null; }
-        }
-        if (body.length > MAX_SCAN) return null;
-        const m = BLOCKED_OPS_RE.exec(body);
+    function extractSyncBodyText(data) {
+        if (!data) return null;
+        if (typeof data === 'string') return data.length <= MAX_SCAN ? data : null;
+        try {
+            if (typeof URLSearchParams !== 'undefined' && data instanceof URLSearchParams) {
+                const s = data.toString();
+                return s.length <= MAX_SCAN ? s : null;
+            }
+            if (sharedTextDecoder && typeof ArrayBuffer !== 'undefined' && (data instanceof ArrayBuffer || ArrayBuffer.isView(data))) {
+                const byteLen = data.byteLength;
+                if (typeof byteLen === 'number' && byteLen <= MAX_SCAN) {
+                    return sharedTextDecoder.decode(data);
+                }
+                return null;
+            }
+        } catch {}
+        return null;
+    }
+
+    function getBlockedMutationKindFromText(bodyText) {
+        if (!bodyText) return null;
+        const m = BLOCKED_OPS_RE.exec(bodyText);
         if (!m) return null;
         const op = m[1].toLowerCase();
         if (op === 'logimproperuse') return 'improper';
         if (op === 'logevent') return 'event';
         if (op === 'loglessonsearch' || op === 'logvideosearchrequest') return 'search';
         return null;
+    }
+
+    function getBlockedMutationKind(body) {
+        return getBlockedMutationKindFromText(extractSyncBodyText(body));
     }
 
     const REQ_TRANSFORM_RE = /\b(?:GetFeatureFlags|GetFeatureFlagsEnabledGlobally|currentUser)\b/i;
@@ -1209,11 +1537,13 @@
     };
 
     function interceptBlockedMutation(body, url, source) {
-        const kind = getBlockedMutationKind(body);
+        const bodyText = extractSyncBodyText(body);
+        if (!bodyText) return null;
+        const kind = getBlockedMutationKindFromText(bodyText);
         if (!kind) return null;
         const config = MOCKED_MUTATIONS[kind];
         if (!config || !config.shouldBlock()) return null;
-        config.report(source, url, body);
+        config.report(source, url, bodyText);
         bumpStat('blocked');
         return config;
     }
@@ -1873,17 +2203,19 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     ]);
 
     const QUESTION_SUBMIT_RE = /^(submit|check|save|confirm|mark)(\s+(answer|answers|marks|response|part))?$/i;
+    const NON_SUBMIT_LABEL_RE = /search|find|filter|menu|login|sign|logout|cancel|close/i;
 
     const cleanedTextCache = new WeakMap();
 
     function getCleanElementText(el) {
         if (!el) return '';
+        if (el.tagName !== 'BUTTON' && el.childElementCount > 12) return '';
         const raw = el.textContent || el.value || (typeof el.getAttribute === 'function' ? el.getAttribute('aria-label') : '') || '';
         if (!raw) return '';
-        const cached = cleanedTextCache.get(el);
+        const cached = wmGet.call(cleanedTextCache, el);
         if (cached && cached.raw === raw) return cached.cleaned;
         const cleaned = raw.trim().toLowerCase().replace(/\s+/g, ' ');
-        cleanedTextCache.set(el, { raw, cleaned });
+        wmSet.call(cleanedTextCache, el, { raw, cleaned });
         return cleaned;
     }
 
@@ -1894,8 +2226,8 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
         const txt = getCleanElementText(btn);
         let matches = isSubmitLabel(txt);
-        if (!matches && btn.getAttribute('type') === 'submit' && txt.length > 0 && txt.length < 30) {
-            if (!/search|find|filter|menu|login|sign|logout|cancel|close/i.test(txt)) {
+        if (!matches && typeof btn.getAttribute === 'function' && btn.getAttribute('type') === 'submit' && txt.length > 0 && txt.length < 30) {
+            if (!NON_SUBMIT_LABEL_RE.test(txt)) {
                 matches = true;
             }
         }
@@ -1911,6 +2243,8 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             return lastResolvedSubmitBtn;
         }
 
+        let checkedBtns = null;
+
         // 1. Search inside active question/quiz containers first
         const containers = document.querySelectorAll('[role="dialog"], .quiz-content, [data-testid*="question"], [data-testid*="quiz"], .question');
         for (let c = 0; c < containers.length; c++) {
@@ -1918,8 +2252,10 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             if (!isElementVisible(container)) continue;
 
             const btns = container.querySelectorAll('button, input[type="submit"], [role="button"]');
+            if (btns.length > 0 && !checkedBtns) checkedBtns = new Set();
             for (let i = 0; i < btns.length; i++) {
                 const b = btns[i];
+                if (checkedBtns) setAdd.call(checkedBtns, b);
                 if (isCandidateSubmitButton(b)) {
                     lastResolvedSubmitBtn = b;
                     return b;
@@ -1927,10 +2263,11 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             }
         }
 
-        // 2. Global search across all buttons in document
+        // 2. Global search across all buttons in document (skipping buttons already checked above)
         const allButtons = document.querySelectorAll('button, input[type="submit"], [role="button"]');
         for (let i = 0; i < allButtons.length; i++) {
             const b = allButtons[i];
+            if (checkedBtns && setHas.call(checkedBtns, b)) continue;
             if (isCandidateSubmitButton(b)) {
                 lastResolvedSubmitBtn = b;
                 return b;
@@ -2170,7 +2507,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         const cls = typeof node.className === 'string' ? node.className : '';
         if (cls.includes('quiz') || cls.includes('question') || cls.includes('modal') || cls.includes('dialog')) return true;
 
-        if (node.children && node.children.length > 0 && typeof node.querySelector === 'function') {
+        if (node.firstElementChild !== null && typeof node.querySelector === 'function') {
             return !!node.querySelector('button, input[type="submit"], [role="button"], [role="dialog"], .quiz-content, [data-testid*="question"], [data-testid*="quiz"], .question');
         }
         return false;
@@ -2216,7 +2553,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     /* ------------------------------------------------------------
      * Body Rewriting & Network Injection
      * ------------------------------------------------------------ */
-    const TIME_SPENT_RE = /timeSpent(?:Answering|Marking)?|completeVideoLesson|updateVideoLessonWatchPercent|Answer|SaveExam|Complete/i;
+    const TIME_SPENT_RE = /timeSpent|completeVideoLesson/i;
 
     function resolveTimeField(vars) {
         if (vars.timeSpent != null) return 'timeSpent';
@@ -2360,9 +2697,10 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                             VLOG('group bonus applied; per-question accumulator reset', { bonus, count, opName });
                         }
                     }
+                    const prevAcc = accumulatedExtraSeconds;
                     accumulatedExtraSeconds = 0;
                     accumulatedQuestionCount = 0;
-                    notifyStatsChange();
+                    if (!changed && prevAcc > 0) notifyStatsChange();
                 }
                 return;
             }
@@ -2401,7 +2739,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                         bumpStat('manualBoosted');
                         manualResetNeeded = true;
                     }
-                    notifyStatsChange();
                     changed = true;
 
                     const displayOp = opName || 'Question';
@@ -2446,14 +2783,22 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     // FETCH INTERCEPTOR
     // ============================================================
     const origFetch = window.fetch;
+    const JSON_OK_INIT = {
+        status: 200,
+        statusText: 'OK',
+        headers: { 'Content-Type': 'application/json' },
+    };
 
     function withCapturedFetchBody(input, init, onBody, onFallback) {
-        const bodyStr = init && typeof init.body === 'string' ? init.body : null;
+        const bodyStr = init && init.body != null ? extractSyncBodyText(init.body) : null;
         if (bodyStr == null && settings.logLevel !== 'silent' && typeof Request !== 'undefined' && input instanceof Request) {
             try {
                 const ct = (input.headers.get('content-type') || '').toLowerCase();
                 if (ct.includes('application/json') || ct.includes('text/')) {
-                    return input.clone().text().then(onBody, onFallback || (() => onBody(null)));
+                    const cl = Number(input.headers.get('content-length'));
+                    if (!cl || cl <= MAX_SCAN) {
+                        return input.clone().text().then(onBody, onFallback || (() => onBody(null)));
+                    }
                 }
             } catch {}
         }
@@ -2523,135 +2868,177 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     }
 
     if (origFetch) {
-        window.fetch = function (input, init) {
-            const self = this;
-            let url = '';
-            let method = 'GET';
-            let targetApi = false;
-            let reqKind = 'none';
-            try {
-                url = typeof input === 'string' ? input
-                          : (input && input.url) ? input.url
-                          : String(input || '');
-                method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+        const patchedFetch = ({
+            fetch(input, init = undefined) {
+                const self = this;
+                let url = '';
+                let method = 'GET';
+                let targetApi = false;
+                let reqKind = 'none';
+                let bodyChanged = false;
+                try {
+                    url = toUrlString(input);
+                    method = ((init && init.method) || (typeof input === 'object' && input !== null && input.method) || 'GET').toUpperCase();
 
-                const anyMatch = matchAnyTelemetryService(url);
-                if (anyMatch) {
-                    // ---- Telemetry block ----
-                    if (isServiceMatchBlocked(anyMatch)) {
-                        bumpStat('blocked');
-                        const isJitsu = anyMatch.key === 'jitsu';
-                        return Promise.resolve(withCapturedFetchBody(input, init, (capturedBody) => {
-                            if (isJitsu) {
-                                bumpStat('jitsuPackets');
-                                reportJitsuPacket('fetch · BLOCKED', url, capturedBody);
-                            } else {
-                                reportBlock('fetch', url, { method, body: capturedBody });
-                            }
-                            return new Response('{}', {
-                                status: 200, statusText: 'OK',
-                                headers: { 'Content-Type': 'application/json' },
-                            });
-                        }));
-                    }
-
-                    // ---- Jitsu allowed: log the packet, then pass through ----
-                    if (anyMatch.key === 'jitsu') {
-                        bumpStat('jitsuPackets');
-                        return withCapturedFetchBody(
-                            input,
-                            init,
-                            (capturedBody) => {
-                                reportJitsuPacket('fetch', url, capturedBody);
-                                return origFetch.call(self, input, init);
-                            },
-                            () => origFetch.call(self, input, init)
-                        );
-                    }
-
-                    if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
-                        reportAllow('fetch', url, `service "${anyMatch.label}" disabled in settings`);
-                    }
-                } else {
-                    targetApi = isTargetApi(url);
-                    if (method === 'POST' && targetApi) {
-                        bumpStat('apiPosts');
-                        const body = init && typeof init.body === 'string' ? init.body : null;
-
-                        if (body == null && typeof Request !== 'undefined' && input instanceof Request) {
-                            const ct = (input.headers.get('content-type') || '').toLowerCase();
-                            if (ct.includes('application/json')) {
-                                const passInit = init;
-                                return input.clone().text().then((text) => {
-                                    const mocked = interceptBlockedMutation(text, url, 'fetch · Request body');
-                                    if (mocked) {
-                                        return new Response(mocked.payload, {
-                                            status: 200, statusText: 'OK',
-                                            headers: { 'Content-Type': 'application/json' }
-                                        });
-                                    }
-                                    const reqK = classifyApiRequest(text);
-                                    const { body: newBody, changed } = maybeBumpTimeSpent(text, 'fetch-Req');
-                                    const reqToFetch = changed
-                                        ? new Request(input, { body: newBody, method: input.method })
-                                        : input;
-                                    const fetchPromise = origFetch.call(self, reqToFetch, passInit);
-                                    return processFetchResponse(fetchPromise, url, reqK);
-                                }, () => {
-                                    // Rejection handler fallback if input stream was disturbed/locked
-                                    return origFetch.call(self, input, passInit);
-                                });
-                            }
+                    const anyMatch = matchAnyTelemetryService(url);
+                    if (anyMatch) {
+                        // ---- Telemetry block ----
+                        if (isServiceMatchBlocked(anyMatch)) {
+                            bumpStat('blocked');
+                            const isJitsu = anyMatch.key === 'jitsu';
+                            return Promise.resolve(withCapturedFetchBody(input, init, (capturedBody) => {
+                                if (isJitsu) {
+                                    bumpStat('jitsuPackets');
+                                    reportJitsuPacket('fetch · BLOCKED', url, capturedBody);
+                                } else {
+                                    reportBlock('fetch', url, { method, body: capturedBody });
+                                }
+                                return new Response('{}', JSON_OK_INIT);
+                            }));
                         }
 
-                        if (body != null) {
-                            const mocked = interceptBlockedMutation(body, url, 'fetch');
-                            if (mocked) {
-                                return Promise.resolve(new Response(mocked.payload, {
-                                    status: 200, statusText: 'OK',
-                                    headers: { 'Content-Type': 'application/json' }
-                                }));
+                        // ---- Jitsu allowed: log the packet, then pass through ----
+                        if (anyMatch.key === 'jitsu') {
+                            bumpStat('jitsuPackets');
+                            return withCapturedFetchBody(
+                                input,
+                                init,
+                                (capturedBody) => {
+                                    reportJitsuPacket('fetch', url, capturedBody);
+                                    return origFetch.call(self, input, init);
+                                },
+                                () => origFetch.call(self, input, init)
+                            );
+                        }
+
+                        if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
+                            reportAllow('fetch', url, `service "${anyMatch.label}" disabled in settings`);
+                        }
+                    } else {
+                        targetApi = isTargetApi(url);
+                        if (method === 'POST' && targetApi) {
+                            bumpStat('apiPosts');
+                            const hasInitBody = !!(init && init.body != null);
+                            const body = hasInitBody ? extractSyncBodyText(init.body) : null;
+
+                            if (!hasInitBody && typeof Request !== 'undefined' && input instanceof Request) {
+                                const ct = (input.headers.get('content-type') || '').toLowerCase();
+                                const cl = Number(input.headers.get('content-length'));
+                                if (ct.includes('application/json') && (!cl || cl <= MAX_SCAN)) {
+                                    const passInit = init;
+                                    return input.clone().text().then((text) => {
+                                        const mocked = interceptBlockedMutation(text, url, 'fetch · Request body');
+                                        if (mocked) {
+                                            return new Response(mocked.payload, JSON_OK_INIT);
+                                        }
+                                        const reqK = classifyApiRequest(text);
+                                        const { body: newBody, changed } = maybeBumpTimeSpent(text, 'fetch-Req');
+                                        const reqToFetch = changed
+                                            ? new Request(input, { body: newBody, method: input.method })
+                                            : input;
+                                        const fetchPromise = origFetch.call(self, reqToFetch, passInit);
+                                        return processFetchResponse(fetchPromise, url, reqK);
+                                    }, () => {
+                                        // Rejection handler fallback if input stream was disturbed/locked
+                                        return origFetch.call(self, input, passInit);
+                                    });
+                                }
                             }
 
-                            reqKind = classifyApiRequest(body);
-                            const { body: newBody, changed } = maybeBumpTimeSpent(body, 'fetch');
-                            if (changed) init = Object.assign({}, init || {}, { body: newBody });
+                            if (body != null) {
+                                const mocked = interceptBlockedMutation(body, url, 'fetch');
+                                if (mocked) {
+                                    return Promise.resolve(new Response(mocked.payload, JSON_OK_INIT));
+                                }
+
+                                reqKind = classifyApiRequest(body);
+                                const { body: newBody, changed } = maybeBumpTimeSpent(body, 'fetch');
+                                if (changed) {
+                                    const wasBuffer = typeof ArrayBuffer !== 'undefined' && (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body));
+                                    const encodedBody = (wasBuffer && typeof TextEncoder !== 'undefined')
+                                        ? new TextEncoder().encode(newBody)
+                                        : newBody;
+                                    init = Object.assign({}, init, { body: encodedBody });
+                                    bodyChanged = true;
+                                }
+                            }
+                        } else if (settings.logLevel === 'verbose' && targetApi) {
+                            VLOG('API request (non-POST, passing through):', method, url);
                         }
-                    } else if (settings.logLevel === 'verbose' && targetApi) {
-                        VLOG('API request (non-POST, passing through):', method, url);
                     }
+                } catch (e) {
+                    WARN('fetch interceptor error:', e);
                 }
-            } catch (e) {
-                WARN('fetch interceptor error:', e);
-            }
 
-            const fetchPromise = origFetch.call(self, input, init);
-            if (targetApi) {
-                return processFetchResponse(fetchPromise, url, reqKind);
+                let fetchPromise;
+                if (bodyChanged || arguments.length === 2) {
+                    fetchPromise = origFetch.call(self, input, init);
+                } else if (arguments.length === 1) {
+                    fetchPromise = origFetch.call(self, input);
+                } else {
+                    fetchPromise = reflectApply(origFetch, self, arguments);
+                }
+                if (targetApi) {
+                    return processFetchResponse(fetchPromise, url, reqKind);
+                }
+                return fetchPromise;
             }
-            return fetchPromise;
-        };
-        cloak(window.fetch, 'fetch');
+        }).fetch;
+        window.fetch = cloak(patchedFetch, 'fetch');
         VLOG('fetch hook installed');
     }
 
     // ============================================================
     // XHR INTERCEPTOR
     // ============================================================
-    function mockBlockedXHR(self, responseText, jsonFn) {
-        Object.defineProperty(self, 'readyState',   { value: 4,            configurable: true });
-        Object.defineProperty(self, 'status',       { value: 200,          configurable: true });
-        Object.defineProperty(self, 'statusText',   { value: 'OK',         configurable: true });
-        Object.defineProperty(self, 'responseText', { value: responseText, configurable: true });
-        Object.defineProperty(self, 'response', {
-            get() { return self.responseType === 'json' ? jsonFn() : responseText; },
-            configurable: true,
+    const SPOOFED_XHR_PROPS = ['readyState', 'status', 'statusText', 'responseText', 'response'];
+    function saveAndDefineSpoofedXHRProps(xhr, info, descs) {
+        if (info) {
+            info.spoofed = true;
+            if (!info.savedDescs) {
+                const saved = {};
+                for (let i = 0; i < SPOOFED_XHR_PROPS.length; i++) {
+                    const prop = SPOOFED_XHR_PROPS[i];
+                    if (prop in descs) {
+                        const prev = origGetOwnPropDesc(xhr, prop);
+                        if (prev) saved[prop] = prev;
+                    }
+                }
+                info.savedDescs = saved;
+            }
+        }
+        origDefineProperties(xhr, descs);
+    }
+
+    function clearSpoofedXHRProps(xhr, info) {
+        const saved = info && info.savedDescs;
+        for (let i = 0; i < SPOOFED_XHR_PROPS.length; i++) {
+            const prop = SPOOFED_XHR_PROPS[i];
+            if (saved && saved[prop]) {
+                try { origDefineProperty(xhr, prop, saved[prop]); } catch {}
+            } else {
+                try { delete xhr[prop]; } catch {}
+            }
+        }
+    }
+
+    function mockBlockedXHR(self, responseText, jsonFn, info, sentSeq) {
+        saveAndDefineSpoofedXHRProps(self, info, {
+            readyState:   { value: 4,            configurable: true },
+            status:       { value: 200,          configurable: true },
+            statusText:   { value: 'OK',         configurable: true },
+            responseText: { value: responseText, configurable: true },
+            response: {
+                get() { return self.responseType === 'json' ? jsonFn() : responseText; },
+                configurable: true,
+            },
         });
         setTimeout(() => {
+            if (info && info.seq !== sentSeq) return;
             try {
                 self.dispatchEvent(new Event('readystatechange'));
-                self.dispatchEvent(new ProgressEvent('load'));
-                self.dispatchEvent(new ProgressEvent('loadend'));
+                self.dispatchEvent(typeof ProgressEvent !== 'undefined' ? new ProgressEvent('load') : new Event('load'));
+                self.dispatchEvent(typeof ProgressEvent !== 'undefined' ? new ProgressEvent('loadend') : new Event('loadend'));
             } catch {}
         }, 0);
     }
@@ -2662,122 +3049,182 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     if (OrigXHR) {
         const origOpen = OrigXHR.prototype.open;
         const origSend = OrigXHR.prototype.send;
+        const origAbort = OrigXHR.prototype.abort;
 
-        OrigXHR.prototype.open = function (method, url) {
-            xhrInfoMap.set(this, { method, url });
-            return origOpen.apply(this, arguments);
-        };
-        cloak(OrigXHR.prototype.open, 'open');
+        const patchedOpen = ({
+            open(method, url, async = undefined) {
+                const prev = wmGet.call(xhrInfoMap, this);
+                if (prev && prev.spoofed) clearSpoofedXHRProps(this, prev);
+                wmSet.call(xhrInfoMap, this, {
+                    method,
+                    url: toUrlString(url),
+                    seq: prev ? prev.seq + 1 : 1,
+                    spoofed: false,
+                    savedDescs: null,
+                });
+                if (arguments.length === 2) return origOpen.call(this, method, url);
+                if (arguments.length === 3) return origOpen.call(this, method, url, async);
+                return reflectApply(origOpen, this, arguments);
+            }
+        }).open;
+        origDefineProperty(OrigXHR.prototype, 'open', {
+            value: cloak(patchedOpen, 'open'),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
 
-        OrigXHR.prototype.send = function (body) {
-            try {
-                const info = xhrInfoMap.get(this);
-                const method = (info?.method || '').toUpperCase();
-                const url = info?.url || '';
+        if (typeof origAbort === 'function') {
+            const patchedAbort = ({
+                abort() {
+                    const info = wmGet.call(xhrInfoMap, this);
+                    if (info) info.seq++;
+                    if (arguments.length === 0) return origAbort.call(this);
+                    return reflectApply(origAbort, this, arguments);
+                }
+            }).abort;
+            origDefineProperty(OrigXHR.prototype, 'abort', {
+                value: cloak(patchedAbort, 'abort'),
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            });
+        }
 
-                const anyMatch = matchAnyTelemetryService(url);
-                if (anyMatch) {
-                    // ---- Telemetry block ----
-                    if (isServiceMatchBlocked(anyMatch)) {
-                        const bodyStr = describeBody(body);
+        const patchedSend = ({
+            send(body = undefined) {
+                let bodyChanged = false;
+                try {
+                    const info = wmGet.call(xhrInfoMap, this);
+                    const sentSeq = info ? info.seq : 0;
+                    const method = (info && info.method ? String(info.method) : '').toUpperCase();
+                    const url = (info && info.url) || '';
+
+                    const anyMatch = matchAnyTelemetryService(url);
+                    if (anyMatch) {
+                        // ---- Telemetry block ----
+                        if (isServiceMatchBlocked(anyMatch)) {
+                            const bodyStr = describeBody(body);
+                            if (anyMatch.key === 'jitsu') {
+                                bumpStat('jitsuPackets');
+                                reportJitsuPacket('XHR · BLOCKED', url, bodyStr);
+                            } else {
+                                reportBlock('XHR', url, { method, body: bodyStr });
+                            }
+                            bumpStat('blocked');
+                            mockBlockedXHR(this, '{}', () => ({}), info, sentSeq);
+                            return;
+                        }
+
+                        // ---- Jitsu allowed: log packet, then pass through ----
                         if (anyMatch.key === 'jitsu') {
                             bumpStat('jitsuPackets');
-                            reportJitsuPacket('XHR · BLOCKED', url, bodyStr);
-                        } else {
-                            reportBlock('XHR', url, { method, body: bodyStr });
+                            reportJitsuPacket('XHR', url, describeBody(body));
+                        } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
+                            reportAllow('XHR', url, `service "${anyMatch.label}" disabled in settings`);
                         }
-                        bumpStat('blocked');
-                        mockBlockedXHR(this, '{}', () => ({}));
-                        return;
-                    }
+                    } else if (isTargetApi(url)) {
+                        if (method === 'POST') bumpStat('apiPosts');
 
-                    // ---- Jitsu allowed: log packet, then pass through ----
-                    if (anyMatch.key === 'jitsu') {
-                        bumpStat('jitsuPackets');
-                        reportJitsuPacket('XHR', url, describeBody(body));
-                    } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
-                        reportAllow('XHR', url, `service "${anyMatch.label}" disabled in settings`);
-                    }
-                } else if (isTargetApi(url)) {
-                    if (method === 'POST') bumpStat('apiPosts');
+                        const bodyText = extractSyncBodyText(body);
+                        let reqKind = 'none';
+                        if (bodyText !== null) {
+                            const mocked = interceptBlockedMutation(bodyText, url, 'XHR');
+                            if (mocked) {
+                                mockBlockedXHR(this, mocked.payload, mocked.json, info, sentSeq);
+                                return;
+                            }
 
-                    const mocked = interceptBlockedMutation(body, url, 'XHR');
-                    if (mocked) {
-                        mockBlockedXHR(this, mocked.payload, mocked.json);
-                        return;
-                    }
+                            reqKind = classifyApiRequest(bodyText);
+                            const { body: newBody, changed } = maybeBumpTimeSpent(bodyText, 'xhr');
+                            if (changed) {
+                                body = (typeof body === 'string' || typeof TextEncoder === 'undefined')
+                                    ? newBody
+                                    : new TextEncoder().encode(newBody);
+                                bodyChanged = true;
+                            }
+                        }
 
-                    let reqKind = 'none';
-                    if (typeof body === 'string') {
-                        reqKind = classifyApiRequest(body);
-                        const { body: newBody, changed } = maybeBumpTimeSpent(body, 'xhr');
-                        if (changed) body = newBody;
-                    }
-
-                    if (reqKind !== 'none') {
-                        const selfXhr = this;
-                        let xhrHandled = false;
-                        const cleanupXhrListeners = function () {
-                            try {
-                                selfXhr.removeEventListener('readystatechange', handleXhrResponse, true);
-                                selfXhr.removeEventListener('loadend', handleXhrResponse, true);
-                            } catch {}
-                        };
-                        const handleXhrResponse = function () {
-                            if (xhrHandled) return;
-                            try {
-                                if (selfXhr.readyState === 4) {
+                        if (reqKind !== 'none') {
+                            const selfXhr = this;
+                            let xhrHandled = false;
+                            const cleanupXhrListeners = function () {
+                                try {
+                                    selfXhr.removeEventListener('readystatechange', handleXhrResponse, true);
+                                    selfXhr.removeEventListener('loadend', handleXhrResponse, true);
+                                } catch {}
+                            };
+                            const handleXhrResponse = function () {
+                                if (xhrHandled) return;
+                                if (info && info.seq !== sentSeq) {
                                     xhrHandled = true;
                                     cleanupXhrListeners();
-                                    if (selfXhr.status === 200) {
-                                        if (selfXhr.responseType === 'json') {
-                                            if (selfXhr.response && typeof selfXhr.response === 'object') {
-                                                handleApiResponse(selfXhr.response);
+                                    return;
+                                }
+                                try {
+                                    if (selfXhr.readyState === 4) {
+                                        xhrHandled = true;
+                                        cleanupXhrListeners();
+                                        if (selfXhr.status === 200) {
+                                            if (selfXhr.responseType === 'json') {
+                                                if (selfXhr.response && typeof selfXhr.response === 'object') {
+                                                    handleApiResponse(selfXhr.response);
+                                                }
+                                                return;
                                             }
-                                            return;
-                                        }
-                                        if (!selfXhr.responseType || selfXhr.responseType === 'text') {
-                                            const rt = selfXhr.responseText;
-                                            const ingest = shouldIngestGraphQLResponse(rt);
-                                            const transform = shouldTransformFeatureFlags(rt);
-                                            if (ingest || transform) {
-                                                try {
-                                                    const parsed = JSON.parse(rt);
-                                                    if (ingest) handleApiResponse(parsed);
-                                                    if (transform) {
-                                                        const modifiedJson = stripFullscreenFeatureFlags(parsed);
-                                                        const modifiedText = JSON.stringify(modifiedJson);
-                                                        reportFeatureFlagsTransformed('XHR', url || 'API');
-                                                        Object.defineProperty(selfXhr, 'responseText', {
-                                                            get() { return modifiedText; },
-                                                            configurable: true,
-                                                        });
-                                                        Object.defineProperty(selfXhr, 'response', {
-                                                            get() {
-                                                                return selfXhr.responseType === 'json' ? modifiedJson : modifiedText;
-                                                            },
-                                                            configurable: true,
-                                                        });
-                                                    }
-                                                } catch {}
+                                            if (!selfXhr.responseType || selfXhr.responseType === 'text') {
+                                                const rt = selfXhr.responseText;
+                                                const ingest = shouldIngestGraphQLResponse(rt);
+                                                const transform = shouldTransformFeatureFlags(rt);
+                                                if (ingest || transform) {
+                                                    try {
+                                                        const parsed = JSON.parse(rt);
+                                                        if (ingest) handleApiResponse(parsed);
+                                                        if (transform) {
+                                                            const modifiedJson = stripFullscreenFeatureFlags(parsed);
+                                                            const modifiedText = JSON.stringify(modifiedJson);
+                                                            reportFeatureFlagsTransformed('XHR', url || 'API');
+                                                            saveAndDefineSpoofedXHRProps(selfXhr, info, {
+                                                                responseText: {
+                                                                    get() { return modifiedText; },
+                                                                    configurable: true,
+                                                                },
+                                                                response: {
+                                                                    get() {
+                                                                        return selfXhr.responseType === 'json' ? modifiedJson : modifiedText;
+                                                                    },
+                                                                    configurable: true,
+                                                                },
+                                                            });
+                                                        }
+                                                    } catch {}
+                                                }
                                             }
                                         }
                                     }
+                                } catch {
+                                    cleanupXhrListeners();
                                 }
-                            } catch {
-                                cleanupXhrListeners();
-                            }
-                        };
-                        this.addEventListener('readystatechange', handleXhrResponse, true);
-                        this.addEventListener('loadend', handleXhrResponse, { once: true, capture: true });
+                            };
+                            this.addEventListener('readystatechange', handleXhrResponse, true);
+                            this.addEventListener('loadend', handleXhrResponse, { once: true, capture: true });
+                        }
                     }
+                } catch (e) {
+                    WARN('xhr interceptor error:', e);
                 }
-            } catch (e) {
-                WARN('xhr interceptor error:', e);
+                if (bodyChanged) return origSend.call(this, body);
+                if (arguments.length === 0) return origSend.call(this);
+                if (arguments.length === 1) return origSend.call(this, body);
+                return reflectApply(origSend, this, arguments);
             }
-            return origSend.call(this, body);
-        };
-        cloak(OrigXHR.prototype.send, 'send');
+        }).send;
+        origDefineProperty(OrigXHR.prototype, 'send', {
+            value: cloak(patchedSend, 'send'),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
         VLOG('XHR hook installed');
     }
 
@@ -2785,34 +3232,66 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     // SEND-BEACON INTERCEPTOR
     // ============================================================
     if (navigator.sendBeacon) {
-        const origBeacon = navigator.sendBeacon.bind(navigator);
-        navigator.sendBeacon = function (url, data) {
-            try {
-                const anyMatch = matchAnyTelemetryService(url);
-                if (anyMatch) {
-                    if (settings.blockSendBeacon && isServiceMatchBlocked(anyMatch)) {
-                        const bodyStr = describeBody(data);
+        const origBeacon = navigator.sendBeacon;
+        const patchedBeacon = ({
+            sendBeacon(url, data = undefined) {
+                try {
+                    const urlStr = toUrlString(url);
+                    const anyMatch = matchAnyTelemetryService(urlStr);
+                    if (anyMatch) {
+                        if (settings.blockSendBeacon && isServiceMatchBlocked(anyMatch)) {
+                            const bodyStr = describeBody(data);
+                            if (anyMatch.key === 'jitsu') {
+                                bumpStat('jitsuPackets');
+                                reportJitsuPacket('sendBeacon · BLOCKED', urlStr, bodyStr);
+                            } else {
+                                reportBlock('sendBeacon', urlStr, { body: bodyStr });
+                            }
+                            bumpStat('blocked');
+                            return true;
+                        }
+
                         if (anyMatch.key === 'jitsu') {
                             bumpStat('jitsuPackets');
-                            reportJitsuPacket('sendBeacon · BLOCKED', String(url), bodyStr);
-                        } else {
-                            reportBlock('sendBeacon', String(url), { body: bodyStr });
+                            reportJitsuPacket('sendBeacon', urlStr, describeBody(data));
+                        } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
+                            reportAllow('sendBeacon', urlStr, `service "${anyMatch.label}" disabled in settings`);
                         }
-                        bumpStat('blocked');
-                        return true;
+                    } else if (isTargetApi(urlStr)) {
+                        const bodyText = extractSyncBodyText(data);
+                        if (bodyText) {
+                            const mocked = interceptBlockedMutation(bodyText, urlStr, 'sendBeacon');
+                            if (mocked) {
+                                return true;
+                            }
+                        }
                     }
-
-                    if (anyMatch.key === 'jitsu') {
-                        bumpStat('jitsuPackets');
-                        reportJitsuPacket('sendBeacon', String(url), describeBody(data));
-                    } else if (settings.logLevel === 'verbose' && !settings.telemetryServices[anyMatch.key]) {
-                        reportAllow('sendBeacon', url, `service "${anyMatch.label}" disabled in settings`);
-                    }
-                }
-            } catch {}
-            return origBeacon(url, data);
-        };
-        cloak(navigator.sendBeacon, 'sendBeacon');
+                } catch {}
+                const navThis = this || navigator;
+                if (arguments.length === 1) return origBeacon.call(navThis, url);
+                if (arguments.length === 2) return origBeacon.call(navThis, url, data);
+                return reflectApply(origBeacon, navThis, arguments);
+            }
+        }).sendBeacon;
+        cloak(patchedBeacon, 'sendBeacon');
+        const navProto = typeof Navigator !== 'undefined' && Navigator.prototype ? Navigator.prototype : null;
+        if (navProto && !origGetOwnPropDesc(navigator, 'sendBeacon') && origGetOwnPropDesc(navProto, 'sendBeacon')) {
+            try {
+                origDefineProperty(navProto, 'sendBeacon', {
+                    value: patchedBeacon, writable: true, enumerable: true, configurable: true,
+                });
+            } catch {
+                navigator.sendBeacon = patchedBeacon;
+            }
+        } else {
+            try {
+                origDefineProperty(navigator, 'sendBeacon', {
+                    value: patchedBeacon, writable: true, enumerable: true, configurable: true,
+                });
+            } catch {
+                navigator.sendBeacon = patchedBeacon;
+            }
+        }
         VLOG('sendBeacon hook installed');
     }
 
@@ -2821,41 +3300,50 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     // ============================================================
     const ORIG_VIS = (() => {
         try {
-            const d = (typeof Document !== 'undefined' && Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState'))
-                   || (typeof HTMLDocument !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'visibilityState'));
+            const d = (typeof Document !== 'undefined' && origGetOwnPropDesc(Document.prototype, 'visibilityState'))
+                   || (typeof HTMLDocument !== 'undefined' && origGetOwnPropDesc(HTMLDocument.prototype, 'visibilityState'));
             return d && d.get ? d.get : null;
         } catch { return null; }
     })();
     const ORIG_HIDDEN = (() => {
         try {
-            const d = (typeof Document !== 'undefined' && Object.getOwnPropertyDescriptor(Document.prototype, 'hidden'))
-                   || (typeof HTMLDocument !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'hidden'));
+            const d = (typeof Document !== 'undefined' && origGetOwnPropDesc(Document.prototype, 'hidden'))
+                   || (typeof HTMLDocument !== 'undefined' && origGetOwnPropDesc(HTMLDocument.prototype, 'hidden'));
             return d && d.get ? d.get : null;
         } catch { return null; }
     })();
-    const ORIG_HAS_FOCUS = document.hasFocus ? document.hasFocus.bind(document) : (() => true);
+    const ORIG_HAS_FOCUS = typeof document.hasFocus === 'function' ? document.hasFocus : null;
 
     const VISIBILITY_PROPS = ['visibilityState', 'webkitVisibilityState', 'mozVisibilityState', 'msVisibilityState'];
     const HIDDEN_PROPS     = ['hidden', 'webkitHidden', 'mozHidden', 'msHidden'];
-    const VIS_DESC = {
-        get: function () {
-            return settings.spoofVisibility ? 'visible' : (ORIG_VIS ? ORIG_VIS.call(document) : 'visible');
-        },
-        configurable: true,
-    };
-    cloak(VIS_DESC.get, 'get');
 
-    const HIDDEN_DESC = {
-        get: function () {
-            return settings.spoofVisibility ? false : (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : false);
-        },
-        configurable: true,
-    };
-    cloak(HIDDEN_DESC.get, 'get');
+    const VISIBILITY_DESCS = VISIBILITY_PROPS.map((prop) => {
+        const getterName = 'get ' + prop;
+        const get = ({
+            [getterName]() {
+                return settings.spoofVisibility ? 'visible' : (ORIG_VIS ? ORIG_VIS.call(this) : 'visible');
+            }
+        })[getterName];
+        cloak(get, getterName);
+        return [prop, { get, enumerable: true, configurable: true }];
+    });
 
-    const SPOOFED_HAS_FOCUS = function () {
-        return settings.spoofVisibility ? true : ORIG_HAS_FOCUS();
-    };
+    const HIDDEN_DESCS = HIDDEN_PROPS.map((prop) => {
+        const getterName = 'get ' + prop;
+        const get = ({
+            [getterName]() {
+                return settings.spoofVisibility ? false : (ORIG_HIDDEN ? ORIG_HIDDEN.call(this) : false);
+            }
+        })[getterName];
+        cloak(get, getterName);
+        return [prop, { get, enumerable: true, configurable: true }];
+    });
+
+    const SPOOFED_HAS_FOCUS = ({
+        hasFocus() {
+            return settings.spoofVisibility ? true : (ORIG_HAS_FOCUS ? ORIG_HAS_FOCUS.call(this || document) : true);
+        }
+    }).hasFocus;
     cloak(SPOOFED_HAS_FOCUS, 'hasFocus');
 
     function patchVisibilityProps() {
@@ -2864,18 +3352,18 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             const htmlDocProto = (typeof HTMLDocument !== 'undefined' && HTMLDocument.prototype) ? HTMLDocument.prototype : null;
             const targets = [docProto, htmlDocProto].filter(Boolean);
 
-            for (let i = 0; i < VISIBILITY_PROPS.length; i++) {
-                const prop = VISIBILITY_PROPS[i];
+            for (let i = 0; i < VISIBILITY_DESCS.length; i++) {
+                const [prop, desc] = VISIBILITY_DESCS[i];
                 try { delete document[prop]; } catch {}
                 for (let t = 0; t < targets.length; t++) {
-                    try { Object.defineProperty(targets[t], prop, VIS_DESC); } catch {}
+                    try { origDefineProperty(targets[t], prop, desc); } catch {}
                 }
             }
-            for (let i = 0; i < HIDDEN_PROPS.length; i++) {
-                const prop = HIDDEN_PROPS[i];
+            for (let i = 0; i < HIDDEN_DESCS.length; i++) {
+                const [prop, desc] = HIDDEN_DESCS[i];
                 try { delete document[prop]; } catch {}
                 for (let t = 0; t < targets.length; t++) {
-                    try { Object.defineProperty(targets[t], prop, HIDDEN_DESC); } catch {}
+                    try { origDefineProperty(targets[t], prop, desc); } catch {}
                 }
             }
         } catch (e) { WARN('visibility patch failed', e); }
@@ -2886,7 +3374,13 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         try {
             try { delete document.hasFocus; } catch {}
             if (typeof Document !== 'undefined' && Document.prototype && Document.prototype.hasFocus !== SPOOFED_HAS_FOCUS) {
-                Document.prototype.hasFocus = SPOOFED_HAS_FOCUS;
+                const desc = origGetOwnPropDesc(Document.prototype, 'hasFocus');
+                origDefineProperty(Document.prototype, 'hasFocus', {
+                    value: SPOOFED_HAS_FOCUS,
+                    writable: true,
+                    enumerable: desc ? desc.enumerable : true,
+                    configurable: true,
+                });
             }
         } catch {}
     }
@@ -2911,6 +3405,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             if (
                 e.target &&
                 e.target !== window &&
+                e.target !== rawWin &&
                 e.target !== document &&
                 e.target !== document.documentElement &&
                 e.target !== document.body
@@ -2918,40 +3413,51 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 return;
             }
         }
-        if (settings.logLevel === 'verbose' && !__ul_seenKilled.has(e.type)) {
-            __ul_seenKilled.add(e.type);
+        if (settings.logLevel === 'verbose' && !setHas.call(__ul_seenKilled, e.type)) {
+            setAdd.call(__ul_seenKilled, e.type);
             VLOG(`intercepted "${e.type}" event (further ${e.type}s will be silenced from logs)`);
         }
         if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
         if (typeof e.stopPropagation === 'function') e.stopPropagation();
     };
 
-    // Register capture-phase KILL listeners BEFORE wrapping addEventListener so they are never blocked by our own wrapper
+    // Register capture-phase KILL listeners BEFORE wrapping addEventListener so they are never blocked by our own wrapper.
+    // Register focusout on window ONLY (window capture already intercepts all focusout events before document).
     ['visibilitychange', 'webkitvisibilitychange', 'mozvisibilitychange', 'msvisibilitychange', 'blur', 'focusout', 'pagehide', 'freeze'].forEach((evt) => {
+        let winRegistered = false;
         try {
-            if (origWinAdd) origWinAdd(evt, KILL, true);
-            else if (origProtoAdd) origProtoAdd.call(window, evt, KILL, true);
+            if (origWinAdd) { origWinAdd(evt, KILL, true); winRegistered = true; }
+            else if (origProtoAdd) { origProtoAdd.call(window, evt, KILL, true); winRegistered = true; }
         } catch {}
+        if (evt === 'focusout' && winRegistered) return;
         try {
             if (origDocAdd) origDocAdd(evt, KILL, true);
             else if (origProtoAdd) origProtoAdd.call(document, evt, KILL, true);
         } catch {}
     });
 
-
-
     try {
         if (origProtoAdd) {
-            EventTarget.prototype.addEventListener = function (type, listener, options) {
-                if (settings.spoofVisibility &&
-                    (this === window || this === document) &&
-                    SUPPRESSED_EVENTS.has(type)) {
-                    VLOG(`suppressed "${type}" listener via EventTarget prototype`);
-                    return;
+            const patchedAddEventListener = ({
+                addEventListener(type, listener, options = undefined) {
+                    if (settings.spoofVisibility &&
+                        (this === window || this === rawWin || this === document || this == null) &&
+                        setHas.call(SUPPRESSED_EVENTS, type)) {
+                        VLOG(`suppressed "${type}" listener via EventTarget prototype`);
+                        return;
+                    }
+                    if (arguments.length >= 2 && arguments.length <= 3) {
+                        return origProtoAdd.call(this, type, listener, options);
+                    }
+                    return reflectApply(origProtoAdd, this, arguments);
                 }
-                return origProtoAdd.call(this, type, listener, options);
-            };
-            cloak(EventTarget.prototype.addEventListener, 'addEventListener');
+            }).addEventListener;
+            origDefineProperty(EventTarget.prototype, 'addEventListener', {
+                value: cloak(patchedAddEventListener, 'addEventListener'),
+                writable: true,
+                enumerable: true,
+                configurable: true,
+            });
         }
     } catch {}
 
@@ -2959,37 +3465,44 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         let cur = obj;
         while (cur) {
             try {
-                const d = Object.getOwnPropertyDescriptor(cur, prop);
+                const d = origGetOwnPropDesc(cur, prop);
                 if (d) return d;
             } catch {}
-            try { cur = Object.getPrototypeOf(cur); } catch { break; }
+            try { cur = origGetPrototypeOf(cur); } catch { break; }
         }
         return null;
     }
 
     ['onpagehide', 'onvisibilitychange', 'onblur', 'onfocusout'].forEach((prop) => {
+        const getterName = 'get ' + prop;
+        const setterName = 'set ' + prop;
         [window, document].forEach((target) => {
             try {
                 const desc = findPropertyDescriptor(target, prop);
                 let fallbackVal = null;
-                const getter = function () {
-                    if (settings.spoofVisibility) return null;
-                    if (desc && desc.get) return desc.get.call(this);
-                    return fallbackVal;
-                };
-                const setter = function (v) {
-                    if (settings.spoofVisibility) {
-                        VLOG(`suppressed assignment to "${prop}"`);
-                        return;
+                const getter = ({
+                    [getterName]() {
+                        if (settings.spoofVisibility) return null;
+                        if (desc && desc.get) return reflectApply(desc.get, this, arguments);
+                        return fallbackVal;
                     }
-                    if (desc && desc.set) desc.set.call(this, v);
-                    else fallbackVal = v;
-                };
-                cloak(getter, 'get ' + prop);
-                cloak(setter, 'set ' + prop);
-                Object.defineProperty(target, prop, {
+                })[getterName];
+                const setter = ({
+                    [setterName](v) {
+                        if (settings.spoofVisibility) {
+                            VLOG(`suppressed assignment to "${prop}"`);
+                            return;
+                        }
+                        if (desc && desc.set) reflectApply(desc.set, this, arguments);
+                        else fallbackVal = v;
+                    }
+                })[setterName];
+                cloak(getter, getterName);
+                cloak(setter, setterName);
+                origDefineProperty(target, prop, {
                     get: getter,
                     set: setter,
+                    enumerable: desc ? desc.enumerable : true,
                     configurable: true,
                 });
             } catch {}
@@ -3008,32 +3521,34 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     function installFullscreenBlocker() {
         FULLSCREEN_METHODS.forEach((name) => {
             const proto = Element.prototype;
-            if (!proto[name] || patchedFullscreenFns.has(proto[name])) return;
+            if (!proto[name] || wsHas.call(patchedFullscreenFns, proto[name])) return;
             const orig = proto[name];
-            const wrapped = function () {
-                if (settings.disableAutoFullscreen) {
-                    bumpStat('fullscreenBlocked');
-                    reportBlock('Fullscreen request', '(browser API)', {
-                        element: this.tagName ? this.tagName.toLowerCase() : String(this),
-                        method: name,
-                    });
-                    try {
-                        if (document.fullscreenElement && document.exitFullscreen) {
-                            document.exitFullscreen().catch(() => {});
-                        }
-                    } catch {}
-                    return Promise.reject(new DOMException(
-                        'Fullscreen request blocked by userscript',
-                        'NotAllowedError'
-                    ));
+            const wrapped = ({
+                [name](options = undefined) {
+                    if (settings.disableAutoFullscreen) {
+                        bumpStat('fullscreenBlocked');
+                        reportBlock('Fullscreen request', '(browser API)', {
+                            element: this.tagName ? this.tagName.toLowerCase() : String(this),
+                            method: name,
+                        });
+                        try {
+                            if (document.fullscreenElement && document.exitFullscreen) {
+                                document.exitFullscreen().catch(() => {});
+                            }
+                        } catch {}
+                        return Promise.reject(new DOMException(
+                            'Fullscreen request blocked by userscript',
+                            'NotAllowedError'
+                        ));
+                    }
+                    return reflectApply(orig, this, arguments);
                 }
-                return orig.apply(this, arguments);
-            };
-            patchedFullscreenFns.add(wrapped);
+            })[name];
+            wsAdd.call(patchedFullscreenFns, wrapped);
             cloak(wrapped, name);
             try {
-                Object.defineProperty(proto, name, {
-                    value: wrapped, writable: true, configurable: true,
+                origDefineProperty(proto, name, {
+                    value: wrapped, writable: true, enumerable: true, configurable: true,
                 });
             } catch {
                 proto[name] = wrapped;
@@ -5053,6 +5568,8 @@ function getEffectiveTheme(thm) {
         return t;
     }
 
+    let pillOpacityLogTimer = null;
+
     function applySettingChange(key, value) {
         if (key === 'telemetryPreset') {
             if (value === settings.telemetryPreset && value !== 'custom') return;
@@ -5107,7 +5624,15 @@ function getEffectiveTheme(thm) {
         }
 
         saveSettings();
-        LOG('setting changed:', key, '=', value);
+        if (key === 'pillOpacity') {
+            if (pillOpacityLogTimer) clearTimeout(pillOpacityLogTimer);
+            pillOpacityLogTimer = setTimeout(() => {
+                pillOpacityLogTimer = null;
+                LOG('setting changed: pillOpacity =', settings.pillOpacity);
+            }, 300);
+        } else {
+            LOG('setting changed:', key, '=', value);
+        }
 
         switch (key) {
             case 'manualTimeButtonEnabled':
@@ -5456,14 +5981,17 @@ var Glisse = (() => {
       sharedCanvas = document.createElement("canvas");
       sharedCtx = sharedCanvas.getContext("2d");
     }
-    sharedCanvas.width = w;
-    sharedCanvas.height = h;
+    if (sharedCanvas.width !== w) sharedCanvas.width = w;
+    if (sharedCanvas.height !== h) sharedCanvas.height = h;
 
     const field = needDisplacement ? sharedCtx.createImageData(w, h) : null;
-    if (field) new Uint32Array(field.data.buffer).fill(0xFF808080);
+    const fieldData = field ? field.data : null;
+    const fieldU32 = fieldData ? new Uint32Array(fieldData.buffer) : null;
+    if (fieldU32) fieldU32.fill(0xFF808080);
 
     const shine = sharedCtx.createImageData(w, h);
-    const shineU32 = new Uint32Array(shine.data.buffer);
+    const shineData = shine.data;
+    const shineU32 = new Uint32Array(shineData.buffer);
     const useMagnify = needDisplacement && !selection && shape.zoom > 1;
     const magnify = useMagnify ? sharedCtx.createImageData(w, h) : null;
     const magnifyU32 = magnify ? new Uint32Array(magnify.data.buffer) : null;
@@ -5475,82 +6003,138 @@ var Glisse = (() => {
     const reach = Math.max(width, height) / 2;
     const direction = selection ? 1 : -1;
     const bloomDenom = bezel * 0.22;
+    const radiusSqLimit = radius * radius + 1e-9;
+    const sqrt1_2 = Math.SQRT1_2;
 
-    let magX = null, magY = null;
-    if (magnify) {
-      magX = new Uint8Array(w);
-      magY = new Uint8Array(h);
+    if (magnifyU32) {
+      const magX = new Uint8Array(w);
       for (let x = 0; x < w; x++) magX[x] = Math.round(127.5 - ((x + 0.5) - halfW) / reach * 127.5);
-      for (let y = 0; y < h; y++) magY[y] = Math.round(127.5 - ((y + 0.5) - halfH) / reach * 127.5);
+      for (let y = 0; y < h; y++) {
+        const magYBits = 0xFF800000 | (Math.round(127.5 - ((y + 0.5) - halfH) / reach * 127.5) << 8);
+        const off = y * w;
+        for (let x = 0; x < w; x++) magnifyU32[off + x] = magYBits | magX[x];
+      }
+    }
+
+    let outShine = 0;
+    let outField = 0xFF808080;
+    function evalPixel(distance, nx, ny) {
+      outField = 0xFF808080;
+      if (distance < bezel && fieldU32) {
+        const sample = distance / bezel * maxSampleIdx;
+        const lower = Math.floor(sample);
+        const a = samples[lower];
+        const shift = a + (samples[Math.min(lower + 1, maxSampleIdx)] - a) * (sample - lower);
+        const rF = Math.round(127.5 + direction * nx * shift / maximum * 127.5);
+        const gF = Math.round(127.5 + direction * ny * shift / maximum * 127.5);
+        const rc = rF < 0 ? 0 : rF > 255 ? 255 : rF;
+        const gc = gF < 0 ? 0 : gF > 255 ? 255 : gF;
+        outField = (0xFF800000 | (gc << 8) | rc) >>> 0;
+      }
+
+      const light = -(nx + ny) * sqrt1_2;
+      const glint = light > 0 ? light ** 3 : 0;
+      const reflected = light < 0 ? (-light) ** 3 : 0;
+      let r = 255, g = 255, b = 255, alpha = 0;
+
+      if (selection) {
+        const d0 = (distance - 0.18) / 0.22;
+        const d1 = (distance - 0.42) / 0.22;
+        const d2 = (distance - 0.66) / 0.22;
+        const b0 = Math.exp(-(d0 * d0));
+        const b1 = Math.exp(-(d1 * d1));
+        const b2 = Math.exp(-(d2 * d2));
+        const peak = Math.max(b0, b1, b2);
+        alpha = peak * (0.06 + 0.8 * glint + 0.35 * reflected) * 0.85;
+        const invPeak = peak ? 0.35 / peak : 0;
+        r = Math.round(255 * (0.65 + b0 * invPeak));
+        g = Math.round(255 * (0.65 + b1 * invPeak));
+        b = Math.round(255 * (0.65 + b2 * invPeak));
+        r = r >= 255 ? 255 : r > 0 ? r : 0;
+        g = g >= 255 ? 255 : g > 0 ? g : 0;
+        b = b >= 255 ? 255 : b > 0 ? b : 0;
+      } else {
+        const rim = Math.exp(-(((distance - 0.4) / 0.38) ** 2));
+        const bloom = Math.exp(-((distance / bloomDenom) ** 2));
+        alpha = rim * (0.045 + 0.52 * glint + 0.2 * reflected) + bloom * 0.02 * glint;
+      }
+
+      const aByte = Math.round((alpha < 0 ? 0 : alpha > 1 ? 1 : alpha) * 255);
+      outShine = ((aByte << 24) | (b << 16) | (g << 8) | r) >>> 0;
     }
 
     for (let y = 0; y < h; y++) {
       const py = (y + 0.5) - halfH;
       const qy = Math.abs(py) - innerH;
+      const signPy = py > 0 ? 1 : py < 0 ? -1 : 0;
       const rowPixelOffset = y * w;
-      const magYBits = magnifyU32 ? (0xFF800000 | (magY[y] << 8)) : 0;
+      const qyNegBezel = qy < -bezel;
 
-      for (let x = 0; x < w; x++) {
-        const px = (x + 0.5) - halfW;
-        const qx = Math.abs(px) - innerW;
-        const pixelIdx = rowPixelOffset + x;
-
-        if (magnifyU32) {
-          magnifyU32[pixelIdx] = magYBits | magX[x];
-        }
-
-        if (qx < -bezel && qy < -bezel) {
-          continue;
-        }
-
-        const ox = Math.max(qx, 0);
-        const oy = Math.max(qy, 0);
-        const length = Math.hypot(ox, oy);
-        const distance = radius - (length + Math.min(Math.max(qx, qy), 0));
-
-        if (distance < 0) {
-          shineU32[pixelIdx] = 0x00FFFFFF;
-          continue;
-        }
-
-        const i = pixelIdx * 4;
-        const nx = length > 0 ? ox / length * Math.sign(px) : qx > qy ? Math.sign(px) : 0;
-        const ny = length > 0 ? oy / length * Math.sign(py) : qx > qy ? 0 : Math.sign(py);
-
-        if (distance < bezel && field) {
-          const sample = distance / bezel * maxSampleIdx;
-          const lower = Math.floor(sample);
-          const a = samples[lower];
-          const shift = a + (samples[Math.min(lower + 1, maxSampleIdx)] - a) * (sample - lower);
-          field.data[i] = Math.round(127.5 + direction * nx * shift / maximum * 127.5);
-          field.data[i + 1] = Math.round(127.5 + direction * ny * shift / maximum * 127.5);
-        }
-
-        const light = -(nx + ny) * Math.SQRT1_2;
-        const glint = Math.max(light, 0) ** 3;
-        const reflected = Math.max(-light, 0) ** 3;
-        let alpha = 0;
-
-        if (selection) {
-          const d0 = (distance - 0.18) / 0.22;
-          const d1 = (distance - 0.42) / 0.22;
-          const d2 = (distance - 0.66) / 0.22;
-          const b0 = Math.exp(-(d0 * d0));
-          const b1 = Math.exp(-(d1 * d1));
-          const b2 = Math.exp(-(d2 * d2));
-          const peak = Math.max(b0, b1, b2);
-          alpha = peak * (0.06 + 0.8 * glint + 0.35 * reflected) * 0.85;
-          const invPeak = peak ? 0.35 / peak : 0;
-          shine.data[i] = Math.round(255 * (0.65 + b0 * invPeak));
-          shine.data[i + 1] = Math.round(255 * (0.65 + b1 * invPeak));
-          shine.data[i + 2] = Math.round(255 * (0.65 + b2 * invPeak));
+      // Flat horizontal middle span has constant distance/normal across x (or sits inside interior)
+      const spanLimit = qyNegBezel ? (innerW - bezel - 1e-9) : (innerW + (qy < 0 ? qy : 0) - 1e-9);
+      let flatStart = 0;
+      let flatEnd = 0;
+      if (spanLimit >= 0) {
+        flatStart = Math.max(0, Math.ceil(halfW - spanLimit - 0.5));
+        flatEnd = Math.min(w, Math.floor(halfW + spanLimit - 0.5) + 1);
+        if (flatEnd > flatStart) {
+          if (!qyNegBezel) {
+            const flatDist = radius - qy;
+            if (flatDist < 0) {
+              shineU32.fill(0x00FFFFFF, rowPixelOffset + flatStart, rowPixelOffset + flatEnd);
+            } else {
+              evalPixel(flatDist, 0, signPy);
+              shineU32.fill(outShine, rowPixelOffset + flatStart, rowPixelOffset + flatEnd);
+              if (fieldU32 && outField !== 0xFF808080) {
+                fieldU32.fill(outField, rowPixelOffset + flatStart, rowPixelOffset + flatEnd);
+              }
+            }
+          }
         } else {
-          shine.data[i] = shine.data[i + 1] = shine.data[i + 2] = 255;
-          const rim = Math.exp(-(((distance - 0.4) / 0.38) ** 2));
-          const bloom = Math.exp(-((distance / bloomDenom) ** 2));
-          alpha = rim * (0.045 + 0.52 * glint + 0.2 * reflected) + bloom * 0.02 * glint;
+          flatStart = 0;
+          flatEnd = 0;
         }
-        shine.data[i + 3] = Math.round(clamp$2(alpha, 0, 1) * 255);
+      }
+
+      // Left [0, flatStart) and right [flatEnd, w) edge/corner segments
+      for (let seg = 0; seg < 2; seg++) {
+        const xStart = seg === 0 ? 0 : flatEnd;
+        const xEnd = seg === 0 ? flatStart : w;
+        for (let x = xStart; x < xEnd; x++) {
+          const px = (x + 0.5) - halfW;
+          const absPx = px < 0 ? -px : px;
+          const qx = absPx - innerW;
+          if (qx < -bezel && qyNegBezel) continue;
+
+          let distance, nx, ny;
+          if (qx <= 0) {
+            distance = radius - (qy < 0 ? qx : qy);
+            nx = qx > qy ? (px > 0 ? 1 : px < 0 ? -1 : 0) : 0;
+            ny = qx > qy ? 0 : signPy;
+          } else if (qy <= 0) {
+            distance = radius - qx;
+            nx = px > 0 ? 1 : px < 0 ? -1 : 0;
+            ny = 0;
+          } else {
+            if (qx * qx + qy * qy > radiusSqLimit) {
+              shineU32[rowPixelOffset + x] = 0x00FFFFFF;
+              continue;
+            }
+            const length = Math.hypot(qx, qy);
+            distance = radius - length;
+            nx = qx / length * (px > 0 ? 1 : px < 0 ? -1 : 0);
+            ny = qy / length * signPy;
+          }
+
+          const pixelIdx = rowPixelOffset + x;
+          if (distance < 0) {
+            shineU32[pixelIdx] = 0x00FFFFFF;
+            continue;
+          }
+          evalPixel(distance, nx, ny);
+          shineU32[pixelIdx] = outShine;
+          if (fieldU32 && outField !== 0xFF808080) fieldU32[pixelIdx] = outField;
+        }
       }
     }
 
