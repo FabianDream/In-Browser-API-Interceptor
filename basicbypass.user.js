@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UpLearn Telemetry + Fullscreen + Tab-Switch Blocker (Hardened)
 // @namespace    https://github.com/FabianDream/In-Browser-API-Interceptor
-// @version      1.6.3
+// @version      1.6.4
 // @description  Blocks telemetry, third-party trackers, WebWorker beacons, auto-fullscreen, and tab-switch/blur detection.
 // @author       FabianDream
 // @homepageURL  https://github.com/FabianDream/In-Browser-API-Interceptor
@@ -151,7 +151,8 @@
     // ============================================================
     // 1. TELEMETRY HOST DEFINITIONS & SINGLE-PASS URL CLASSIFIER
     // ============================================================
-    const API_HOST = 'web.uplearn.co.uk';
+    const API_HOST          = 'web.uplearn.co.uk';
+    const API_ORIGIN_PREFIX = 'https://' + API_HOST + '/';
 
     const URL_OTHER      = 0;
     const URL_TELEMETRY  = 1;
@@ -207,44 +208,57 @@
     const HOST_CACHE_MAX = 256;
     const hostKindCache  = new Map();
 
-    // Unified single-pass scheme + hostname classifier
+    // Unified single-pass scheme + hostname classifier with origin & HTTP(S) fast-paths
     function classifyUrl(url) {
         const str = typeof url === 'string' ? url : toUrlString(url);
         const len = str.length;
         if (len === 0) return URL_OTHER;
-        if (str.charCodeAt(0) === 47 && (len === 1 || str.charCodeAt(1) !== 47)) {
+
+        const firstCh = str.charCodeAt(0);
+        if (firstCh === 47 && (len === 1 || str.charCodeAt(1) !== 47)) {
             return URL_TARGET_API;
         }
 
         let start = 0;
-        while (start < len && str.charCodeAt(start) <= 32) start++;
-        if (start >= len) return URL_OTHER;
-
-        const c0 = str.charCodeAt(start);
-        if (c0 === 47) { // '/'
-            if (start + 1 >= len || str.charCodeAt(start + 1) !== 47) return URL_TARGET_API;
-            start += 2;
-        } else {
-            const first = c0 | 32;
-            if (first < 97 || first > 122) return URL_TARGET_API;
-            const limit = start + 32 < len ? start + 32 : len;
-            let schemeEnd = 0;
-            for (let i = start + 1; i < limit; i++) {
-                const ch = str.charCodeAt(i);
-                if (ch === 58) { // ':'
-                    if (i + 2 < len && str.charCodeAt(i + 1) === 47 && str.charCodeAt(i + 2) === 47) {
-                        schemeEnd = i + 3;
-                        break;
-                    }
-                    return URL_OTHER;
-                }
-                const low = ch | 32;
-                if (!((low >= 97 && low <= 122) || (ch >= 48 && ch <= 57) || ch === 43 || ch === 45 || ch === 46)) {
-                    return URL_TARGET_API;
-                }
+        if (firstCh === 104) { // 'h'
+            if (str.startsWith(API_ORIGIN_PREFIX)) return URL_TARGET_API;
+            if (str.startsWith('https://')) {
+                start = 8;
+            } else if (str.startsWith('http://')) {
+                start = 7;
             }
-            if (schemeEnd === 0) return URL_TARGET_API;
-            start = schemeEnd;
+        }
+
+        if (start === 0) {
+            while (start < len && str.charCodeAt(start) <= 32) start++;
+            if (start >= len) return URL_OTHER;
+
+            const c0 = str.charCodeAt(start);
+            if (c0 === 47) { // '/'
+                if (start + 1 >= len || str.charCodeAt(start + 1) !== 47) return URL_TARGET_API;
+                start += 2;
+            } else {
+                const first = c0 | 32;
+                if (first < 97 || first > 122) return URL_TARGET_API;
+                const limit = start + 32 < len ? start + 32 : len;
+                let schemeEnd = 0;
+                for (let i = start + 1; i < limit; i++) {
+                    const ch = str.charCodeAt(i);
+                    if (ch === 58) { // ':'
+                        if (i + 2 < len && str.charCodeAt(i + 1) === 47 && str.charCodeAt(i + 2) === 47) {
+                            schemeEnd = i + 3;
+                            break;
+                        }
+                        return URL_OTHER;
+                    }
+                    const low = ch | 32;
+                    if (!((low >= 97 && low <= 122) || (ch >= 48 && ch <= 57) || ch === 43 || ch === 45 || ch === 46)) {
+                        return URL_TARGET_API;
+                    }
+                }
+                if (schemeEnd === 0) return URL_TARGET_API;
+                start = schemeEnd;
+            }
         }
 
         let end = start;
@@ -343,7 +357,7 @@
                 set: cloak(({
                     [sName](val) {
                         if (isTelemetryUrl(val)) {
-                            LOG(`blocked <${tag}> ${prop}:`, val);
+                            if (DEBUG) LOG(`blocked <${tag}> ${prop}:`, val);
                             return;
                         }
                         return origSet.call(this, val);
@@ -386,7 +400,7 @@
     Element.prototype.setAttribute = cloak(({
         setAttribute(name, value) {
             if (isUrlAttribute(name) && isTelemetryUrl(value)) {
-                LOG(`blocked setAttribute(${name}):`, value);
+                if (DEBUG) LOG(`blocked setAttribute(${name}):`, value);
                 return;
             }
             return origSetAttribute.call(this, name, value);
@@ -399,6 +413,8 @@
     const TELEMETRY_CODE_RE = /openreplay|sentry|sessionReplay|replayUploader/i;
     const telemetryBlobs    = new WeakSet();
     const telemetryBlobUrls = new Set();
+    let hasTelemetryBlobs     = false;
+    let telemetryBlobUrlCount = 0;
 
     function createDummyTarget(newTarget, FallbackCtor, descs) {
         const dummy = reflectConstruct(EventTarget, [], newTarget || FallbackCtor);
@@ -414,8 +430,11 @@
             URL.createObjectURL = cloak(({
                 createObjectURL(obj) {
                     const url = origCreateObjectURL.call(this, obj);
-                    if (obj && typeof obj === 'object' && wsHas.call(telemetryBlobs, obj)) {
-                        setAdd.call(telemetryBlobUrls, url);
+                    if (hasTelemetryBlobs && obj && typeof obj === 'object' && wsHas.call(telemetryBlobs, obj)) {
+                        if (!setHas.call(telemetryBlobUrls, url)) {
+                            setAdd.call(telemetryBlobUrls, url);
+                            telemetryBlobUrlCount++;
+                        }
                     }
                     return url;
                 },
@@ -425,8 +444,8 @@
         if (origRevokeObjectURL) {
             URL.revokeObjectURL = cloak(({
                 revokeObjectURL(url) {
-                    if (typeof url === 'string') {
-                        setDel.call(telemetryBlobUrls, url);
+                    if (telemetryBlobUrlCount > 0 && typeof url === 'string' && setDel.call(telemetryBlobUrls, url)) {
+                        telemetryBlobUrlCount--;
                     }
                     return origRevokeObjectURL.call(this, url);
                 },
@@ -436,13 +455,11 @@
 
     const MEDIA_BLOB_TYPE_RE = /^(?:video|audio|image|font)\//i;
 
-    function isTelemetryBlobPart(part, options) {
+    function isTelemetryBlobPart(part, isMediaType) {
         if (typeof part === 'string') {
-            return part.length < 1e6 &&
-                !(options && typeof options.type === 'string' && MEDIA_BLOB_TYPE_RE.test(options.type)) &&
-                TELEMETRY_CODE_RE.test(part);
+            return !isMediaType && part.length >= 6 && part.length < 1e6 && TELEMETRY_CODE_RE.test(part);
         }
-        return typeof part === 'object' && part !== null && wsHas.call(telemetryBlobs, part);
+        return hasTelemetryBlobs && typeof part === 'object' && part !== null && wsHas.call(telemetryBlobs, part);
     }
 
     const OrigBlob = window.Blob;
@@ -455,18 +472,23 @@
                 : reflectConstruct(OrigBlob, argc === 0 ? [] : argc === 1 ? [blobParts] : [blobParts, options], new.target);
             try {
                 if (blobParts) {
-                    if (Array.isArray(blobParts)) {
-                        for (let i = 0, len = blobParts.length; i < len; i++) {
-                            if (isTelemetryBlobPart(blobParts[i], options)) {
-                                wsAdd.call(telemetryBlobs, blob);
-                                break;
+                    const isMediaType = !!(options && typeof options.type === 'string' && MEDIA_BLOB_TYPE_RE.test(options.type));
+                    if (!isMediaType || hasTelemetryBlobs) {
+                        if (Array.isArray(blobParts)) {
+                            for (let i = 0, len = blobParts.length; i < len; i++) {
+                                if (isTelemetryBlobPart(blobParts[i], isMediaType)) {
+                                    wsAdd.call(telemetryBlobs, blob);
+                                    hasTelemetryBlobs = true;
+                                    break;
+                                }
                             }
-                        }
-                    } else if (typeof blobParts[Symbol.iterator] === 'function') {
-                        for (const part of blobParts) {
-                            if (isTelemetryBlobPart(part, options)) {
-                                wsAdd.call(telemetryBlobs, blob);
-                                break;
+                        } else if (typeof blobParts[Symbol.iterator] === 'function') {
+                            for (const part of blobParts) {
+                                if (isTelemetryBlobPart(part, isMediaType)) {
+                                    wsAdd.call(telemetryBlobs, blob);
+                                    hasTelemetryBlobs = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -491,11 +513,11 @@
             if (!new.target) return OrigWorker();
             const urlStr = toUrlString(scriptURL);
             if (
-                setHas.call(telemetryBlobUrls, urlStr) ||
+                (telemetryBlobUrlCount > 0 && setHas.call(telemetryBlobUrls, urlStr)) ||
                 isTelemetryUrl(urlStr) ||
                 (urlStr.startsWith('data:') && TELEMETRY_CODE_RE.test(urlStr))
             ) {
-                LOG('blocked telemetry WebWorker:', urlStr);
+                if (DEBUG) LOG('blocked telemetry WebWorker:', urlStr);
                 return createDummyTarget(new.target, OrigWorker, WORKER_DUMMY_DESCS);
             }
             return reflectConstruct(OrigWorker, arguments, new.target);
@@ -530,7 +552,7 @@
             if (!new.target) return OrigWebSocket();
             const urlStr = toUrlString(url);
             if (isTelemetryUrl(urlStr)) {
-                LOG('blocked WebSocket connection:', urlStr);
+                if (DEBUG) LOG('blocked WebSocket connection:', urlStr);
                 const dummy = createDummyTarget(new.target, OrigWebSocket, WS_DUMMY_DESCS);
                 origDefineProperty(dummy, 'url', {
                     value: urlStr,
@@ -585,44 +607,46 @@
                 try {
                     const kind = classifyUrl(input);
                     if (kind === URL_TELEMETRY) {
-                        LOG('blocked telemetry fetch:', input);
+                        if (DEBUG) LOG('blocked telemetry fetch:', input);
                         return Promise.resolve(syntheticNoContent());
                     }
 
-                    const method = (init && init.method) || (typeof input === 'object' && input !== null ? input.method : undefined);
-                    if (kind === URL_TARGET_API && isPostMethod(method)) {
-                        const body = init && init.body;
-                        let asyncSource = null;
+                    if (kind === URL_TARGET_API) {
+                        const method = (init && init.method) || (typeof input === 'object' && input !== null ? input.method : undefined);
+                        if (isPostMethod(method)) {
+                            const body = init && init.body;
+                            let asyncSource = null;
 
-                        if (body != null) {
-                            if (bodyLooksLikeLogImproperUse(body)) {
-                                LOG('dropped LogImproperUse (fetch)');
-                                return Promise.resolve(syntheticOk());
+                            if (body != null) {
+                                if (bodyLooksLikeLogImproperUse(body)) {
+                                    if (DEBUG) LOG('dropped LogImproperUse (fetch)');
+                                    return Promise.resolve(syntheticOk());
+                                }
+                                if (typeof body === 'object' && typeof body.text === 'function' && !(typeof body.size === 'number' && body.size > MAX_BODY_SCAN)) {
+                                    asyncSource = body;
+                                }
+                            } else if (typeof Request !== 'undefined' && input instanceof Request && input.body != null && !input.bodyUsed) {
+                                if (!shouldSkipRequestScan(input)) {
+                                    asyncSource = input.clone();
+                                }
                             }
-                            if (typeof body.text === 'function' && !(typeof body.size === 'number' && body.size > MAX_BODY_SCAN)) {
-                                asyncSource = body;
-                            }
-                        } else if (typeof Request !== 'undefined' && input instanceof Request && input.body != null && !input.bodyUsed) {
-                            if (!shouldSkipRequestScan(input)) {
-                                asyncSource = input.clone();
-                            }
-                        }
 
-                        if (asyncSource) {
-                            return asyncSource.text().then(
-                                (text) => {
-                                    if (text.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(text)) {
-                                        LOG('dropped LogImproperUse (async fetch body)');
-                                        return syntheticOk();
-                                    }
-                                    return origFetch.call(this, input, init);
-                                },
-                                () => origFetch.call(this, input, init)
-                            );
+                            if (asyncSource) {
+                                return asyncSource.text().then(
+                                    (text) => {
+                                        if (text.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(text)) {
+                                            if (DEBUG) LOG('dropped LogImproperUse (async fetch body)');
+                                            return syntheticOk();
+                                        }
+                                        return origFetch.call(this, input, init);
+                                    },
+                                    () => origFetch.call(this, input, init)
+                                );
+                            }
                         }
                     }
                 } catch (e) {
-                    WARN('fetch interceptor error:', e);
+                    if (DEBUG) WARN('fetch interceptor error:', e);
                 }
 
                 return origFetch.call(this, input, init);
@@ -706,21 +730,29 @@
 
         OrigXHR.prototype.open = cloak(({
             open(method, url) {
-                let st = wmGet.call(xhrState, this);
-                if (!st) {
-                    st = { method: '', url: '', kind: URL_OTHER, seq: 0, spoofed: false };
-                    wmSet.call(xhrState, this, st);
-                } else if (st.spoofed) {
-                    st.spoofed = false;
-                    for (let i = 0; i < SPOOFED_XHR_KEYS.length; i++) {
-                        delete this[SPOOFED_XHR_KEYS[i]];
-                    }
-                }
                 const urlStr = toUrlString(url);
-                st.method = method;
-                st.url    = urlStr;
-                st.kind   = classifyUrl(urlStr);
-                st.seq++;
+                const kind   = classifyUrl(urlStr);
+                const isPost = kind === URL_TARGET_API && isPostMethod(method);
+                const st     = wmGet.call(xhrState, this);
+
+                if (st) {
+                    if (st.spoofed) {
+                        st.spoofed = false;
+                        for (let i = 0; i < SPOOFED_XHR_KEYS.length; i++) {
+                            delete this[SPOOFED_XHR_KEYS[i]];
+                        }
+                    }
+                    st.url    = urlStr;
+                    st.kind   = kind;
+                    st.isPost = isPost;
+                    st.seq++;
+                } else if (kind === URL_TELEMETRY || isPost) {
+                    wmSet.call(xhrState, this, { url: urlStr, kind, isPost, seq: 1, spoofed: false });
+                }
+
+                const argc = arguments.length;
+                if (argc === 2) return origOpen.call(this, method, url);
+                if (argc === 3) return origOpen.call(this, method, url, arguments[2]);
                 return reflectApply(origOpen, this, arguments);
             },
         }).open);
@@ -731,18 +763,18 @@
                     const st = wmGet.call(xhrState, this);
                     if (st) {
                         if (st.kind === URL_TELEMETRY) {
-                            LOG('blocked telemetry xhr:', st.url);
+                            if (DEBUG) LOG('blocked telemetry xhr:', st.url);
                             spoofXhr(this, st, XHR_BLOCKED_DESCS);
                             return;
                         }
-                        if (st.kind === URL_TARGET_API && isPostMethod(st.method) && bodyLooksLikeLogImproperUse(body)) {
-                            LOG('dropped LogImproperUse (xhr)');
+                        if (st.isPost && bodyLooksLikeLogImproperUse(body)) {
+                            if (DEBUG) LOG('dropped LogImproperUse (xhr)');
                             spoofXhr(this, st, XHR_OK_DESCS);
                             return;
                         }
                     }
                 } catch (e) {
-                    WARN('xhr interceptor error:', e);
+                    if (DEBUG) WARN('xhr interceptor error:', e);
                 }
                 return origSend.call(this, body);
             },
@@ -753,7 +785,7 @@
                 abort() {
                     const st = wmGet.call(xhrState, this);
                     if (st) st.seq++;
-                    return reflectApply(origAbort, this, arguments);
+                    return origAbort.call(this);
                 },
             }).abort);
         }
@@ -766,11 +798,11 @@
                 try {
                     const kind = classifyUrl(url);
                     if (kind === URL_TELEMETRY) {
-                        LOG('blocked sendBeacon:', url);
+                        if (DEBUG) LOG('blocked sendBeacon:', url);
                         return true;
                     }
                     if (kind === URL_TARGET_API && data != null && bodyLooksLikeLogImproperUse(data)) {
-                        LOG('dropped LogImproperUse (sendBeacon)');
+                        if (DEBUG) LOG('dropped LogImproperUse (sendBeacon)');
                         return true;
                     }
                 } catch {}
@@ -922,26 +954,44 @@
         }
     }
 
-    const origProtoAdd = EventTarget.prototype.addEventListener;
-    const winDesc      = origGetOwnPropDesc(window, 'window');
-    const rawWin       = (winDesc && winDesc.value) || window;
+    const origProtoAdd   = EventTarget.prototype.addEventListener;
+    const winDesc        = origGetOwnPropDesc(window, 'window');
+    const rawWin         = (winDesc && winDesc.value) || window;
+    const distinctRawWin = rawWin !== window ? rawWin : null;
 
-    const patchedAddEventListener = cloak(({
-        addEventListener(type, listener, options = undefined) {
-            if (
-                (this === document || this === rawWin || this === window || this == null) &&
-                setHas.call(SUPPRESSED_EVENTS, type)
-            ) {
-                return;
-            }
-            if (arguments.length >= 2) {
-                return origProtoAdd.call(this, type, listener, options);
-            }
-            return arguments.length === 1
-                ? origProtoAdd.call(this, type)
-                : origProtoAdd.call(this);
-        },
-    }).addEventListener);
+    const patchedAddEventListener = distinctRawWin !== null
+        ? cloak(({
+            addEventListener(type, listener, options = undefined) {
+                if (
+                    (this === document || this === window || this === distinctRawWin || this == null) &&
+                    setHas.call(SUPPRESSED_EVENTS, type)
+                ) {
+                    return;
+                }
+                if (arguments.length >= 2) {
+                    return origProtoAdd.call(this, type, listener, options);
+                }
+                return arguments.length === 1
+                    ? origProtoAdd.call(this, type)
+                    : origProtoAdd.call(this);
+            },
+        }).addEventListener)
+        : cloak(({
+            addEventListener(type, listener, options = undefined) {
+                if (
+                    (this === document || this === window || this == null) &&
+                    setHas.call(SUPPRESSED_EVENTS, type)
+                ) {
+                    return;
+                }
+                if (arguments.length >= 2) {
+                    return origProtoAdd.call(this, type, listener, options);
+                }
+                return arguments.length === 1
+                    ? origProtoAdd.call(this, type)
+                    : origProtoAdd.call(this);
+            },
+        }).addEventListener);
 
     function defineAddEventListener(target, protoFallback) {
         const desc = origGetOwnPropDesc(target, 'addEventListener') ||
@@ -971,8 +1021,8 @@
             e.type === 'blur' &&
             e.target &&
             e.target !== window &&
-            e.target !== rawWin &&
-            e.target !== document
+            e.target !== document &&
+            (distinctRawWin === null || e.target !== distinctRawWin)
         ) {
             return;
         }
@@ -992,23 +1042,28 @@
     // 6. PROPERTY PROTECTION & MONITORING
     // ============================================================
     function getProtectedSet(target) {
-        if (!target || (typeof target !== 'object' && typeof target !== 'function')) return null;
-        if (target === document || target === DocProto || target === HtmlDocProto) return PROTECTED_DOC_PROPS;
-        if (target === window || target === rawWin || target === WinProto) return PROTECTED_WIN_PROPS;
-        if (target === EventTargetProto) return PROTECTED_ET_PROPS;
+        if (target === document || (DocProto !== null && target === DocProto) || (HtmlDocProto !== null && target === HtmlDocProto)) {
+            return PROTECTED_DOC_PROPS;
+        }
+        if (target === window || (WinProto !== null && target === WinProto) || (distinctRawWin !== null && target === distinctRawWin)) {
+            return PROTECTED_WIN_PROPS;
+        }
+        if (EventTargetProto !== null && target === EventTargetProto) {
+            return PROTECTED_ET_PROPS;
+        }
         return null;
-    }
-
-    function isProtectedProp(target, prop) {
-        const set = getProtectedSet(target);
-        return set !== null && setHas.call(set, prop);
     }
 
     Object.defineProperty = cloak(({
         defineProperty(target, prop, descriptor) {
-            return isProtectedProp(target, prop)
-                ? target
-                : origDefineProperty(target, prop, descriptor);
+            if (target === document || (DocProto !== null && target === DocProto) || (HtmlDocProto !== null && target === HtmlDocProto)) {
+                if (setHas.call(PROTECTED_DOC_PROPS, prop)) return target;
+            } else if (target === window || (WinProto !== null && target === WinProto) || (distinctRawWin !== null && target === distinctRawWin)) {
+                if (setHas.call(PROTECTED_WIN_PROPS, prop)) return target;
+            } else if (EventTargetProto !== null && target === EventTargetProto) {
+                if (setHas.call(PROTECTED_ET_PROPS, prop)) return target;
+            }
+            return origDefineProperty(target, prop, descriptor);
         },
     }).defineProperty);
 
@@ -1047,12 +1102,17 @@
         const origReflectDefineProperty = Reflect.defineProperty;
         Reflect.defineProperty = cloak(({
             defineProperty(target, prop, descriptor) {
-                return isProtectedProp(target, prop)
-                    ? true
-                    : origReflectDefineProperty(target, prop, descriptor);
+                if (target === document || (DocProto !== null && target === DocProto) || (HtmlDocProto !== null && target === HtmlDocProto)) {
+                    if (setHas.call(PROTECTED_DOC_PROPS, prop)) return true;
+                } else if (target === window || (WinProto !== null && target === WinProto) || (distinctRawWin !== null && target === distinctRawWin)) {
+                    if (setHas.call(PROTECTED_WIN_PROPS, prop)) return true;
+                } else if (EventTargetProto !== null && target === EventTargetProto) {
+                    if (setHas.call(PROTECTED_ET_PROPS, prop)) return true;
+                }
+                return origReflectDefineProperty(target, prop, descriptor);
             },
         }).defineProperty);
     }
 
-    LOG('=== READY | telemetry: blocked | workers: neutered | fullscreen: disabled | tab-switch: blocked ===');
+    if (DEBUG) LOG('=== READY | telemetry: blocked | workers: neutered | fullscreen: disabled | tab-switch: blocked ===');
 })();
