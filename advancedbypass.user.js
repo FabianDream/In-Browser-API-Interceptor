@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         UpLearn i think
+// @name         UpLearn
 // @namespace    https://github.com/local/uplearn-telemetry-blocker
-// @version      3.9.3
+// @version      4.0.0
 // @description  hi
 // @match        https://web.uplearn.co.uk/*
 // @run-at       document-start
@@ -11,18 +11,15 @@
 // @downloadURL  https://raw.githubusercontent.com/FabianDream/In-Browser-API-Interceptor/refs/heads/main/advancedbypass.user.js
 // @updateURL    https://raw.githubusercontent.com/FabianDream/In-Browser-API-Interceptor/refs/heads/main/advancedbypass.user.js
 //
-// @webRequest   [{"selector":"*://*.openreplay.uplearn.co.uk/*","action":"cancel"},{"selector":"*://*.sentry.io/*","action":"cancel"},{"selector":"*://static.cloudflareinsights.com/*","action":"cancel"},{"selector":"*://*.intercom.io/*","action":"cancel"},{"selector":"*://*.intercomcdn.com/*","action":"cancel"},{"selector":"*://*.googletagmanager.com/*","action":"cancel"},{"selector":"*://*.google-analytics.com/*","action":"cancel"},{"selector":"*://analytics.google.com/*","action":"cancel"},{"selector":"*://*.googleadservices.com/*","action":"cancel"},{"selector":"*://*.doubleclick.net/*","action":"cancel"},{"selector":"*://*.facebook.net/*","action":"cancel"},{"selector":"*://*.sc-static.net/*","action":"cancel"},{"selector":"*://bat.bing.com/*","action":"cancel"},{"selector":"*://bzrcdn.openai.com/*","action":"cancel"},{"selector":"*://*.posthog.com/*","action":"cancel"},{"selector":"*://*.fullstory.com/*","action":"cancel"},{"selector":"*://*.hotjar.com/*","action":"cancel"},{"selector":"*://*.mixpanel.com/*","action":"cancel"},{"selector":"*://*.segment.io/*","action":"cancel"},{"selector":"*://*.amplitude.com/*","action":"cancel"}]
-//
-// @require      https://unpkg.com/react@18.3.1/umd/react.production.min.js
-// @require      https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js
-// @require      https://unpkg.com/htm@3.1.1/dist/htm.umd.js
+// Note: @webRequest is intentionally omitted so runtime Telemetry presets and
+// individual service toggles take effect immediately in Violentmonkey & Tampermonkey.
 // ==/UserScript==
 
 (function () {
     'use strict';
 
     // ============================================================
-    // CACHED PRIMORDIALS & STEALTH CLOAKING INFRASTRUCTURE
+    // 1. CACHED PRIMORDIALS, NATIVE LISTENERS & STEALTH CLOAKING
     // ============================================================
     const origDefineProperty   = Object.defineProperty;
     const origDefineProperties = Object.defineProperties;
@@ -48,6 +45,25 @@
     const sharedTextEncoder    = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
     const rawWin               = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || (window && window.window) || window;
 
+    // Cache native URL blob methods before Section 8 patches URL.createObjectURL/revokeObjectURL
+    const origCreateObjectURL  = (typeof URL !== 'undefined' && URL.createObjectURL) ? URL.createObjectURL : null;
+    const origRevokeObjectURL  = (typeof URL !== 'undefined' && URL.revokeObjectURL) ? URL.revokeObjectURL : null;
+
+    // Cache native EventTarget methods for internal listeners so spoofVisibility
+    // never drops Glisse's own listeners, and export unified safe helpers.
+    const origWinAdd           = window.addEventListener ? window.addEventListener.bind(window) : null;
+    const origWinRemove        = window.removeEventListener ? window.removeEventListener.bind(window) : null;
+    const origDocAdd           = document.addEventListener ? document.addEventListener.bind(document) : null;
+    const origDocRemove        = document.removeEventListener ? document.removeEventListener.bind(document) : null;
+    const origProtoAdd         = (typeof EventTarget !== 'undefined' && EventTarget.prototype && EventTarget.prototype.addEventListener)
+        ? EventTarget.prototype.addEventListener
+        : null;
+
+    const safeWinAdd = origWinAdd || ((t, fn, o) => window.addEventListener(t, fn, o));
+    const safeWinRem = origWinRemove || ((t, fn, o) => window.removeEventListener(t, fn, o));
+    const safeDocAdd = origDocAdd || ((t, fn, o) => document.addEventListener(t, fn, o));
+    const safeDocRem = origDocRemove || ((t, fn, o) => document.removeEventListener(t, fn, o));
+
     const cloakedFns = new WeakMap();
 
     function cloak(fn, name) {
@@ -55,6 +71,17 @@
             wmSet.call(cloakedFns, fn, `function ${name || fn.name || ''}() { [native code] }`);
         }
         return fn;
+    }
+
+    function patchMethod(target, prop, fn, name, enumerable = true) {
+        const cloaked = cloak(fn, name || prop);
+        origDefineProperty(target, prop, {
+            value: cloaked,
+            writable: true,
+            enumerable,
+            configurable: true,
+        });
+        return cloaked;
     }
 
     function patchConstructor(Orig, Patched, name) {
@@ -87,17 +114,9 @@
             return (typeof this === 'function' && wmGet.call(cloakedFns, this)) || origToString.call(this);
         }
     }).toString;
-    cloak(patchedToString, 'toString');
-    origDefineProperty(Function.prototype, 'toString', {
-        value: patchedToString,
-        writable: true,
-        enumerable: false,
-        configurable: true,
-    });
+    patchMethod(Function.prototype, 'toString', patchedToString, 'toString', false);
 
-    // ============================================================
-    // NATIVE CONSOLE PRESERVED (before any patching)
-    // ============================================================
+    // Preserve native console methods before installing any console filters
     const nativeConsole = {
         log:            console.log.bind(console),
         warn:           console.warn.bind(console),
@@ -111,8 +130,20 @@
     };
 
     // ============================================================
-    // TELEMETRY SERVICE REGISTRY
+    // 2. CONSTANTS, REGISTRY & CENTRALIZED STATE OBJECTS
     // ============================================================
+    const API_HOST               = 'web.uplearn.co.uk';
+    const SETTINGS_KEY           = 'uplearn_settings_v2';
+    const LEGACY_BOOST_KEY       = 'uplearn_time_boost_enabled';
+    const LEGACY_UI_KEY          = 'uplearn_time_boost_ui_visible';
+    const WINDOW_POS_KEY         = '__ul_win_pos';
+    const MANUAL_BUTTON_ID       = 'us-timespent-btn';
+    const DARK_MODE_STYLE_ID     = '__ul-dark-styles';
+    const VIDEO_OP               = 'CompleteVideoLesson';
+    const MAX_SCAN               = 65536;
+    const HOST_SERVICE_CACHE_MAX = 256;
+    const QUESTION_REGISTRY_MAX  = 500;
+
     const TELEMETRY_SERVICES = {
         openreplay:      { label: 'OpenReplay',                     hosts: ['openreplay.uplearn.co.uk'] },
         jitsu:           { label: 'Jitsu',                          hosts: ['jitsu.uplearn.co.uk'] },
@@ -148,14 +179,6 @@
         return o;
     }
 
-    // ============================================================
-    // SETTINGS
-    // ============================================================
-    const SETTINGS_KEY      = 'uplearn_settings_v2';
-    const LEGACY_BOOST_KEY  = 'uplearn_time_boost_enabled';
-    const LEGACY_UI_KEY     = 'uplearn_time_boost_ui_visible';
-    let publicApi           = null;
-
     const IS_MAC = /Mac|iPhone|iPad|iPod/i.test(
         (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent
     );
@@ -166,47 +189,40 @@
     };
 
     const DEFAULT_SETTINGS = {
-        telemetryPreset:           'harsh',
-        telemetryServices:         buildDefaultTelemetryServices(),
-        suppressJitsu:             true,   // true = block Jitsu, false = allow + log
-        blockLogImproperUse:       true,
-        blockLogEvent:             true,
-        privateSearchMode:         true,
-        spoofVisibility:           true,
-        blockWebSockets:           true,
-        blockSendBeacon:           true,
-        blockDomElements:          true,
-        suppressConsoleNoise:      true,
-        timeBoostEnabled:          true,
-        dynamicTimeEnabled:        true,
-        predictFinalCallEnabled:   true,
-        extraSecondsMin:           30,
-        extraSecondsMax:           90,
-        manualTimeButtonEnabled:   true,
-        manualTimeStacksWithAuto:  false,
-        fullVideoWatchedEnabled:   true,
-        autoSkipVideoEnabled:      true,
+        telemetryPreset:             'harsh',
+        telemetryServices:           buildDefaultTelemetryServices(),
+        suppressJitsu:               true,   // true = block Jitsu, false = allow + log
+        blockLogImproperUse:         true,
+        blockLogEvent:               true,
+        privateSearchMode:           true,
+        spoofVisibility:             true,
+        blockWebSockets:             true,
+        blockSendBeacon:             true,
+        blockDomElements:            true,
+        suppressConsoleNoise:        true,
+        timeBoostEnabled:            true,
+        dynamicTimeEnabled:          true,
+        predictFinalCallEnabled:     true,
+        extraSecondsMin:             30,
+        extraSecondsMax:             90,
+        manualTimeButtonEnabled:     true,
+        manualTimeStacksWithAuto:    false,
+        fullVideoWatchedEnabled:     true,
+        autoSkipVideoEnabled:        true,
         addVideoDurationToTimeSpent: true,
-        disableAutoFullscreen:     true,
-        darkMode:                  false,
-        pillVisible:               true,
-        pillPosition:              'bottom-right',
-        pillOpacity:               1,
-        pillMode:                  'minimal',
-        theme:                     'dark',
-        accentColor:               '#007aff',
-        logLevel:                  'normal',
-        keybindAction:             'toggle-pill',
-        draggableUI:               false,
-        uiToggleKeybind:           Object.assign({}, DEFAULT_KEYBIND),
+        disableAutoFullscreen:       true,
+        darkMode:                    false,
+        pillVisible:                 true,
+        pillPosition:                'bottom-right',
+        pillOpacity:                 1,
+        pillMode:                    'minimal',
+        theme:                       'dark',
+        accentColor:                 '#007aff',
+        logLevel:                    'normal',
+        keybindAction:               'toggle-pill',
+        draggableUI:                 false,
+        uiToggleKeybind:             Object.assign({}, DEFAULT_KEYBIND),
     };
-
-    const INDIVIDUAL_TELEMETRY_SETTINGS = new Set([
-        'telemetryServices',
-        'suppressJitsu',
-        'blockLogImproperUse', 'blockLogEvent', 'privateSearchMode', 'spoofVisibility', 'blockWebSockets',
-        'blockSendBeacon', 'blockDomElements', 'suppressConsoleNoise',
-    ]);
 
     const BOOLEAN_SETTING_KEYS = [
         'dynamicTimeEnabled',
@@ -240,13 +256,137 @@
         },
     };
 
+    // Derived directly from PRESET_CONFIGS to prevent metadata drift
+    const PRESET_TELEMETRY_FLAGS        = Object.keys(PRESET_CONFIGS.harsh).filter((k) => k !== 'services');
+    const PRESET_SYNC_KEYS              = ['telemetryPreset', ...PRESET_TELEMETRY_FLAGS];
+    const INDIVIDUAL_TELEMETRY_SETTINGS = new Set(['telemetryServices', ...PRESET_TELEMETRY_FLAGS]);
+
+    // Session metrics & reactive subscriber hub
+    const stats = {
+        apiPosts: 0, seen: 0, boosted: 0, blocked: 0,
+        groupExtra: 0, fullscreenBlocked: 0, consoleSuppressed: 0,
+        logImproperUseBlocked: 0, jitsuPackets: 0, manualBoosted: 0,
+        videosMaxed: 0, videosSkipped: 0, videoTimeAdded: 0,
+        finalCallsModified: 0, questionsIdentified: 0,
+    };
+
+    const statsListeners = new Set();
+    function subscribeStats(fn) {
+        statsListeners.add(fn);
+        return () => statsListeners.delete(fn);
+    }
+    let statsNotifyScheduled = false;
+    function notifyStatsChange() {
+        if (statsNotifyScheduled || statsListeners.size === 0) return;
+        statsNotifyScheduled = true;
+        const deliver = () => {
+            statsNotifyScheduled = false;
+            for (const fn of statsListeners) {
+                try { fn(stats); } catch {}
+            }
+        };
+        if (typeof queueMicrotask === 'function') queueMicrotask(deliver);
+        else setTimeout(deliver, 0);
+    }
+    function bumpStat(key, delta = 1) {
+        stats[key] = (stats[key] || 0) + delta;
+        notifyStatsChange();
+    }
+
+    // Structured runtime state objects (eliminates scattered globals & forward refs)
+    const sessionState = {
+        questionRegistry:           new Map(),
+        questionAliasMap:           new Map(),
+        knownLessonDurations:       new Map(),
+        activeSession:              null,
+        lastSubmittedQuestionId:    null,
+        contextRevision:            0,
+        accumulatedExtraSeconds:    0,
+        accumulatedQuestionCount:   0,
+        /**
+         * Extra seconds queued to ADD on top of UpLearn's own timeSpent.
+         *   null  -> user hasn't set anything (button shows "Add time")
+         *   0     -> user explicitly set 0 (button shows "+0s")
+         *   N > 0 -> user set N seconds (button shows "+Xm Ys")
+         */
+        queuedSeconds:              null,
+        editing:                    false,
+        resetScheduled:             false,
+        pulseTimer:                 null,
+        errorTimer:                 null,
+        latestExamPaperData:        null,
+        latestUserProfile:          null,
+        latestFeatureFlags:         null,
+        latestGlobalFeatureFlags:   null,
+        latestQuizFeedback:         null,
+        cachedContextSnapshot:      null,
+        cachedContextRevision:      -1,
+    };
+
+    const videoState = {
+        currentVideoLesson:         null,
+        lastSkippedTarget:          null,
+        autoSkipThrottled:          false,
+        autoSkipThrottleTimer:      null,
+        lastActiveVideoElement:     null,
+        lastQuestionAnsweredAt:     0,
+        waitingForPostAnswerResume: false,
+        mediaListenersInstalled:    false,
+    };
+
+    const uiState = {
+        hostEl:                     null,
+        shadowRoot:                 null,
+        containerEl:                null,
+        pillEl:                     null,
+        pillRefs:                   null,
+        pillCleanup:                null,
+        modalBackdropEl:            null,
+        modalIsOpen:                false,
+        modalIsClosing:             false,
+        modalCloseTimer:            null,
+        modalCleanupFns:            [],
+        activeTab:                  'telemetry',
+        tabPanels:                  {},
+        tabBarApi:                  null,
+        openMenuCount:              0,
+        openMenuClosers:            new Set(),
+        capturingKeybind:           false,
+        domObserver:                null,
+        domObserverConnected:       false,
+        darkObserver:               null,
+        darkObserverConnected:      false,
+        lastResolvedSubmitBtn:      null,
+        manualBtnTimer:             null,
+        pillOpacityLogTimer:        null,
+        bindings:                   {},
+        statsUnsub:                 null,
+        pillStatsUnsub:             null,
+    };
+
+    let publicApi = null;
     let applyingPreset = false;
 
+    // ============================================================
+    // 3. SETTINGS PERSISTENCE, CLONING & PRESETS
+    // ============================================================
     function normalizeKeybind(kb) {
         if (!kb) return Object.assign({}, DEFAULT_KEYBIND);
         if (typeof kb === 'string') return { code: kb, ctrl: false, shift: false, alt: false, meta: false };
         if (typeof kb !== 'object') return Object.assign({}, DEFAULT_KEYBIND);
         return { code: kb.code || null, ctrl: !!kb.ctrl, shift: !!kb.shift, alt: !!kb.alt, meta: !!kb.meta };
+    }
+
+    function normalizeRange(s) {
+        let min = Number(s.extraSecondsMin);
+        let max = Number(s.extraSecondsMax);
+        if (!isFinite(min) || min < 1) min = DEFAULT_SETTINGS.extraSecondsMin;
+        if (!isFinite(max) || max < 1) max = DEFAULT_SETTINGS.extraSecondsMax;
+        min = Math.round(min);
+        max = Math.round(max);
+        if (min > max) { const t = min; min = max; max = t; }
+        s.extraSecondsMin = min;
+        s.extraSecondsMax = max;
     }
 
     function loadSettings() {
@@ -273,7 +413,7 @@
                         if (!(k in parsed.telemetryServices)) parsed.telemetryServices[k] = true;
                     }
                 }
-                // Migration: old allowJitsu (true = allow) → new suppressJitsu (true = block)
+                // Migration: old allowJitsu (true = allow) -> new suppressJitsu (true = block)
                 if (typeof parsed.suppressJitsu !== 'boolean') {
                     parsed.suppressJitsu = typeof parsed.allowJitsu === 'boolean'
                         ? !parsed.allowJitsu
@@ -320,17 +460,6 @@
         return s;
     }
 
-    function normalizeRange(s) {
-        let min = Number(s.extraSecondsMin);
-        let max = Number(s.extraSecondsMax);
-        if (!isFinite(min) || min < 1) min = DEFAULT_SETTINGS.extraSecondsMin;
-        if (!isFinite(max) || max < 1) max = DEFAULT_SETTINGS.extraSecondsMax;
-        min = Math.round(min); max = Math.round(max);
-        if (min > max) { const t = min; min = max; max = t; }
-        s.extraSecondsMin = min;
-        s.extraSecondsMax = max;
-    }
-
     const settings = loadSettings();
 
     let saveSettingsTimer = null;
@@ -351,20 +480,9 @@
         }
     }
     try {
-        window.addEventListener('beforeunload', () => saveSettings(true));
-        window.addEventListener('pagehide', () => saveSettings(true));
+        safeWinAdd('beforeunload', () => saveSettings(true));
+        safeWinAdd('pagehide', () => saveSettings(true));
     } catch {}
-
-    // ============================================================
-    // CLONING & PRESETS
-    // ============================================================
-    function cloneSettings(s) {
-        if (!s) return s;
-        return Object.assign({}, s, {
-            telemetryServices: Object.assign({}, s.telemetryServices),
-            uiToggleKeybind: Object.assign({}, s.uiToggleKeybind),
-        });
-    }
 
     function applyTelemetryPreset(preset) {
         const cfg = PRESET_CONFIGS[preset];
@@ -386,7 +504,7 @@
     }
 
     // ============================================================
-    // LOGGING
+    // 4. CONSOLE LOGGING & NOISE FILTER
     // ============================================================
     const CSS = {
         base:       'color:#00e5ff;font-weight:bold',
@@ -416,12 +534,91 @@
         nativeConsole.log('%c[UL · verbose] ' + msg, CSS.verbose, ...rest);
     };
 
+    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    const ALWAYS_NOISE_RE = (() => {
+        const parts = ['\\[Sentry\\]'];
+        for (const k in TELEMETRY_SERVICES) {
+            if (k === 'jitsu') continue;
+            for (const h of TELEMETRY_SERVICES[k].hosts) parts.push(escapeRegExp(h));
+        }
+        return new RegExp(parts.join('|'), 'i');
+    })();
+
+    const JITSU_NOISE_RE = (() => {
+        const parts = [
+            '\\[J-(?:ERROR|WARN|DEBUG|INFO|LOG)\\]',
+            '\\[Jitsu\\]',
+            'Failed to send data to',
+            'Dropping queued event after',
+            'max send attempts',
+        ];
+        for (const h of TELEMETRY_SERVICES.jitsu.hosts) parts.push(escapeRegExp(h));
+        return new RegExp(parts.join('|'), 'i');
+    })();
+
+    const COMBINED_NOISE_RE = new RegExp(ALWAYS_NOISE_RE.source + '|' + JITSU_NOISE_RE.source, 'i');
+
+    function textMatchesNoise(text) {
+        if (typeof text !== 'string' || !text) return false;
+        return settings.suppressJitsu ? COMBINED_NOISE_RE.test(text) : ALWAYS_NOISE_RE.test(text);
+    }
+
+    function argsAreNoise(args, startIndex = 0) {
+        for (let i = startIndex; i < args.length; i++) {
+            const a = args[i];
+            if (typeof a === 'string') {
+                if (textMatchesNoise(a)) return true;
+            } else if (a instanceof Error) {
+                if (a.message && textMatchesNoise(a.message)) return true;
+            } else if (a && typeof a === 'object') {
+                try {
+                    if (typeof a.url     === 'string' && textMatchesNoise(a.url))     return true;
+                    if (typeof a.message === 'string' && textMatchesNoise(a.message)) return true;
+                } catch {}
+            }
+        }
+        return false;
+    }
+
+    function installConsoleNoiseFilter() {
+        const methods = ['log', 'warn', 'error', 'info', 'debug'];
+        for (let m = 0; m < methods.length; m++) {
+            const method = methods[m];
+            const orig = nativeConsole[method];
+            const wrapped = ({
+                [method]() {
+                    if (!settings.suppressConsoleNoise) {
+                        return reflectApply(orig, console, arguments);
+                    }
+                    const len = arguments.length;
+                    if (len === 0) return reflectApply(orig, console, arguments);
+                    const first = arguments[0];
+                    const firstIsString = typeof first === 'string';
+                    if (firstIsString && textMatchesNoise(first)) {
+                        bumpStat('consoleSuppressed');
+                        return;
+                    }
+                    if (len === 1 && firstIsString) {
+                        return reflectApply(orig, console, arguments);
+                    }
+                    if (argsAreNoise(arguments, firstIsString ? 1 : 0)) {
+                        bumpStat('consoleSuppressed');
+                        return;
+                    }
+                    return reflectApply(orig, console, arguments);
+                }
+            })[method];
+            console[method] = cloak(wrapped, method);
+        }
+        VLOG('console noise filter installed (Jitsu / Apollo / Sentry / host matches)');
+    }
+    installConsoleNoiseFilter();
+
     // ============================================================
-    // URL / SERVICE MATCHING
+    // 5. URL & TELEMETRY SERVICE MATCHING
     // ============================================================
-    const API_HOST               = 'web.uplearn.co.uk';
-    const HOST_SERVICE_CACHE_MAX = 256;
-    const hostServiceCache       = new Map();
+    const hostServiceCache = new Map();
 
     function toUrlString(url) {
         if (typeof url === 'string') return url;
@@ -493,12 +690,10 @@
             if (colonIdx + 2 < len && s.charCodeAt(colonIdx + 1) === 47 && s.charCodeAt(colonIdx + 2) === 47) {
                 authStart = colonIdx + 3;
             } else {
-                // Non-authority scheme (data:, blob:, javascript:, etc.)
                 return '';
             }
         }
 
-        // Single-pass authority scan [authStart, authEnd) tracking last '@' and host ':port'
         let atIdx = -1;
         let authEnd = authStart;
         let firstColon = -1;
@@ -544,7 +739,7 @@
         if (typeof url === 'string') {
             const c0 = url.charCodeAt(0);
             if (c0 === 47 && url.charCodeAt(1) !== 47) return null;
-            if (c0 === 35 || c0 === 63) return null; // '#...' or '?...'
+            if (c0 === 35 || c0 === 63) return null;
             if (url.length >= 5 && url.charCodeAt(4) === 58) {
                 const c0l = c0 | 32;
                 if (
@@ -587,7 +782,6 @@
 
     function isServiceEnabledIn(cfg, key) {
         if (!cfg) return false;
-        // Jitsu is controlled by settings.suppressJitsu (synced with telemetryServices.jitsu and presets)
         if (key === 'jitsu') {
             return !!(cfg.suppressJitsu && (!cfg.telemetryServices || cfg.telemetryServices.jitsu !== false));
         }
@@ -618,8 +812,8 @@
         const after = pathStart + 4;
         if (after === len) return true;
         const c = s.charCodeAt(after);
-        if (c === 63 || c === 35) return true; // '?' or '#'
-        if (c === 47) { // '/'
+        if (c === 63 || c === 35) return true;
+        if (c === 47) {
             if (after + 1 === len) return true;
             const c2 = s.charCodeAt(after + 1);
             return c2 === 63 || c2 === 35;
@@ -672,133 +866,26 @@
     }
 
     // ============================================================
-    // STATS & REACTIVE SUBSCRIBERS
-    // ============================================================
-    const stats = {
-        apiPosts: 0, seen: 0, boosted: 0, blocked: 0,
-        groupExtra: 0, fullscreenBlocked: 0, consoleSuppressed: 0,
-        logImproperUseBlocked: 0, jitsuPackets: 0, manualBoosted: 0,
-        videosMaxed: 0, videosSkipped: 0, videoTimeAdded: 0,
-        finalCallsModified: 0, questionsIdentified: 0,
-    };
-
-    const statsListeners = new Set();
-    function subscribeStats(fn) {
-        statsListeners.add(fn);
-        return () => statsListeners.delete(fn);
-    }
-    let statsNotifyScheduled = false;
-    function notifyStatsChange() {
-        if (statsNotifyScheduled || statsListeners.size === 0) return;
-        statsNotifyScheduled = true;
-        const deliver = () => {
-            statsNotifyScheduled = false;
-            for (const fn of statsListeners) {
-                try { fn(stats); } catch {}
-            }
-        };
-        if (typeof queueMicrotask === 'function') queueMicrotask(deliver);
-        else setTimeout(deliver, 0);
-    }
-    function bumpStat(key, delta = 1) {
-        stats[key] = (stats[key] || 0) + delta;
-        notifyStatsChange();
-    }
-
-    // ============================================================
-    // CONSOLE NOISE FILTER
-    // ============================================================
-    const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-    const ALWAYS_NOISE_RE = (() => {
-        const parts = ['\\[Sentry\\]'];
-        for (const k in TELEMETRY_SERVICES) {
-            if (k === 'jitsu') continue;
-            for (const h of TELEMETRY_SERVICES[k].hosts) parts.push(escapeRegExp(h));
-        }
-        return new RegExp(parts.join('|'), 'i');
-    })();
-
-    const JITSU_NOISE_RE = (() => {
-        const parts = [
-            '\\[J-(?:ERROR|WARN|DEBUG|INFO|LOG)\\]',
-            '\\[Jitsu\\]',
-            'Failed to send data to',
-            'Dropping queued event after',
-            'max send attempts',
-        ];
-        for (const h of TELEMETRY_SERVICES.jitsu.hosts) parts.push(escapeRegExp(h));
-        return new RegExp(parts.join('|'), 'i');
-    })();
-
-    const COMBINED_NOISE_RE = new RegExp(ALWAYS_NOISE_RE.source + '|' + JITSU_NOISE_RE.source, 'i');
-
-    function textMatchesNoise(text) {
-        if (typeof text !== 'string' || !text) return false;
-        // If Jitsu is being ALLOWED (suppressJitsu === false), don't silence its own
-        // log lines — the user asked to see what it's doing.
-        return settings.suppressJitsu ? COMBINED_NOISE_RE.test(text) : ALWAYS_NOISE_RE.test(text);
-    }
-
-    function argsAreNoise(args, startIndex = 0) {
-        for (let i = startIndex; i < args.length; i++) {
-            const a = args[i];
-            if (typeof a === 'string') {
-                if (textMatchesNoise(a)) return true;
-            } else if (a instanceof Error) {
-                if (a.message && textMatchesNoise(a.message)) return true;
-            } else if (a && typeof a === 'object') {
-                try {
-                    if (typeof a.url     === 'string' && textMatchesNoise(a.url))     return true;
-                    if (typeof a.message === 'string' && textMatchesNoise(a.message)) return true;
-                } catch {}
-            }
-        }
-        return false;
-    }
-
-    function installConsoleNoiseFilter() {
-        const methods = ['log', 'warn', 'error', 'info', 'debug'];
-        for (let m = 0; m < methods.length; m++) {
-            const method = methods[m];
-            const orig = nativeConsole[method];
-            const wrapped = ({
-                [method]() {
-                    if (!settings.suppressConsoleNoise) {
-                        return reflectApply(orig, console, arguments);
-                    }
-                    const len = arguments.length;
-                    if (len === 0) return reflectApply(orig, console, arguments);
-                    const first = arguments[0];
-                    const firstIsString = typeof first === 'string';
-                    if (firstIsString && textMatchesNoise(first)) {
-                        bumpStat('consoleSuppressed');
-                        return;
-                    }
-                    if (len === 1 && firstIsString) {
-                        return reflectApply(orig, console, arguments);
-                    }
-                    if (argsAreNoise(arguments, firstIsString ? 1 : 0)) {
-                        bumpStat('consoleSuppressed');
-                        return;
-                    }
-                    return reflectApply(orig, console, arguments);
-                }
-            })[method];
-            console[method] = cloak(wrapped, method);
-        }
-        VLOG('console noise filter installed (Jitsu / Apollo / Sentry / host matches)');
-    }
-    installConsoleNoiseFilter();
-
-    // ============================================================
-    // REPORTING
+    // 6. DIAGNOSTIC REPORTING & BOOT BANNER
     // ============================================================
     function truncateBody(b, max) {
         if (b == null) return null;
         if (typeof b !== 'string') return '(non-string body)';
         if (b.length <= max) return b;
         return b.slice(0, max) + `… [+${b.length - max} more chars]`;
+    }
+
+    function describeBody(data) {
+        if (!data) return '';
+        if (typeof data === 'string') return data;
+        try {
+            if (typeof FormData !== 'undefined' && data instanceof FormData) return '(FormData)';
+            if (typeof URLSearchParams !== 'undefined' && data instanceof URLSearchParams) return data.toString();
+            if (typeof Blob !== 'undefined' && data instanceof Blob) return `(Blob · ${data.size} bytes)`;
+            if (typeof ArrayBuffer !== 'undefined' && (data instanceof ArrayBuffer || ArrayBuffer.isView(data))) return `(ArrayBuffer · ${data.byteLength || data.length} bytes)`;
+            if (typeof Document !== 'undefined' && data instanceof Document) return '(Document)';
+        } catch {}
+        return `(${typeof data} body)`;
     }
 
     function reportBlock(kind, url, details, matchedSvc) {
@@ -833,7 +920,7 @@
             nativeConsole.trace('%c↳ call site', CSS.dim);
             nativeConsole.groupEnd();
         } else {
-            let line = `%c[UL] 🛡 Blocked%c ${kind}%c → ${svcLabel}%c (${host})`;
+            const line = `%c[UL] 🛡 Blocked%c ${kind}%c → ${svcLabel}%c (${host})`;
             const args = [line, CSS.block, CSS.url, CSS.service, CSS.muted];
             if (bodyPreview) {
                 args[0] += `%c · body: ${bodyPreview}`;
@@ -843,8 +930,6 @@
         }
     }
 
-    // Dedicated reporter for Jitsu packets so the user can inspect exactly what
-    // the UpLearn tracker is trying to send (allowed OR blocked).
     function reportJitsuPacket(source, url, body) {
         if (settings.logLevel === 'silent') return;
         const host = hostOf(url);
@@ -859,7 +944,6 @@
         nativeConsole.log('%cSuppress:', CSS.muted, settings.suppressJitsu ? 'ON (request will be blocked)' : 'OFF (request passes through)');
         if (preview) {
             nativeConsole.log('%cPayload: ', CSS.body, preview);
-            // Try to pretty-print JSON for readability
             try {
                 const parsed = JSON.parse(body);
                 nativeConsole.log('%cParsed:  ', CSS.body, parsed);
@@ -873,20 +957,6 @@
 
     const OP_TYPE_RE = /^\s*(mutation|query|subscription)/i;
 
-    // Dedicated reporter for LogImproperUse so it stands out from generic
-    // telemetry blocks. Bumps its own counter and uses pink styling.
-    function describeBody(data) {
-        if (!data) return '';
-        if (typeof data === 'string') return data;
-        try {
-            if (typeof FormData !== 'undefined' && data instanceof FormData) return '(FormData)';
-            if (typeof URLSearchParams !== 'undefined' && data instanceof URLSearchParams) return data.toString();
-            if (typeof Blob !== 'undefined' && data instanceof Blob) return `(Blob · ${data.size} bytes)`;
-            if (typeof ArrayBuffer !== 'undefined' && (data instanceof ArrayBuffer || ArrayBuffer.isView(data))) return `(ArrayBuffer · ${data.byteLength || data.length} bytes)`;
-            if (typeof Document !== 'undefined' && data instanceof Document) return '(Document)';
-        } catch {}
-        return `(${typeof data} body)`;
-    }
     function reportLogImproperUse(source, url, body) {
         bumpStat('logImproperUseBlocked');
         if (settings.logLevel === 'silent') return;
@@ -932,8 +1002,7 @@
             if (variableNames.length) {
                 nativeConsole.log('%cVariables: ', CSS.muted, variableNames.join(', '));
             }
-            nativeConsole.log('%cResponse:  ', CSS.muted,
-                '→ synthetic 200 OK  { data: { logImproperUse: true } }');
+            nativeConsole.log('%cResponse:  ', CSS.muted, '→ synthetic 200 OK  { data: { logImproperUse: true } }');
             nativeConsole.log('%cBody:      ', CSS.body, bodyPreviewFull);
             nativeConsole.log('%cTime:      ', CSS.muted, new Date().toLocaleTimeString());
             nativeConsole.trace('%c↳ call site', CSS.dim);
@@ -983,20 +1052,23 @@
         );
     }
 
-    function reportFeatureFlagsTransformed(source, url) {
+    function reportFeatureFlagsTransformed(source, url, strippedFlags) {
         if (settings.logLevel === 'silent') return;
+        const flagList = (strippedFlags && strippedFlags.length)
+            ? strippedFlags.join(', ')
+            : 'course_activity_*';
         if (settings.logLevel === 'verbose') {
             nativeConsole.groupCollapsed(
                 `%c🪟 WINDOWED MODE%c · Feature flags stripped%c · ${source}`,
                 CSS.improper, CSS.url, CSS.service
             );
             nativeConsole.log('%cURL:       ', CSS.muted, url);
-            nativeConsole.log('%cStripped:  ', CSS.muted, 'course_activity_fullscreen_mode, course_activity_fullscreen_exit_modal, course_activity_record_improper_use');
-            nativeConsole.log('%cResult:    ', CSS.muted, 'Activity session initializes in standard windowed mode without fullscreen prompts or improper use listeners');
+            nativeConsole.log('%cStripped:  ', CSS.muted, flagList);
+            nativeConsole.log('%cResult:    ', CSS.muted, 'Activity session initializes without gated fullscreen/improper-use flags');
             nativeConsole.groupEnd();
         } else {
             nativeConsole.log(
-                `%c[UL] 🪟 WINDOWED MODE%c · Feature flags stripped (${source})`,
+                `%c[UL] 🪟 WINDOWED MODE%c · Feature flags stripped (${source}): ${flagList}`,
                 CSS.improper, CSS.url
             );
         }
@@ -1011,36 +1083,7 @@
     }
 
     // ============================================================
-    // BOOT BANNER
-    // ============================================================
-    LOG('=== SCRIPT LOADED on', location.host, '===');
-    if (settings.logLevel === 'verbose') {
-        nativeConsole.groupCollapsed('%c[UL · verbose] 🚀 Startup summary', CSS.verbose);
-        nativeConsole.log('%cLog level:       ', CSS.muted, settings.logLevel);
-        nativeConsole.log('%cTelemetry:       ', CSS.muted, settings.telemetryPreset);
-        nativeConsole.log('%cServices on:     ', CSS.muted,
-            Object.keys(TELEMETRY_SERVICES)
-                .filter((k) => k !== 'jitsu' && settings.telemetryServices[k])
-                .map((k) => TELEMETRY_SERVICES[k].label)
-                .join(', ') || '(none)');
-        nativeConsole.log('%cSuppress Jitsu:  ', CSS.muted, settings.suppressJitsu ? 'YES (blocked + logged)' : 'no (allowed + logged)');
-        nativeConsole.log('%cLogImproperUse:  ', CSS.muted, settings.blockLogImproperUse);
-        nativeConsole.log('%cDOM inject:      ', CSS.muted, settings.blockDomElements);
-        nativeConsole.log('%cWebSockets:      ', CSS.muted, settings.blockWebSockets);
-        nativeConsole.log('%csendBeacon:      ', CSS.muted, settings.blockSendBeacon);
-        nativeConsole.log('%cVisibility:      ', CSS.muted, settings.spoofVisibility);
-        nativeConsole.log('%cConsole noise:   ', CSS.muted, settings.suppressConsoleNoise);
-        nativeConsole.log('%cTime boost:      ', CSS.muted, settings.timeBoostEnabled,
-            `(+${settings.extraSecondsMin}–${settings.extraSecondsMax}s)`);
-        nativeConsole.log('%cManual time btn: ', CSS.muted, settings.manualTimeButtonEnabled ? 'ON' : 'OFF');
-        nativeConsole.log('%cFull video watch: ', CSS.muted, settings.fullVideoWatchedEnabled ? 'ON' : 'OFF');
-        nativeConsole.log('%cFullscreen:      ', CSS.muted, settings.disableAutoFullscreen ? 'blocked' : 'allowed');
-        nativeConsole.log('%cDark mode:       ', CSS.muted, settings.darkMode);
-        nativeConsole.groupEnd();
-    }
-
-    // ============================================================
-    // DOM / SCRIPT/IFRAME/IMG/LINK INJECTION BLOCKER
+    // 7. DOM INJECTION BLOCKER & UNIFIED MUTATION OBSERVER
     // ============================================================
     function hookElementProperty(proto, prop, tag) {
         const desc = origGetOwnPropDesc(proto, prop);
@@ -1095,13 +1138,13 @@
         if (len === 3) {
             return (name.charCodeAt(0) | 32) === 115 &&
                    (name.charCodeAt(1) | 32) === 114 &&
-                   (name.charCodeAt(2) | 32) === 99; // 'src'
+                   (name.charCodeAt(2) | 32) === 99;
         }
         if (len === 4) {
             return (name.charCodeAt(0) | 32) === 104 &&
                    (name.charCodeAt(1) | 32) === 114 &&
                    (name.charCodeAt(2) | 32) === 101 &&
-                   (name.charCodeAt(3) | 32) === 102; // 'href'
+                   (name.charCodeAt(3) | 32) === 102;
         }
         return false;
     }
@@ -1124,14 +1167,68 @@
                 return reflectApply(origSetAttribute, this, arguments);
             }
         }).setAttribute;
-        cloak(patchedSetAttribute, 'setAttribute');
-        origDefineProperty(Element.prototype, 'setAttribute', {
-            value: patchedSetAttribute,
-            writable: true,
-            enumerable: true,
-            configurable: true,
-        });
+        patchMethod(Element.prototype, 'setAttribute', patchedSetAttribute, 'setAttribute');
     } catch (e) { WARN('setAttribute patch failed', e); }
+
+    function isRelevantQuestionMutationNode(node) {
+        if (!node || node.nodeType !== 1) return false;
+        if (node === uiState.hostEl) return false;
+        const tid = node.id;
+        if (tid === MANUAL_BUTTON_ID || (typeof tid === 'string' && tid.includes('__ul-'))) return false;
+
+        const tag = node.tagName;
+        if (tag === 'BUTTON' || tag === 'INPUT') return true;
+
+        const role = typeof node.getAttribute === 'function' ? node.getAttribute('role') : null;
+        if (role === 'button' || role === 'dialog') return true;
+
+        const cls = typeof node.className === 'string' ? node.className : '';
+        if (cls.includes('quiz') || cls.includes('question') || cls.includes('modal') || cls.includes('dialog')) return true;
+
+        // Short-circuit on the first matching descendant without counting the full subtree.
+        if (node.childElementCount > 0 && typeof node.querySelector === 'function') {
+            if (node.querySelector('button, input') !== null) return true;
+        }
+        return false;
+    }
+
+    // Trailing debounce (~300ms) when no submit button is currently attached,
+    // and prompt ~100ms sync when an attached button changes or is removed.
+    function scheduleEnsureButton() {
+        if (!settings.manualTimeButtonEnabled) return;
+        const hasAttachedSubmit = !!(uiState.lastResolvedSubmitBtn && uiState.lastResolvedSubmitBtn.isConnected);
+        if (uiState.manualBtnTimer !== null) {
+            if (hasAttachedSubmit) return;
+            clearTimeout(uiState.manualBtnTimer);
+        }
+        const delay = hasAttachedSubmit ? 100 : 300;
+        uiState.manualBtnTimer = setTimeout(() => {
+            uiState.manualBtnTimer = null;
+            ensureButton();
+        }, delay);
+    }
+
+    function syncDomObserver() {
+        if (!uiState.domObserver) return;
+        const shouldObserve = !!(settings.blockDomElements || settings.manualTimeButtonEnabled);
+        if (shouldObserve && !uiState.domObserverConnected) {
+            try {
+                uiState.domObserver.observe(document.documentElement || document, { childList: true, subtree: true });
+                uiState.domObserverConnected = true;
+                VLOG('DOM observer connected');
+            } catch (e) {
+                WARN('DOM observer connect failed', e);
+            }
+        } else if (!shouldObserve && uiState.domObserverConnected) {
+            try {
+                uiState.domObserver.disconnect();
+                uiState.domObserverConnected = false;
+                VLOG('DOM observer disconnected');
+            } catch (e) {
+                WARN('DOM observer disconnect failed', e);
+            }
+        }
+    }
 
     try {
         function checkAndBlockTelemetryElement(el) {
@@ -1153,9 +1250,9 @@
             return false;
         }
 
-        const domObserver = new MutationObserver((mutations) => {
+        uiState.domObserver = new MutationObserver((mutations) => {
             const blockDom = settings.blockDomElements;
-            let needButtonCheck = settings.manualTimeButtonEnabled && !manualBtnScheduled;
+            let needButtonCheck = settings.manualTimeButtonEnabled;
             if (!blockDom && !needButtonCheck) return;
 
             for (let i = 0; i < mutations.length; i++) {
@@ -1165,16 +1262,16 @@
                 const added = m.addedNodes;
                 for (let j = 0; j < added.length; j++) {
                     const node = added[j];
-                    if (!node || node.nodeType !== 1 || node === uiHostEl || node.id === MANUAL_BUTTON_ID) continue;
+                    if (!node || node.nodeType !== 1 || node === uiState.hostEl || node.id === MANUAL_BUTTON_ID) continue;
                     const isHtmlNode = !node.namespaceURI || node.namespaceURI === 'http://www.w3.org/1999/xhtml';
                     if (!isHtmlNode) continue;
 
                     if (blockDom) {
                         if (!checkAndBlockTelemetryElement(node)) {
-                            if (node.firstElementChild !== null && typeof node.querySelectorAll === 'function') {
-                                const nested = node.querySelectorAll('script[src], iframe[src]');
-                                for (let k = 0; k < nested.length; k++) {
-                                    checkAndBlockTelemetryElement(nested[k]);
+                            if (node.firstElementChild !== null && typeof node.getElementsByTagName === 'function') {
+                                const iframes = node.getElementsByTagName('iframe');
+                                for (let k = 0; k < iframes.length; k++) {
+                                    checkAndBlockTelemetryElement(iframes[k]);
                                 }
                             }
                         }
@@ -1190,7 +1287,7 @@
                     const removed = m.removedNodes;
                     for (let j = 0; j < removed.length; j++) {
                         const node = removed[j];
-                        if (!node || node.nodeType !== 1 || node === uiHostEl || node.id === MANUAL_BUTTON_ID) continue;
+                        if (!node || node.nodeType !== 1 || node === uiState.hostEl || node.id === MANUAL_BUTTON_ID) continue;
                         const isHtmlNode = !node.namespaceURI || node.namespaceURI === 'http://www.w3.org/1999/xhtml';
                         if (isHtmlNode && isRelevantQuestionMutationNode(node)) {
                             needButtonCheck = false;
@@ -1203,12 +1300,12 @@
                 if (!blockDom && !needButtonCheck) break;
             }
         });
-        domObserver.observe(document.documentElement || document, { childList: true, subtree: true });
+        syncDomObserver();
         VLOG('DOM observer installed');
     } catch (e) { WARN('DOM observer failed', e); }
 
     // ============================================================
-    // WEBSOCKET BLOCKER
+    // 8. WEBSOCKET, BLOB & WEB WORKER BLOCKER
     // ============================================================
     const EVENT_TARGET_FALLBACK_DESCS = typeof EventTarget !== 'undefined' && EventTarget.prototype ? {
         addEventListener:    { value: EventTarget.prototype.addEventListener, writable: true, configurable: true },
@@ -1280,17 +1377,20 @@
         }
     } catch (e) { WARN('websocket patch failed', e); }
 
-    // ============================================================
-    // WEB WORKER & BLOB TARGETED NEUTER
-    // ============================================================
-    const TELEMETRY_CODE_RE = /openreplay|sentry|sessionReplay|replayUploader/i;
+    const TELEMETRY_CODE_RE   = /openreplay|sentry|sessionReplay|replayUploader/i;
     const BINARY_BLOB_MIME_RE = /^(?:video|audio|image|font)\//i;
-    const telemetryBlobUrls = new Set();
-    const telemetryBlobs = new WeakSet();
+    const telemetryBlobUrls   = new Set();
+    const telemetryBlobs      = new WeakSet();
+    let hasTelemetryBlobs     = false;
 
     function isTelemetryBlobPart(part, scanText) {
-        if (part && typeof part === 'object' && wsHas.call(telemetryBlobs, part)) return true;
-        return scanText && typeof part === 'string' && TELEMETRY_CODE_RE.test(part);
+        if (scanText && typeof part === 'string') {
+            return TELEMETRY_CODE_RE.test(part);
+        }
+        if (hasTelemetryBlobs && part && typeof part === 'object') {
+            return wsHas.call(telemetryBlobs, part);
+        }
+        return false;
     }
 
     function isTelemetryDataUrl(urlStr) {
@@ -1320,14 +1420,13 @@
     }
 
     try {
-        const origCreateObjectURL = (typeof URL !== 'undefined' && URL.createObjectURL) ? URL.createObjectURL : null;
         if (origCreateObjectURL) {
             const patchedCreateObjectURL = ({
                 createObjectURL(obj) {
                     const url = arguments.length === 1
                         ? origCreateObjectURL.call(this, obj)
                         : reflectApply(origCreateObjectURL, this, arguments);
-                    if (obj && wsHas.call(telemetryBlobs, obj)) {
+                    if (hasTelemetryBlobs && obj && wsHas.call(telemetryBlobs, obj)) {
                         setAdd.call(telemetryBlobUrls, url);
                     }
                     return url;
@@ -1336,7 +1435,6 @@
             URL.createObjectURL = cloak(patchedCreateObjectURL, 'createObjectURL');
         }
 
-        const origRevokeObjectURL = (typeof URL !== 'undefined' && URL.revokeObjectURL) ? URL.revokeObjectURL : null;
         if (origRevokeObjectURL) {
             const patchedRevokeObjectURL = ({
                 revokeObjectURL(url) {
@@ -1355,6 +1453,7 @@
                     throw new TypeError("Failed to construct 'Blob': Please use the 'new' operator");
                 }
                 const blob = reflectConstruct(OrigBlob, arguments, new.target);
+                if (settings.telemetryPreset === 'off') return blob;
                 try {
                     if (blobParts != null) {
                         const type = options && typeof options.type === 'string' ? options.type : '';
@@ -1365,6 +1464,7 @@
                             for (let i = 0; i < blobParts.length; i++) {
                                 if (isTelemetryBlobPart(blobParts[i], scanText)) {
                                     wsAdd.call(telemetryBlobs, blob);
+                                    hasTelemetryBlobs = true;
                                     break;
                                 }
                             }
@@ -1372,6 +1472,7 @@
                             for (const part of blobParts) {
                                 if (isTelemetryBlobPart(part, scanText)) {
                                     wsAdd.call(telemetryBlobs, blob);
+                                    hasTelemetryBlobs = true;
                                     break;
                                 }
                             }
@@ -1418,13 +1519,12 @@
     } catch (e) { WARN('worker/blob patch failed', e); }
 
     // ============================================================
-    // DARK MODE
+    // 9. SOFT DARK MODE (AUTO-DISCONNECTING OBSERVER)
     // ============================================================
-    const DARK_MODE_STYLE_ID  = '__ul-dark-styles';
-    const PARENT_INVERT       = 0.88;
-    const CHILD_CONTRAST      = 1.3158;
-    const DARK_BASE_COLOR     = '#1f1f1f';
-    const DARK_PRE_INVERT_BG  = '#ffffff';
+    const PARENT_INVERT      = 0.88;
+    const CHILD_CONTRAST     = 1.3158;
+    const DARK_BASE_COLOR    = '#1f1f1f';
+    const DARK_PRE_INVERT_BG = '#ffffff';
 
     function ensureDarkModeStyles() {
         try {
@@ -1467,36 +1567,134 @@
         } catch {}
     }
 
+    function syncDarkObserver() {
+        if (!document.documentElement) return;
+        if (settings.darkMode) {
+            if (!uiState.darkObserver) {
+                try {
+                    uiState.darkObserver = new MutationObserver(applyDarkMode);
+                } catch {
+                    return;
+                }
+            }
+            if (!uiState.darkObserverConnected) {
+                try {
+                    uiState.darkObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+                    uiState.darkObserverConnected = true;
+                } catch {}
+            }
+        } else if (uiState.darkObserver && uiState.darkObserverConnected) {
+            try {
+                uiState.darkObserver.disconnect();
+                uiState.darkObserverConnected = false;
+            } catch {}
+        }
+    }
+
     function applyDarkMode() {
         try {
-            const html = document.documentElement;
-            if (!html) return;
+            const htmlEl = document.documentElement;
+            if (!htmlEl) return;
+            syncDarkObserver();
             if (settings.darkMode) ensureDarkModeStyles();
-            const has = html.classList.contains('ul-dark-mode');
-            if (settings.darkMode && !has) html.classList.add('ul-dark-mode');
-            else if (!settings.darkMode && has) html.classList.remove('ul-dark-mode');
+            const has = htmlEl.classList.contains('ul-dark-mode');
+            if (settings.darkMode && !has) htmlEl.classList.add('ul-dark-mode');
+            else if (!settings.darkMode && has) htmlEl.classList.remove('ul-dark-mode');
         } catch (e) { WARN('dark mode apply failed', e); }
     }
 
     if (settings.darkMode) ensureDarkModeStyles();
     applyDarkMode();
 
-    let darkObserverAttached = false;
-    function ensureDarkObserver() {
-        if (darkObserverAttached || !document.documentElement) return;
-        try {
-            const obs = new MutationObserver(applyDarkMode);
-            obs.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
-            darkObserverAttached = true;
-        } catch {}
-    }
-    ensureDarkObserver();
+    // ============================================================
+    // 10. SINGLE-PASS GRAPHQL OPERATION DISPATCH & SHARED PIPELINES
+    // ============================================================
+    const OP_NAME_HEAD_RE  = /"operationName"\s*:\s*"([^"]+)"/;
+    const BLOCKED_OPS_RE   = /\b(logImproperUse|logEvent|logLessonSearch|logVideoSearchRequest)\b/i;
+    const REQ_TRANSFORM_RE = /\b(?:GetFeatureFlags|GetFeatureFlagsEnabledGlobally|currentUser)\b/i;
+    const REQ_INGEST_RE    = /\b(?:GetVideoLesson|GetProgressQuizGroup|GetStrengthenQuiz|GetSpacedPracticeQuizGroup|GetSubsectionDiagnosticQuiz|GetExamHowToLesson|GetExamPaper|GetExamPracticeSessionReview|GetExamQuestion|GetSubsectionSummary|GetSubsectionOverviewData|GetSubsectionActivity|GetCurrentActivityDetails|GetQuizContent|GetStandaloneQuestion|StartExamPracticeSession|AnswerProgressQuizQuestion|AnswerStrengthenQuizQuestion|AnswerSpacedPracticeQuizQuestion|AnswerDiagnosticQuestion|AnswerPreVideoQuestion|AnswerInVideoQuestion|AnswerExamQuestion|SaveExamQuestionMarks|SaveExamPracticeAnswers|SaveExamPracticeQuestionMarks|EvaluateQuizContentResponses|EvaluateStandaloneQuestionResponses|videoLesson|progressQuizGroup|spacedPracticeQuiz|strengthenQuiz|diagnosticQuiz|examHowToLesson|examPaper|examQuestion|subsection|quizContent|standaloneQuestion)\b/i;
+    const TIME_SPENT_RE    = /timeSpent|completeVideoLesson|completeSubsectionSummary|completeArticleLesson|completeExamQuestionWalkthrough|completeProgressQuizGroup|completeStrengthenQuiz|completeSpacedPracticeQuiz|completeDiagnosticQuizSession|saveExamPractice|completeExamPracticeSession/i;
 
-    // ============================================================
-    // REQUEST BODY CLASSIFICATION & MUTATION INTERCEPTION
-    // ============================================================
-    const MAX_SCAN = 65536;
-    const BLOCKED_OPS_RE = /\b(logImproperUse|logEvent|logLessonSearch|logVideoSearchRequest)\b/i;
+    // Consolidated single-pass dispatch table keyed by lowercased operationName.
+    // Eliminates redundant full-body regex scans when operationName is known.
+    const OP_DISPATCH = new Map([
+        // Blocked mutations
+        ['logimproperuse',                     { blockedKind: 'improper' }],
+        ['logevent',                           { blockedKind: 'event' }],
+        ['loglessonsearch',                    { blockedKind: 'search' }],
+        ['logvideosearchrequest',              { blockedKind: 'search' }],
+
+        // Response transform operations
+        ['getfeatureflags',                    { reqKind: 'transform' }],
+        ['getfeatureflagsenabledglobally',     { reqKind: 'transform' }],
+        ['currentuser',                        { reqKind: 'transform' }],
+
+        // Passive response ingest operations
+        ['getvideolesson',                     { reqKind: 'ingest' }],
+        ['getprogressquizgroup',               { reqKind: 'ingest' }],
+        ['getstrengthenquiz',                  { reqKind: 'ingest' }],
+        ['getspacedpracticequizgroup',         { reqKind: 'ingest' }],
+        ['getsubsectiondiagnosticquiz',        { reqKind: 'ingest' }],
+        ['getexamhowtolesson',                 { reqKind: 'ingest' }],
+        ['getexampaper',                       { reqKind: 'ingest' }],
+        ['getexampracticesessionreview',       { reqKind: 'ingest' }],
+        ['getexamquestion',                    { reqKind: 'ingest' }],
+        ['getsubsectionsummary',               { reqKind: 'ingest' }],
+        ['getsubsectionoverviewdata',          { reqKind: 'ingest' }],
+        ['getsubsectionactivity',              { reqKind: 'ingest' }],
+        ['getcurrentactivitydetails',          { reqKind: 'ingest' }],
+        ['getquizcontent',                     { reqKind: 'ingest' }],
+        ['getstandalonequestion',              { reqKind: 'ingest' }],
+        ['startexampracticesession',           { reqKind: 'ingest' }],
+        ['videolesson',                        { reqKind: 'ingest' }],
+        ['progressquizgroup',                  { reqKind: 'ingest' }],
+        ['spacedpracticequiz',                 { reqKind: 'ingest' }],
+        ['strengthenquiz',                     { reqKind: 'ingest' }],
+        ['diagnosticquiz',                     { reqKind: 'ingest' }],
+        ['examhowtolesson',                    { reqKind: 'ingest' }],
+        ['exampaper',                          { reqKind: 'ingest' }],
+        ['examquestion',                       { reqKind: 'ingest' }],
+        ['subsection',                         { reqKind: 'ingest' }],
+        ['quizcontent',                        { reqKind: 'ingest' }],
+        ['standalonequestion',                 { reqKind: 'ingest' }],
+
+        // Answer / marking operations (both ingest feedback & rewrite timeSpent)
+        ['answerprogressquizquestion',         { reqKind: 'ingest', timeSpent: true }],
+        ['answerstrengthenquizquestion',       { reqKind: 'ingest', timeSpent: true }],
+        ['answerspacedpracticequizquestion',   { reqKind: 'ingest', timeSpent: true }],
+        ['answerdiagnosticquestion',           { reqKind: 'ingest', timeSpent: true }],
+        ['answerprevideoquestion',             { reqKind: 'ingest', timeSpent: true }],
+        ['answerinvideoquestion',              { reqKind: 'ingest', timeSpent: true }],
+        ['answerexamquestion',                 { reqKind: 'ingest', timeSpent: true }],
+        ['saveexamquestionmarks',              { reqKind: 'ingest', timeSpent: true }],
+        ['saveexampracticeanswers',            { reqKind: 'ingest', timeSpent: true }],
+        ['saveexampracticequestionmarks',      { reqKind: 'ingest', timeSpent: true }],
+        ['evaluatequizcontentresponses',       { reqKind: 'ingest', timeSpent: true }],
+        ['evaluatestandalonequestionresponses', { reqKind: 'ingest', timeSpent: true }],
+
+        // Lesson & session completion operations (rewrite timeSpent / percentWatched)
+        ['completevideolesson',                { timeSpent: true }],
+        ['completesubsectionsummary',          { timeSpent: true }],
+        ['completearticlelesson',              { timeSpent: true }],
+        ['completeexamquestionwalkthrough',    { timeSpent: true }],
+        ['completeprogressquizgroup',          { timeSpent: true }],
+        ['completestrengthenquiz',             { timeSpent: true }],
+        ['completespacedpracticequiz',         { timeSpent: true }],
+        ['completediagnosticquizsession',      { timeSpent: true }],
+        ['saveexampractice',                   { timeSpent: true }],
+        ['completeexampracticesession',        { timeSpent: true }],
+    ]);
+
+    function extractFastOperationName(body) {
+        if (!body || typeof body !== 'string') return null;
+        const len = body.length;
+        let start = 0;
+        while (start < len && body.charCodeAt(start) <= 32) start++;
+        if (start >= len || body.charCodeAt(start) === 91) return null; // '[' batched array
+        const head = body.slice(start, start + 256);
+        const m = OP_NAME_HEAD_RE.exec(head);
+        return m ? m[1] : null;
+    }
 
     function extractSyncBodyText(data) {
         if (!data) return null;
@@ -1517,30 +1715,12 @@
         return null;
     }
 
-    function getBlockedMutationKindFromText(bodyText) {
-        if (!bodyText) return null;
-        const m = BLOCKED_OPS_RE.exec(bodyText);
-        if (!m) return null;
-        const op = m[1].toLowerCase();
-        if (op === 'logimproperuse') return 'improper';
-        if (op === 'logevent') return 'event';
-        if (op === 'loglessonsearch' || op === 'logvideosearchrequest') return 'search';
-        return null;
+    function reencodeBodyLike(originalBody, newText) {
+        const wasBuffer = typeof ArrayBuffer !== 'undefined' &&
+            (originalBody instanceof ArrayBuffer || ArrayBuffer.isView(originalBody));
+        return (wasBuffer && sharedTextEncoder) ? sharedTextEncoder.encode(newText) : newText;
     }
 
-    const REQ_TRANSFORM_RE = /\b(?:GetFeatureFlags|GetFeatureFlagsEnabledGlobally|currentUser)\b/i;
-    const REQ_INGEST_RE = /\b(?:GetVideoLesson|GetProgressQuizGroup|GetStrengthenQuiz|GetSpacedPracticeQuizGroup|GetSubsectionDiagnosticQuiz|GetExamHowToLesson|GetExamPaper|GetExamPracticeSessionReview|GetExamQuestion|GetSubsectionSummary|GetSubsectionOverviewData|GetSubsectionActivity|GetCurrentActivityDetails|GetQuizContent|GetStandaloneQuestion|StartExamPracticeSession|AnswerProgressQuizQuestion|AnswerStrengthenQuizQuestion|AnswerSpacedPracticeQuizQuestion|AnswerDiagnosticQuestion|AnswerPreVideoQuestion|AnswerInVideoQuestion|AnswerExamQuestion|SaveExamQuestionMarks|SaveExamPracticeAnswers|SaveExamPracticeQuestionMarks|EvaluateQuizContentResponses|EvaluateStandaloneQuestionResponses|videoLesson|progressQuizGroup|spacedPracticeQuiz|strengthenQuiz|diagnosticQuiz|examHowToLesson|examPaper|examQuestion|subsection|quizContent|standaloneQuestion)\b/i;
-
-    function classifyApiRequest(body) {
-        if (!body || typeof body !== 'string' || body.length > MAX_SCAN) return 'none';
-        if (REQ_TRANSFORM_RE.test(body)) return 'transform';
-        if (REQ_INGEST_RE.test(body)) return 'ingest';
-        return 'none';
-    }
-
-    // ============================================================
-    // MOCKED GRAPHQL MUTATIONS (Centralized Table)
-    // ============================================================
     const MOCKED_MUTATIONS = {
         improper: {
             name: 'LogImproperUse',
@@ -1552,7 +1732,7 @@
         event: {
             name: 'LogEvent',
             payload: '{"data":{"logEvent":{"id":"mock"}}}',
-            json: () => ({ data: { logEvent: { id: "mock" } } }),
+            json: () => ({ data: { logEvent: { id: 'mock' } } }),
             shouldBlock: () => settings.blockLogEvent !== false,
             report: reportLogEvent,
         },
@@ -1561,19 +1741,33 @@
             payload: '{"data":{"logVideoSearchRequest":{"id":"mock"},"logLessonSearch":{"id":"mock"}}}',
             json: () => ({
                 data: {
-                    logVideoSearchRequest: { id: "mock" },
-                    logLessonSearch: { id: "mock" }
-                }
+                    logVideoSearchRequest: { id: 'mock' },
+                    logLessonSearch: { id: 'mock' },
+                },
             }),
             shouldBlock: () => settings.privateSearchMode !== false,
             report: reportLogLessonSearch,
         },
     };
 
-    function interceptBlockedMutation(body, url, source) {
+    function getBlockedMutationKind(bodyText, dispatch) {
+        if (dispatch) return dispatch.blockedKind || null;
+        const m = BLOCKED_OPS_RE.exec(bodyText);
+        if (!m) return null;
+        const op = m[1].toLowerCase();
+        if (op === 'logimproperuse') return 'improper';
+        if (op === 'logevent') return 'event';
+        if (op === 'loglessonsearch' || op === 'logvideosearchrequest') return 'search';
+        return null;
+    }
+
+    function interceptBlockedMutation(body, url, source, fastOpName, dispatch) {
         const bodyText = extractSyncBodyText(body);
         if (!bodyText) return null;
-        const kind = getBlockedMutationKindFromText(bodyText);
+        const resolvedDispatch = dispatch !== undefined
+            ? dispatch
+            : (fastOpName ? OP_DISPATCH.get(fastOpName.toLowerCase()) : null);
+        const kind = getBlockedMutationKind(bodyText, resolvedDispatch);
         if (!kind) return null;
         const config = MOCKED_MUTATIONS[kind];
         if (!config || !config.shouldBlock()) return null;
@@ -1582,149 +1776,136 @@
         return config;
     }
 
-    // ============================================================
-    // FEATURE FLAGS RESPONSE TRANSFORMER (Windowed Multitasking)
-    // ============================================================
-    const STRIPPED_FEATURE_FLAGS = new Set([
-        'course_activity_fullscreen_mode',
-        'course_activity_fullscreen_exit_modal',
-        'course_activity_record_improper_use',
-    ]);
+    function classifyApiRequest(body, dispatch) {
+        if (!body || typeof body !== 'string' || body.length > MAX_SCAN) return 'none';
+        if (dispatch) return dispatch.reqKind || 'none';
+        if (REQ_TRANSFORM_RE.test(body)) return 'transform';
+        if (REQ_INGEST_RE.test(body)) return 'ingest';
+        return 'none';
+    }
+
+    // Feature Flags Response Transformer (gated on user settings)
+    function isFlagStrippedBySettings(flagName) {
+        if (flagName === 'course_activity_fullscreen_mode' || flagName === 'course_activity_fullscreen_exit_modal') {
+            return !!settings.disableAutoFullscreen;
+        }
+        if (flagName === 'course_activity_record_improper_use') {
+            return !!settings.blockLogImproperUse;
+        }
+        return false;
+    }
 
     function shouldTransformFeatureFlags(text) {
+        if (!settings.disableAutoFullscreen && !settings.blockLogImproperUse) return false;
         return typeof text === 'string' && text.includes('course_activity_');
     }
 
-    function stripFullscreenFeatureFlags(obj) {
+    function stripFullscreenFeatureFlags(obj, tracker) {
         if (!obj || typeof obj !== 'object') return obj;
         if (Array.isArray(obj)) {
             let writeIdx = 0;
             for (let i = 0; i < obj.length; i++) {
                 const item = obj[i];
-                if (typeof item === 'string' && STRIPPED_FEATURE_FLAGS.has(item)) {
+                if (typeof item === 'string' && isFlagStrippedBySettings(item)) {
+                    if (tracker) {
+                        tracker.stripped = true;
+                        if (tracker.flags) tracker.flags.add(item);
+                    }
                     continue;
                 }
                 if (item && typeof item === 'object') {
-                    stripFullscreenFeatureFlags(item);
+                    stripFullscreenFeatureFlags(item, tracker);
                 }
                 obj[writeIdx++] = item;
+            }
+            if (obj.length !== writeIdx && tracker) {
+                tracker.stripped = true;
             }
             obj.length = writeIdx;
             return obj;
         }
         for (const k of Object.keys(obj)) {
-            if (STRIPPED_FEATURE_FLAGS.has(k)) {
+            if (isFlagStrippedBySettings(k)) {
                 delete obj[k];
+                if (tracker) {
+                    tracker.stripped = true;
+                    if (tracker.flags) tracker.flags.add(k);
+                }
             } else {
                 const v = obj[k];
                 if (v && typeof v === 'object') {
-                    stripFullscreenFeatureFlags(v);
+                    stripFullscreenFeatureFlags(v, tracker);
                 }
             }
         }
         return obj;
     }
 
-    // ============================================================
-    // UNIFIED GRAPHQL DATA STREAM FILTER
-    // ============================================================
     const GRAPHQL_INGEST_RE = /\b(?:videoLessons?|answerInVideoQuestion|answerPreVideoQuestion|progressQuizGroup|answerProgressQuizQuestion|spacedPracticeQuiz|answerSpacedPracticeQuizQuestion|strengthenQuiz|diagnosticQuiz|answerDiagnosticQuestion|examHowToLesson|answerExamQuestion|saveExamQuestionMarks|examPaper|startExamPracticeSession|examPracticeSession|saveExamPracticeAnswers|saveExamPracticeQuestionMarks|examQuestion|quizContent|evaluateQuizContentResponses|standaloneQuestion|evaluateStandaloneQuestionResponses|subsection|experimentGroup|featureFlagsEnabledGlobally|featureFlags|currentUser)\b/;
 
     function shouldIngestGraphQLResponse(rt) {
         return typeof rt === 'string' && GRAPHQL_INGEST_RE.test(rt);
     }
 
+    // Unified outgoing GraphQL request pipeline shared by fetch & XHR
+    function processOutgoingApiPayload(bodyText, url, source) {
+        const fastOp = extractFastOperationName(bodyText);
+        const dispatch = fastOp ? (OP_DISPATCH.get(fastOp.toLowerCase()) || null) : null;
+        const mocked = interceptBlockedMutation(bodyText, url, source, fastOp, dispatch);
+        if (mocked) {
+            return { blocked: true, mocked };
+        }
+        const reqKind = classifyApiRequest(bodyText, dispatch);
+        const bumped = maybeBumpTimeSpent(bodyText, source, fastOp, dispatch);
+        return {
+            blocked: false,
+            reqKind,
+            body: bumped.body,
+            changed: bumped.changed,
+        };
+    }
+
+    // Shared parsed-payload ingest & conditional feature-flag transformer (fetch + XHR)
+    function transformParsedApiPayload(parsed, reqKind, source, url, shouldIngest = true) {
+        if (shouldIngest) handleApiResponse(parsed);
+        if (reqKind === 'transform' && (settings.disableAutoFullscreen || settings.blockLogImproperUse)) {
+            const tracker = { stripped: false, flags: new Set() };
+            const modifiedJson = stripFullscreenFeatureFlags(parsed, tracker);
+            if (tracker.stripped) {
+                reportFeatureFlagsTransformed(source, url || 'API', Array.from(tracker.flags));
+                return { transformed: true, json: modifiedJson };
+            }
+        }
+        return { transformed: false, json: parsed };
+    }
+
+    // Unified incoming GraphQL response pipeline shared by fetch & XHR
+    function processIncomingApiPayload(rt, reqKind, source, url) {
+        const ingest = shouldIngestGraphQLResponse(rt);
+        const transform = reqKind === 'transform' && shouldTransformFeatureFlags(rt);
+        if (!ingest && !transform) {
+            return { transformed: false, text: rt, json: null };
+        }
+        try {
+            const parsed = JSON.parse(rt);
+            const res = transformParsedApiPayload(parsed, transform ? 'transform' : 'none', source, url, ingest);
+            if (res.transformed) {
+                return {
+                    transformed: true,
+                    text: JSON.stringify(res.json),
+                    json: res.json,
+                };
+            }
+            return { transformed: false, text: rt, json: parsed };
+        } catch (e) {
+            if (transform) WARN(`Failed to transform feature flags response (${source}):`, e);
+            return { transformed: false, text: rt, json: null };
+        }
+    }
+
     // ============================================================
-    // TIME BOOST & MANUAL "ADD TIME" QUESTION BUTTON
+    // 11. TIME BOOST, QUESTION ANALYZER & SESSION PREDICTOR
     // ============================================================
-    const VIDEO_OP             = 'CompleteVideoLesson';
-    const MANUAL_BUTTON_ID     = 'us-timespent-btn';
-
-    const KNOWN_QUESTION_OPS = new Set([
-        'AnswerProgressQuizQuestion',
-        'AnswerInVideoQuestion',
-        'AnswerPreVideoQuestion',
-        'AnswerDiagnosticQuestion',
-        'AnswerSpacedPracticeQuizQuestion',
-        'AnswerStrengthenQuizQuestion',
-        'AnswerExamQuestion',
-        'SaveExamQuestionMarks',
-        'SaveExamPracticeQuestionMarks',
-    ]);
-
-    const KNOWN_GROUP_OPS = new Set([
-        'CompleteProgressQuizGroup',
-        'CompleteSpacedPracticeQuiz',
-        'CompleteStrengthenQuiz',
-        'CompleteDiagnosticQuizSession',
-        'CompleteExamQuestionWalkthrough',
-        'CompleteExamPracticeSession',
-        'SaveExamPracticeAnswers',
-    ]);
-
-    const KNOWN_LESSON_OPS = new Set([
-        'CompleteVideoLesson',
-        'CompleteSubsectionSummary',
-        'CompleteArticleLesson',
-    ]);
-
-    const OP_ANSWER_QUESTION_RE    = /^Answer.*Question$/i;
-    const OP_SAVE_EXAM_RE          = /^SaveExam.*Marks$/i;
-    const QSTR_ANSWER_QUESTION_RE  = /answer[A-Za-z0-9]*Question/i;
-    const QSTR_SAVE_EXAM_RE        = /saveExam[A-Za-z0-9]*Marks/i;
-
-    const OP_COMPLETE_GROUP_RE     = /^Complete.*(Quiz|Group|Session|Walkthrough)$/i;
-    const QSTR_COMPLETE_GROUP_RE   = /complete[A-Za-z0-9]*(Quiz|Group|Session|Walkthrough)|saveExamPracticeAnswers/i;
-
-    const OP_COMPLETE_LESSON_RE    = /^Complete(VideoLesson|SubsectionSummary|ArticleLesson)$/i;
-    const QSTR_COMPLETE_LESSON_RE  = /\bcomplete(VideoLesson|SubsectionSummary|ArticleLesson)\b/i;
-
-    function isQuestionAnswerOp(opName, qStr) {
-        if (KNOWN_QUESTION_OPS.has(opName)) return true;
-        if (OP_ANSWER_QUESTION_RE.test(opName)) return true;
-        if (OP_SAVE_EXAM_RE.test(opName)) return true;
-        if (qStr) {
-            if (QSTR_ANSWER_QUESTION_RE.test(qStr)) return true;
-            if (QSTR_SAVE_EXAM_RE.test(qStr)) return true;
-        }
-        return false;
-    }
-
-    function isQuizGroupOp(opName, qStr) {
-        if (KNOWN_GROUP_OPS.has(opName)) return true;
-        if (OP_COMPLETE_GROUP_RE.test(opName)) return true;
-        if (qStr) {
-            if (QSTR_COMPLETE_GROUP_RE.test(qStr)) return true;
-        }
-        return false;
-    }
-
-    function isLessonCompletionOp(opName, qStr) {
-        if (KNOWN_LESSON_OPS.has(opName)) return true;
-        if (OP_COMPLETE_LESSON_RE.test(opName)) return true;
-        if (qStr) {
-            if (QSTR_COMPLETE_LESSON_RE.test(qStr)) return true;
-        }
-        return false;
-    }
-
-    let accumulatedExtraSeconds  = 0;
-    let accumulatedQuestionCount = 0;
-
-    /**
-     * Extra seconds queued to ADD on top of UpLearn's own timeSpent.
-     *   null  → user hasn't set anything (button shows "Add time")
-     *   0     → user explicitly set 0 (button shows "+0s")
-     *   N > 0 → user set N seconds (button shows "+Xm Ys")
-     * This is SET, not accumulated — each entry replaces the previous one.
-     */
-    let queuedSeconds  = null;
-    let editing        = false;
-    let resetScheduled = false;
-
-    /* ------------------------------------------------------------
-     * Helpers
-     * ------------------------------------------------------------ */
     const round3 = (n) => Math.round(n * 1000) / 1000;
 
     function toIso(seconds) {
@@ -1754,7 +1935,6 @@
         const s = String(raw).trim();
         if (!s) return null;
 
-        // ISO-8601 (e.g. PT1M15S, PT45.5S, P0DT1M15S)
         if (s.charCodeAt(0) === 80 || s.charCodeAt(0) === 112) {
             const m = ISO_DURATION_RE.exec(s);
             if (!m) return null;
@@ -1765,7 +1945,6 @@
             return d * 86400 + h * 3600 + mi * 60 + se;
         }
 
-        // mm:ss or hh:mm:ss (including optional fractional seconds like 00:01:15.5)
         if (COLON_TIME_RE.test(s)) {
             const parts = s.split(':');
             let secs = 0;
@@ -1773,7 +1952,6 @@
             return secs;
         }
 
-        // "1h 30m 20s", "90s", "1.5m", "2 min"
         UNIT_TIME_RE.lastIndex = 0;
         let total = 0;
         let matched = false;
@@ -1781,16 +1959,14 @@
         while ((m = UNIT_TIME_RE.exec(s)) !== null) {
             matched = true;
             const value = parseFloat(m[1]);
-            const c = m[2].charCodeAt(0) | 32; // fast lowercase ASCII char
-            if (c === 104)      total += value * 3600; // 'h'
-            else if (c === 109) total += value * 60;   // 'm'
+            const c = m[2].charCodeAt(0) | 32;
+            if (c === 104)      total += value * 3600;
+            else if (c === 109) total += value * 60;
             else                total += value;
         }
         if (matched) return total;
 
-        // Bare number => seconds
         if (BARE_NUM_RE.test(s)) return parseFloat(s);
-
         return null;
     }
 
@@ -1801,24 +1977,9 @@
         return Math.floor(min + Math.random() * (max - min + 1));
     }
 
-    /* ------------------------------------------------------------
-     * Question Content Analyzer, Session Context & Final Call Predictor
-     * ------------------------------------------------------------ */
-    const QUESTION_REGISTRY_MAX = 500;
-    const questionRegistry      = new Map();
-    const questionAliasMap      = new Map();
-    let activeSession           = null;
-    let lastSubmittedQuestionId = null;
-    let contextRevision         = 0;
-
-    let latestExamPaperData        = null;
-    let latestUserProfile          = null;
-    let latestFeatureFlags         = null;
-    let latestGlobalFeatureFlags   = null;
-    let latestQuizFeedback         = null;
-
     function bumpContextRevision() {
-        contextRevision += 1;
+        sessionState.contextRevision += 1;
+        sessionState.cachedContextSnapshot = null;
         notifyStatsChange();
     }
 
@@ -1901,10 +2062,10 @@
         if (id == null) return null;
         const key = String(id);
         if (!key) return null;
-        const direct = questionRegistry.get(key);
+        const direct = sessionState.questionRegistry.get(key);
         if (direct) return direct;
-        const aliased = questionAliasMap.get(key);
-        if (aliased) return questionRegistry.get(aliased) || null;
+        const aliased = sessionState.questionAliasMap.get(key);
+        if (aliased) return sessionState.questionRegistry.get(aliased) || null;
         return null;
     }
 
@@ -2122,9 +2283,9 @@
         const stemSnippet = fullText.slice(0, 72);
         const stemNeedle = stemText.toLowerCase().slice(0, 64).trim();
 
-        const existing = questionRegistry.get(primaryId);
-        const parsedTrigger = parseDurationToSeconds(q.triggerTime);
-        const parsedResume = parseDurationToSeconds(q.postQuestionResumeTime);
+        const existing = sessionState.questionRegistry.get(primaryId);
+        const parsedTrigger = parseDurationToSeconds(q.triggerTime != null ? q.triggerTime : meta.triggerTime);
+        const parsedResume = parseDurationToSeconds(q.postQuestionResumeTime != null ? q.postQuestionResumeTime : meta.postQuestionResumeTime);
 
         const desc = {
             id: primaryId,
@@ -2167,12 +2328,12 @@
 
         desc.recommendedSeconds = computeBaseQuestionSeconds(desc);
 
-        setBoundedMapEntry(questionRegistry, primaryId, desc, QUESTION_REGISTRY_MAX);
+        setBoundedMapEntry(sessionState.questionRegistry, primaryId, desc, QUESTION_REGISTRY_MAX);
         if (quizContentId && quizContentId !== primaryId) {
-            setBoundedMapEntry(questionAliasMap, quizContentId, primaryId, QUESTION_REGISTRY_MAX);
+            setBoundedMapEntry(sessionState.questionAliasMap, quizContentId, primaryId, QUESTION_REGISTRY_MAX);
         }
         if (desc.lessonId && desc.lessonId !== primaryId) {
-            setBoundedMapEntry(questionAliasMap, desc.lessonId, primaryId, QUESTION_REGISTRY_MAX);
+            setBoundedMapEntry(sessionState.questionAliasMap, desc.lessonId, primaryId, QUESTION_REGISTRY_MAX);
         }
 
         if (!desc._countedIdentified) {
@@ -2190,32 +2351,32 @@
 
         if (session.sessionType === 'VideoLesson') {
             predictedOp = 'CompleteVideoLesson';
-            const dur = session.durationSeconds || knownLessonDurations.get(session.sessionId) || 0;
+            const dur = session.durationSeconds || sessionState.knownLessonDurations.get(session.sessionId) || 0;
             const qExtra = settings.predictFinalCallEnabled ? (session.totalExtraQuestionSeconds || 0) : 0;
-            predictedSeconds = round3((settings.addVideoDurationToTimeSpent ? dur : 0) + qExtra + (queuedSeconds || 0));
+            predictedSeconds = round3((settings.addVideoDurationToTimeSpent ? dur : 0) + qExtra + (sessionState.queuedSeconds || 0));
             varsPreview.lessonId = session.sessionId;
             varsPreview.timeSpent = predictedSeconds;
             varsPreview.percentWatched = settings.fullVideoWatchedEnabled ? 1 : 0;
         } else if (session.sessionType === 'SubsectionSummary') {
             predictedOp = 'CompleteSubsectionSummary';
-            const dur = session.durationSeconds || knownLessonDurations.get(session.sessionId) || 0;
-            predictedSeconds = round3((settings.addVideoDurationToTimeSpent ? dur : 0) + (queuedSeconds || 0));
+            const dur = session.durationSeconds || sessionState.knownLessonDurations.get(session.sessionId) || 0;
+            predictedSeconds = round3((settings.addVideoDurationToTimeSpent ? dur : 0) + (sessionState.queuedSeconds || 0));
             varsPreview.subsectionSummaryId = session.sessionId;
             varsPreview.timeSpent = predictedSeconds;
             varsPreview.percentWatched = settings.fullVideoWatchedEnabled ? 1 : 0;
         } else if (session.sessionType === 'ArticleLesson') {
             predictedOp = 'CompleteArticleLesson';
-            const dur = session.durationSeconds || knownLessonDurations.get(session.sessionId) || 0;
-            predictedSeconds = round3(dur + (queuedSeconds || 0));
+            const dur = session.durationSeconds || sessionState.knownLessonDurations.get(session.sessionId) || 0;
+            predictedSeconds = round3(dur + (sessionState.queuedSeconds || 0));
             varsPreview.lessonId = session.sessionId;
             varsPreview.timeSpent = predictedSeconds;
         } else if (session.sessionType === 'ExamQuestionWalkthrough') {
             predictedOp = 'CompleteExamQuestionWalkthrough';
-            const dur = session.durationSeconds || knownLessonDurations.get(session.sessionId) || 0;
+            const dur = session.durationSeconds || sessionState.knownLessonDurations.get(session.sessionId) || 0;
             const ans = round3(session.answeringSubmittedSeconds || 0);
             const mark = round3(session.markingSubmittedSeconds || 0);
             const watch = settings.addVideoDurationToTimeSpent ? dur : 0;
-            predictedSeconds = round3(ans + mark + watch + (queuedSeconds || 0));
+            predictedSeconds = round3(ans + mark + watch + (sessionState.queuedSeconds || 0));
             varsPreview.lessonId = session.sessionId;
             varsPreview.timeSpentAnswering = toIso(ans);
             varsPreview.timeSpentMarking = toIso(mark);
@@ -2223,7 +2384,7 @@
             if (settings.fullVideoWatchedEnabled) varsPreview.percentWatched = 1;
         } else if (session.sessionType === 'ExamPracticeSession') {
             predictedOp = session.phase === 'answers_saved' ? 'CompleteExamPracticeSession' : 'SaveExamPracticeAnswers';
-            const bonus = (session.totalExtraQuestionSeconds || accumulatedExtraSeconds || 0) + (queuedSeconds || 0);
+            const bonus = (session.totalExtraQuestionSeconds || sessionState.accumulatedExtraSeconds || 0) + (sessionState.queuedSeconds || 0);
             predictedSeconds = round3(Math.max(session.totalSubmittedQuestionSeconds || 0, bonus));
             if (session.sessionId) varsPreview.sessionId = session.sessionId;
             if (predictedOp === 'SaveExamPracticeAnswers') {
@@ -2232,7 +2393,7 @@
                 varsPreview = { id: session.sessionId || null };
             }
         } else {
-            const bonus = (session.totalExtraQuestionSeconds || accumulatedExtraSeconds || 0) + (queuedSeconds || 0);
+            const bonus = (session.totalExtraQuestionSeconds || sessionState.accumulatedExtraSeconds || 0) + (sessionState.queuedSeconds || 0);
             predictedSeconds = round3(Math.max(session.totalSubmittedQuestionSeconds || 0, bonus));
             varsPreview.timeSpent = toIso(predictedSeconds);
         }
@@ -2251,7 +2412,7 @@
     }
 
     function initOrUpdateSession(cfg) {
-        const prev = activeSession;
+        const prev = sessionState.activeSession;
         const sameSession = prev && prev.sessionType === cfg.sessionType && prev.sessionId === cfg.sessionId && !prev.completed;
 
         const session = {
@@ -2288,17 +2449,25 @@
         }
 
         if (!sameSession) {
-            accumulatedExtraSeconds = 0;
-            accumulatedQuestionCount = 0;
-            lastSubmittedQuestionId = null;
+            sessionState.accumulatedExtraSeconds = 0;
+            sessionState.accumulatedQuestionCount = 0;
+            sessionState.lastSubmittedQuestionId = null;
         }
 
-        activeSession = session;
+        sessionState.activeSession = session;
         updatePredictedFinalCall(session);
         bumpContextRevision();
-        if (!editing) updateLabel();
+        if (!sessionState.editing) updateLabel();
         VLOG(`[session] ${session.sessionType} (${session.sessionId || 'anon'}) · ${session.questionIds.length} q · predicted final: ${session.predictedOp}`);
         return session;
+    }
+
+    function cleanDomText(str) {
+        if (str == null) return '';
+        let s = String(str);
+        if (!s) return '';
+        if (s.indexOf('\\') !== -1) s = s.replace(LATEX_CMD_RE, ' ');
+        return s.replace(LATEX_MARKER_RE, ' ').replace(/\s+/g, ' ').trim();
     }
 
     function extractVisibleQuizTextFromDom() {
@@ -2308,9 +2477,9 @@
             let combined = '';
             for (let i = 0; i < containers.length; i++) {
                 const el = containers[i];
-                if (!el || (uiHostEl && (el === uiHostEl || uiHostEl.contains(el)))) continue;
+                if (!el || (uiState.hostEl && (el === uiState.hostEl || uiState.hostEl.contains(el)))) continue;
                 if (!isElementVisible(el)) continue;
-                const txt = stripMarkupToPlainText(el.textContent || '');
+                const txt = cleanDomText(el.textContent || '');
                 if (txt.length > combined.length) combined = txt;
             }
             return combined.toLowerCase();
@@ -2319,7 +2488,9 @@
         }
     }
 
-    function identifyCurrentQuestion(vars, opName, qStr) {
+    function identifyCurrentQuestion(vars, opName, qStr, allowDomScan = true) {
+        const session = sessionState.activeSession;
+
         // Mode 1: Request interception with explicit GraphQL variables
         if (vars && typeof vars === 'object') {
             const candidates = [];
@@ -2340,10 +2511,10 @@
             for (let i = 0; i < candidates.length; i++) {
                 const desc = lookupQuestion(candidates[i]);
                 if (desc) {
-                    if (activeSession) {
-                        activeSession.currentQuestionId = desc.id;
-                        const idx = activeSession.questionIds.indexOf(desc.id);
-                        if (idx !== -1) activeSession.currentQuestionIndex = idx;
+                    if (session) {
+                        session.currentQuestionId = desc.id;
+                        const idx = session.questionIds.indexOf(desc.id);
+                        if (idx !== -1) session.currentQuestionIndex = idx;
                     }
                     return desc;
                 }
@@ -2352,19 +2523,19 @@
         }
 
         // Mode 2: Live page inspection
-        if (!activeSession) return null;
+        if (!session) return null;
 
-        if (activeSession.sessionType === 'VideoLesson') {
+        if (session.sessionType === 'VideoLesson') {
             const video = findActiveVideoElement();
             if (video && isFinite(video.currentTime)) {
                 const ct = video.currentTime;
-                if (ct < 1.0 && activeSession.preVideoQuestionIds.length > 0) {
-                    for (let i = 0; i < activeSession.preVideoQuestionIds.length; i++) {
-                        const pq = lookupQuestion(activeSession.preVideoQuestionIds[i]);
+                if (ct < 1.0 && session.preVideoQuestionIds.length > 0) {
+                    for (let i = 0; i < session.preVideoQuestionIds.length; i++) {
+                        const pq = lookupQuestion(session.preVideoQuestionIds[i]);
                         if (pq && !pq.answered) return pq;
                     }
                 }
-                const ivqs = activeSession.inVideoQuestions || [];
+                const ivqs = session.inVideoQuestions || [];
                 for (let i = 0; i < ivqs.length; i++) {
                     const iq = ivqs[i];
                     if (iq && iq.triggerTime != null && Math.abs(ct - iq.triggerTime) <= 4.0) {
@@ -2375,38 +2546,40 @@
             }
         }
 
-        const qIds = activeSession.questionIds || [];
+        const qIds = session.questionIds || [];
         if (qIds.length > 0) {
-            const domText = extractVisibleQuizTextFromDom();
-            if (domText.length >= 16) {
-                let bestMatch = null;
-                let bestScore = 0;
-                for (let i = 0; i < qIds.length; i++) {
-                    const qDesc = lookupQuestion(qIds[i]);
-                    if (!qDesc || !qDesc.stemText) continue;
-                    const needle = qDesc.stemNeedle ?? qDesc.stemText.toLowerCase().slice(0, 64).trim();
-                    if (needle.length >= 16 && domText.includes(needle)) {
-                        if (needle.length > bestScore) {
-                            bestScore = needle.length;
-                            bestMatch = qDesc;
-                        }
-                    } else if (needle.length >= 24) {
-                        const prefix = needle.slice(0, 24);
-                        if (domText.includes(prefix) && prefix.length > bestScore) {
-                            bestScore = prefix.length;
-                            bestMatch = qDesc;
+            if (allowDomScan) {
+                const domText = extractVisibleQuizTextFromDom();
+                if (domText.length >= 16) {
+                    let bestMatch = null;
+                    let bestScore = 0;
+                    for (let i = 0; i < qIds.length; i++) {
+                        const qDesc = lookupQuestion(qIds[i]);
+                        if (!qDesc || !qDesc.stemText) continue;
+                        const needle = qDesc.stemNeedle ?? qDesc.stemText.toLowerCase().slice(0, 64).trim();
+                        if (needle.length >= 16 && domText.includes(needle)) {
+                            if (needle.length > bestScore) {
+                                bestScore = needle.length;
+                                bestMatch = qDesc;
+                            }
+                        } else if (needle.length >= 24) {
+                            const prefix = needle.slice(0, 24);
+                            if (domText.includes(prefix) && prefix.length > bestScore) {
+                                bestScore = prefix.length;
+                                bestMatch = qDesc;
+                            }
                         }
                     }
-                }
-                if (bestMatch) {
-                    const idx = qIds.indexOf(bestMatch.id);
-                    if (idx !== -1) activeSession.currentQuestionIndex = idx;
-                    activeSession.currentQuestionId = bestMatch.id;
-                    return bestMatch;
+                    if (bestMatch) {
+                        const idx = qIds.indexOf(bestMatch.id);
+                        if (idx !== -1) session.currentQuestionIndex = idx;
+                        session.currentQuestionId = bestMatch.id;
+                        return bestMatch;
+                    }
                 }
             }
 
-            const idx = Math.max(0, Math.min(activeSession.currentQuestionIndex || 0, qIds.length - 1));
+            const idx = Math.max(0, Math.min(session.currentQuestionIndex || 0, qIds.length - 1));
             const indexedQ = lookupQuestion(qIds[idx]);
             if (indexedQ) return indexedQ;
             for (let i = 0; i < qIds.length; i++) {
@@ -2416,14 +2589,14 @@
             return lookupQuestion(qIds[qIds.length - 1]);
         }
 
-        return activeSession.currentQuestionId ? lookupQuestion(activeSession.currentQuestionId) : null;
+        return session.currentQuestionId ? lookupQuestion(session.currentQuestionId) : null;
     }
 
     function inspectDomQuestionComplexity() {
         try {
             if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return null;
             const domText = extractVisibleQuizTextFromDom();
-            const wc = countWords(domText);
+            const wc = countWordsInClean(domText);
             const radios = document.querySelectorAll('input[type="radio"]').length;
             const checks = document.querySelectorAll('input[type="checkbox"]').length;
             const textInputs = document.querySelectorAll('input[type="text"], input[type="number"], textarea, math-field').length;
@@ -2453,6 +2626,17 @@
             return null;
         }
     }
+
+    const OP_ANSWER_QUESTION_RE    = /^Answer.*Question$/i;
+    const OP_SAVE_EXAM_RE          = /^SaveExam.*Marks$/i;
+    const QSTR_ANSWER_QUESTION_RE  = /answer[A-Za-z0-9]*Question/i;
+    const QSTR_SAVE_EXAM_RE        = /saveExam[A-Za-z0-9]*Marks/i;
+
+    const OP_COMPLETE_GROUP_RE     = /^Complete.*(Quiz|Group|Session|Walkthrough)$/i;
+    const QSTR_COMPLETE_GROUP_RE   = /complete[A-Za-z0-9]*(Quiz|Group|Session|Walkthrough)|saveExamPracticeAnswers/i;
+
+    const OP_COMPLETE_LESSON_RE    = /^Complete(VideoLesson|SubsectionSummary|ArticleLesson)$/i;
+    const QSTR_COMPLETE_LESSON_RE  = /\bcomplete(VideoLesson|SubsectionSummary|ArticleLesson)\b/i;
 
     function computeDynamicExtraSeconds(questionDesc, origSeconds, opName, qStr) {
         const isMarking = OP_SAVE_EXAM_RE.test(opName || '') || QSTR_SAVE_EXAM_RE.test(qStr || '');
@@ -2490,56 +2674,59 @@
 
     function processAnswerMutationResponse(mutationKey, payload) {
         if (!payload) return;
-        latestQuizFeedback = { type: mutationKey, timestamp: Date.now(), payload };
+        const session = sessionState.activeSession;
+        if (settings.logLevel === 'verbose') {
+            sessionState.latestQuizFeedback = { type: mutationKey, timestamp: Date.now(), payload };
+        }
 
         if (mutationKey === 'answerInVideoQuestion') {
-            lastQuestionAnsweredAt = Date.now();
-            waitingForPostAnswerResume = true;
+            videoState.lastQuestionAnsweredAt = Date.now();
+            videoState.waitingForPostAnswerResume = true;
         }
 
         if (mutationKey === 'answerExamQuestion') {
-            if (activeSession && activeSession.sessionType === 'ExamQuestionWalkthrough') {
-                activeSession.phase = 'marking';
-                updatePredictedFinalCall(activeSession);
+            if (session && session.sessionType === 'ExamQuestionWalkthrough') {
+                session.phase = 'marking';
+                updatePredictedFinalCall(session);
             }
             bumpContextRevision();
-            if (!editing) updateLabel();
+            if (!sessionState.editing) updateLabel();
             return;
         }
 
         if (mutationKey === 'saveExamQuestionMarks') {
-            if (activeSession && activeSession.sessionType === 'ExamQuestionWalkthrough') {
-                activeSession.phase = 'marked';
-                updatePredictedFinalCall(activeSession);
+            if (session && session.sessionType === 'ExamQuestionWalkthrough') {
+                session.phase = 'marked';
+                updatePredictedFinalCall(session);
             }
             bumpContextRevision();
-            if (!editing) updateLabel();
+            if (!sessionState.editing) updateLabel();
             return;
         }
 
         if (mutationKey === 'saveExamPracticeAnswers') {
-            if (activeSession && activeSession.sessionType === 'ExamPracticeSession') {
-                activeSession.phase = 'answers_saved';
-                updatePredictedFinalCall(activeSession);
+            if (session && session.sessionType === 'ExamPracticeSession') {
+                session.phase = 'answers_saved';
+                updatePredictedFinalCall(session);
             }
             bumpContextRevision();
-            if (!editing) updateLabel();
+            if (!sessionState.editing) updateLabel();
             return;
         }
 
         if (mutationKey === 'saveExamPracticeQuestionMarks') {
-            if (activeSession && activeSession.sessionType === 'ExamPracticeSession') {
-                updatePredictedFinalCall(activeSession);
+            if (session && session.sessionType === 'ExamPracticeSession') {
+                updatePredictedFinalCall(session);
             }
             bumpContextRevision();
-            if (!editing) updateLabel();
+            if (!sessionState.editing) updateLabel();
             return;
         }
 
         const responses = Array.isArray(payload.responses) ? payload.responses : [];
         const allCorrect = responses.length > 0 && responses.every((r) => r && (r.correct === true || r.correct === 'CORRECT'));
 
-        const qId = lastSubmittedQuestionId || (activeSession && activeSession.currentQuestionId);
+        const qId = sessionState.lastSubmittedQuestionId || (session && session.currentQuestionId);
         const qDesc = qId ? lookupQuestion(qId) : null;
         if (qDesc) {
             qDesc.answered = true;
@@ -2547,10 +2734,10 @@
             else if (responses.length > 0 && qDesc.correct !== true) qDesc.correct = false;
         }
 
-        if (activeSession && activeSession.questionIds.length > 0) {
-            const qIds = activeSession.questionIds;
-            let curIdx = qDesc ? qIds.indexOf(qDesc.id) : activeSession.currentQuestionIndex;
-            if (curIdx < 0) curIdx = activeSession.currentQuestionIndex || 0;
+        if (session && session.questionIds.length > 0) {
+            const qIds = session.questionIds;
+            let curIdx = qDesc ? qIds.indexOf(qDesc.id) : session.currentQuestionIndex;
+            if (curIdx < 0) curIdx = session.currentQuestionIndex || 0;
 
             if (payload.questionToSkipTo != null) {
                 let targetIdx = -1;
@@ -2570,12 +2757,12 @@
                         const midQ = lookupQuestion(qIds[i]);
                         if (midQ) midQ.skipped = true;
                     }
-                    activeSession.currentQuestionIndex = targetIdx;
-                    activeSession.currentQuestionId = qIds[targetIdx];
+                    session.currentQuestionIndex = targetIdx;
+                    session.currentQuestionId = qIds[targetIdx];
                 }
             } else if (
                 allCorrect ||
-                activeSession.sessionType === 'DiagnosticQuiz' ||
+                session.sessionType === 'DiagnosticQuiz' ||
                 mutationKey === 'answerInVideoQuestion' ||
                 mutationKey === 'answerPreVideoQuestion'
             ) {
@@ -2597,41 +2784,21 @@
                     }
                 }
                 if (nextIdx !== -1) {
-                    activeSession.currentQuestionIndex = nextIdx;
-                    activeSession.currentQuestionId = qIds[nextIdx];
+                    session.currentQuestionIndex = nextIdx;
+                    session.currentQuestionId = qIds[nextIdx];
                 }
             }
 
-            updatePredictedFinalCall(activeSession);
+            updatePredictedFinalCall(session);
         }
 
         bumpContextRevision();
-        if (!editing) updateLabel();
+        if (!sessionState.editing) updateLabel();
     }
 
-    /* ------------------------------------------------------------
-     * Video Lesson State & Auto-Skip Progression
-     * ------------------------------------------------------------ */
-    const knownLessonDurations = new Map();
     function recordLessonDuration(id, dur) {
         if (!id || !dur) return;
-        setBoundedMapEntry(knownLessonDurations, id, dur, 200);
-    }
-    let currentVideoLesson                 = null;
-    let lastSkippedTarget                  = null;
-    let autoSkipThrottled                  = false;
-    let autoSkipThrottleTimer              = null;
-    let lastActiveVideoElement             = null;
-    let lastQuestionAnsweredAt             = 0;
-    let waitingForPostAnswerResume         = false;
-
-    function throttleAutoSkip() {
-        autoSkipThrottled = true;
-        if (autoSkipThrottleTimer) clearTimeout(autoSkipThrottleTimer);
-        autoSkipThrottleTimer = setTimeout(() => {
-            autoSkipThrottleTimer = null;
-            autoSkipThrottled = false;
-        }, 1500);
+        setBoundedMapEntry(sessionState.knownLessonDurations, id, dur, 200);
     }
 
     const ANSWER_RESPONSE_KEYS = [
@@ -2648,417 +2815,1036 @@
         'evaluateStandaloneQuestionResponses',
     ];
 
+    function handleSubsectionOverview(sub) {
+        const lessonLists = [sub.videoLessons, sub.articleLessons, sub.examHowToLessons];
+        for (let l = 0; l < lessonLists.length; l++) {
+            const list = lessonLists[l];
+            if (!Array.isArray(list)) continue;
+            for (let i = 0; i < list.length; i++) {
+                const item = list[i];
+                if (!item || !item.id) continue;
+                const itemDur = parseDurationToSeconds(item.length) || parseDurationToSeconds(item.duration) || 0;
+                if (itemDur > 0) recordLessonDuration(item.id, itemDur);
+            }
+        }
+        if (sub.summary && sub.summary.id) {
+            const sumVidDur = parseDurationToSeconds(sub.summary.wistiaVideoDuration) || 0;
+            if (sumVidDur > 0) recordLessonDuration(sub.summary.id, sumVidDur);
+        }
+    }
+
+    function handleExperimentGroup(eg) {
+        for (const actWrap of eg.activities) {
+            const act = actWrap && actWrap.activity;
+            if (!act || !act.id) continue;
+            const dur = parseDurationToSeconds(act.length) || 0;
+            if (dur > 0) recordLessonDuration(act.id, dur);
+            if (act.__typename === 'ArticleLesson') {
+                const artDur = dur || Math.max(45, Math.ceil(countWords(act.extraContent) / 3.0));
+                recordLessonDuration(act.id, artDur);
+                initOrUpdateSession({
+                    sessionType: 'ArticleLesson',
+                    sessionId: act.id,
+                    title: act.title || 'Article Lesson',
+                    durationSeconds: artDur,
+                    predictedOp: 'CompleteArticleLesson',
+                    variablesTemplate: { lessonId: String(act.id) },
+                });
+            }
+        }
+    }
+
+    function handleProgressQuizGroup(pg) {
+        const rawQs = Array.isArray(pg.progressQuizQuestions) ? pg.progressQuizQuestions : [];
+        const qIds = [];
+        for (let i = 0; i < rawQs.length; i++) {
+            const desc = analyzeQuestionNode(rawQs[i], {
+                origin: 'progress',
+                sessionId: pg.id,
+                indexInSession: i,
+                questionNumber: i + 1,
+            });
+            if (desc) qIds.push(desc.id);
+        }
+        initOrUpdateSession({
+            sessionType: 'ProgressQuizGroup',
+            sessionId: pg.id,
+            title: pg.name || 'Progress Quiz',
+            moduleUniqueCode: (pg.module && pg.module.uniqueCode) || pg.moduleUniqueCode,
+            subsectionUniqueCode: (pg.subsection && pg.subsection.uniqueCode) || pg.subsectionUniqueCode,
+            questionIds: qIds,
+            predictedOp: 'CompleteProgressQuizGroup',
+            variablesTemplate: { progressQuizGroupId: String(pg.id) },
+        });
+    }
+
+    function handleStrengthenQuiz(sq, sub) {
+        const rawQs = Array.isArray(sq.questions) ? sq.questions : [];
+        const qIds = [];
+        for (let i = 0; i < rawQs.length; i++) {
+            const desc = analyzeQuestionNode(rawQs[i], {
+                origin: 'strengthen',
+                sessionId: sq.id,
+                indexInSession: i,
+                questionNumber: i + 1,
+            });
+            if (desc) qIds.push(desc.id);
+        }
+        initOrUpdateSession({
+            sessionType: 'StrengthenQuiz',
+            sessionId: sq.id,
+            title: sub.name ? `${sub.name} (Strengthen)` : 'Strengthen Quiz',
+            moduleUniqueCode: sub.module && sub.module.uniqueCode,
+            subsectionUniqueCode: sub.uniqueCode,
+            questionIds: qIds,
+            predictedOp: 'CompleteStrengthenQuiz',
+            variablesTemplate: { strengthenQuizSessionId: String(sq.id) },
+        });
+    }
+
+    function handleSpacedPracticeQuiz(sp) {
+        if (!sp || !Array.isArray(sp.questions)) return;
+        const modCode = (sp.module && sp.module.uniqueCode) || '';
+        const subCode = (sp.subsection && sp.subsection.uniqueCode) || '';
+        const spSessionId = `${modCode}:${subCode}` || 'spaced-practice';
+        const qIds = [];
+        for (let i = 0; i < sp.questions.length; i++) {
+            const desc = analyzeQuestionNode(sp.questions[i], {
+                origin: 'spaced',
+                sessionId: spSessionId,
+                indexInSession: i,
+                questionNumber: i + 1,
+            });
+            if (desc) qIds.push(desc.id);
+        }
+        initOrUpdateSession({
+            sessionType: 'SpacedPracticeQuiz',
+            sessionId: spSessionId,
+            title: (sp.subsection && sp.subsection.name) ? `${sp.subsection.name} (Spaced)` : 'Spaced Practice Quiz',
+            moduleUniqueCode: modCode,
+            subsectionUniqueCode: subCode,
+            questionIds: qIds,
+            predictedOp: 'CompleteSpacedPracticeQuiz',
+            variablesTemplate: { moduleUniqueCode: modCode, subsectionUniqueCode: subCode },
+        });
+    }
+
+    function handleDiagnosticQuiz(dq, sub) {
+        const rawQs = Array.isArray(dq.questions) ? dq.questions : [];
+        const qIds = [];
+        for (let i = 0; i < rawQs.length; i++) {
+            const desc = analyzeQuestionNode(rawQs[i], {
+                origin: 'diagnostic',
+                sessionId: dq.id,
+                indexInSession: i,
+                questionNumber: i + 1,
+            });
+            if (desc) qIds.push(desc.id);
+        }
+        initOrUpdateSession({
+            sessionType: 'DiagnosticQuiz',
+            sessionId: dq.id,
+            title: sub.name ? `${sub.name} (Diagnostic)` : 'Diagnostic Quiz',
+            moduleUniqueCode: sub.module && sub.module.uniqueCode,
+            subsectionUniqueCode: sub.uniqueCode,
+            questionIds: qIds,
+            predictedOp: 'CompleteDiagnosticQuizSession',
+            variablesTemplate: { diagnosticQuizSessionId: String(dq.id) },
+        });
+    }
+
+    function handleVideoLesson(vl) {
+        if (!vl || !vl.id) return;
+        const dur = parseDurationToSeconds(vl.length || vl.duration) || 0;
+        if (dur > 0) {
+            recordLessonDuration(vl.id, dur);
+            vl.duration = dur;
+        }
+        const preQs = Array.isArray(vl.preVideoQuestions) ? vl.preVideoQuestions : [];
+        const rawInQs = Array.isArray(vl.inVideoQuizQuestions) ? vl.inVideoQuizQuestions : [];
+        const inQs = rawInQs.slice().sort((a, b) => {
+            const ta = parseDurationToSeconds(a && a.triggerTime) || 0;
+            const tb = parseDurationToSeconds(b && b.triggerTime) || 0;
+            return ta - tb;
+        });
+        const allQIds = [];
+        const preQIds = [];
+        const inVideoList = [];
+        for (let i = 0; i < preQs.length; i++) {
+            const desc = analyzeQuestionNode(preQs[i], {
+                origin: 'pre_video',
+                sessionId: vl.id,
+                lessonId: String(vl.id),
+                indexInSession: i,
+                questionNumber: i + 1,
+            });
+            if (desc) {
+                preQIds.push(desc.id);
+                allQIds.push(desc.id);
+            }
+        }
+        for (let i = 0; i < inQs.length; i++) {
+            const item = inQs[i];
+            const qNode = (item && item.question) || item;
+            const inMeta = {
+                origin: 'in_video',
+                sessionId: vl.id,
+                lessonId: String(vl.id),
+                indexInSession: preQs.length + i,
+                questionNumber: preQs.length + i + 1,
+                triggerTime: item && item.triggerTime,
+                postQuestionResumeTime: item && item.postQuestionResumeTime,
+            };
+            const desc = analyzeQuestionNode(qNode, inMeta);
+            if (desc) {
+                allQIds.push(desc.id);
+                inVideoList.push({
+                    id: desc.id,
+                    triggerTime: item && item.triggerTime,
+                    postQuestionResumeTime: item && item.postQuestionResumeTime,
+                    answered: false,
+                });
+            }
+        }
+        videoState.currentVideoLesson = {
+            id: vl.id,
+            uniqueCode: vl.uniqueCode,
+            title: vl.title,
+            duration: dur,
+            preVideoQuestionIds: preQIds,
+            inVideoQuestions: inVideoList,
+        };
+        initOrUpdateSession({
+            sessionType: 'VideoLesson',
+            sessionId: vl.id,
+            title: vl.title || 'Video Lesson',
+            moduleUniqueCode: vl.module && vl.module.uniqueCode,
+            subsectionUniqueCode: vl.subsection && vl.subsection.uniqueCode,
+            durationSeconds: dur,
+            questionIds: allQIds,
+            preVideoQuestionIds: preQIds,
+            inVideoQuestions: inVideoList,
+            predictedOp: VIDEO_OP,
+            variablesTemplate: { lessonId: String(vl.id), percentWatched: 1 },
+        });
+        VLOG('GetVideoLesson captured:', vl.id, 'duration:', dur, 'preQs:', preQs.length, 'inQs:', inQs.length);
+        if (settings.autoSkipVideoEnabled) {
+            requestAnimationFrame(() => checkAndAutoSkipVideo(false));
+        }
+    }
+
+    function handleExamHowToLesson(ehl) {
+        const dur = parseDurationToSeconds(ehl.duration) || 0;
+        if (dur > 0) recordLessonDuration(ehl.id, dur);
+        const extraTimePct = (ehl.module && ehl.module.currentUserEnrolment && ehl.module.currentUserEnrolment.additionalExamTimePercentage) || ehl.additionalExamTimePercentage || 0;
+        let qDesc = null;
+        if (ehl.examQuestion) {
+            qDesc = analyzeQuestionNode(ehl.examQuestion, {
+                origin: 'exam_walkthrough',
+                sessionId: ehl.id,
+                lessonId: String(ehl.id),
+                indexInSession: 0,
+                questionNumber: 1,
+                additionalExamTimePercentage: extraTimePct,
+            });
+        }
+        initOrUpdateSession({
+            sessionType: 'ExamQuestionWalkthrough',
+            sessionId: ehl.id,
+            title: ehl.title || 'Exam Question Walkthrough',
+            moduleUniqueCode: ehl.module && ehl.module.uniqueCode,
+            subsectionUniqueCode: ehl.subsection && ehl.subsection.uniqueCode,
+            durationSeconds: dur,
+            additionalExamTimePercentage: extraTimePct,
+            questionIds: qDesc ? [qDesc.id] : [],
+            predictedOp: 'CompleteExamQuestionWalkthrough',
+            variablesTemplate: {
+                lessonId: String(ehl.id),
+                percentWatched: 1,
+            },
+        });
+    }
+
+    function handleExamPaper(ep) {
+        if (settings.logLevel === 'verbose') {
+            sessionState.latestExamPaperData = ep;
+        }
+        const dur = parseDurationToSeconds(ep.duration) || 0;
+        const extraTimePct = (ep.module && ep.module.currentUserEnrolment && ep.module.currentUserEnrolment.additionalExamTimePercentage) || 0;
+        const rawQs = Array.isArray(ep.questions) ? ep.questions : [];
+        const qIds = [];
+        for (let i = 0; i < rawQs.length; i++) {
+            const desc = analyzeQuestionNode(rawQs[i], {
+                origin: 'exam_paper',
+                sessionId: ep.id,
+                indexInSession: i,
+                questionNumber: i + 1,
+                additionalExamTimePercentage: extraTimePct,
+            });
+            if (desc) qIds.push(desc.id);
+        }
+        const curSession = sessionState.activeSession;
+        const existingSessionId = (curSession && curSession.sessionType === 'ExamPracticeSession' && curSession.sessionId)
+            ? curSession.sessionId
+            : ep.id;
+        initOrUpdateSession({
+            sessionType: 'ExamPracticeSession',
+            sessionId: existingSessionId,
+            title: ep.name || 'Exam Paper',
+            moduleUniqueCode: ep.module && ep.module.uniqueCode,
+            durationSeconds: dur,
+            additionalExamTimePercentage: extraTimePct,
+            questionIds: qIds,
+            predictedOp: 'SaveExamPracticeAnswers',
+            variablesTemplate: { sessionId: String(existingSessionId) },
+        });
+    }
+
+    function handleStartExamPracticeSession(seps) {
+        const sid = String(seps.id);
+        const curSession = sessionState.activeSession;
+        if (curSession && curSession.sessionType === 'ExamPracticeSession') {
+            curSession.sessionId = sid;
+            curSession.variablesTemplate = { sessionId: sid };
+            updatePredictedFinalCall(curSession);
+            bumpContextRevision();
+        } else {
+            initOrUpdateSession({
+                sessionType: 'ExamPracticeSession',
+                sessionId: sid,
+                title: 'Exam Practice Session',
+                questionIds: [],
+                predictedOp: 'SaveExamPracticeAnswers',
+                variablesTemplate: { sessionId: sid },
+            });
+        }
+    }
+
+    function handleSubsectionSummary(sub) {
+        const sum = sub.summary;
+        let dur = parseDurationToSeconds(sum.wistiaVideoDuration) || 0;
+        if (dur <= 0 && sum.article && Array.isArray(sum.article.parts)) {
+            let words = 0;
+            for (let i = 0; i < sum.article.parts.length; i++) {
+                words += countWords(sum.article.parts[i] && sum.article.parts[i].content);
+            }
+            if (words > 0) dur = Math.max(45, Math.ceil(words / 3.0));
+        }
+        if (dur > 0) recordLessonDuration(sum.id, dur);
+        initOrUpdateSession({
+            sessionType: 'SubsectionSummary',
+            sessionId: sum.id,
+            title: sub.name ? `${sub.name} (Summary)` : 'Subsection Summary',
+            moduleUniqueCode: sub.module && sub.module.uniqueCode,
+            subsectionUniqueCode: sub.uniqueCode,
+            durationSeconds: dur,
+            predictedOp: 'CompleteSubsectionSummary',
+            variablesTemplate: { subsectionSummaryId: String(sum.id), percentWatched: 1 },
+        });
+    }
+
+    function handleSubsectionActivity(sub) {
+        const act = sub.activity;
+        let dur = sessionState.knownLessonDurations.get(String(act.id)) || 0;
+        if (dur <= 0 && act.extraContent) {
+            const words = countWords(act.extraContent);
+            if (words > 0) dur = Math.max(45, Math.ceil(words / 3.0));
+        }
+        if (dur > 0) recordLessonDuration(act.id, dur);
+        initOrUpdateSession({
+            sessionType: 'ArticleLesson',
+            sessionId: act.id,
+            title: act.title || 'Article Lesson',
+            moduleUniqueCode: sub.module && sub.module.uniqueCode,
+            subsectionUniqueCode: sub.uniqueCode,
+            durationSeconds: dur,
+            predictedOp: 'CompleteArticleLesson',
+            variablesTemplate: { lessonId: String(act.id) },
+        });
+    }
+
+    function handleSubsectionNode(sub) {
+        if (!sub || typeof sub !== 'object') return;
+        handleSubsectionOverview(sub);
+        if (sub.strengthenQuiz && sub.strengthenQuiz.id) {
+            handleStrengthenQuiz(sub.strengthenQuiz, sub);
+        }
+        if (sub.diagnosticQuiz && sub.diagnosticQuiz.id) {
+            handleDiagnosticQuiz(sub.diagnosticQuiz, sub);
+        }
+        if (
+            sub.summary &&
+            sub.summary.id &&
+            ('article' in sub.summary || 'wistiaVideoId' in sub.summary || 'summaryOnly' in sub.summary)
+        ) {
+            handleSubsectionSummary(sub);
+        }
+        if (sub.activity && sub.activity.__typename === 'ArticleLesson' && sub.activity.id) {
+            handleSubsectionActivity(sub);
+        }
+    }
+
+    // O(keys in d) GraphQL response dispatch table
+    const GRAPHQL_RESPONSE_HANDLERS = Object.assign(Object.create(null), {
+        featureFlagsEnabledGlobally: (val) => {
+            if (settings.logLevel === 'verbose') {
+                sessionState.latestGlobalFeatureFlags = val;
+            }
+        },
+        currentUser: (user) => {
+            if (!user || typeof user !== 'object' || settings.logLevel !== 'verbose') return;
+            if (user.email || user.roles || user.enrolments) {
+                sessionState.latestUserProfile = user;
+            }
+            if (user.featureFlags !== undefined || user.student || user.managedSchool) {
+                sessionState.latestFeatureFlags = user.featureFlags !== undefined ? user.featureFlags : user;
+            }
+        },
+        subsection: handleSubsectionNode,
+        experimentGroup: (eg) => {
+            if (eg && Array.isArray(eg.activities)) handleExperimentGroup(eg);
+        },
+        progressQuizGroup: (pg) => {
+            if (pg && pg.id) handleProgressQuizGroup(pg);
+        },
+        spacedPracticeQuiz: handleSpacedPracticeQuiz,
+        spacedPracticeQuizGroup: handleSpacedPracticeQuiz,
+        videoLesson: handleVideoLesson,
+        examHowToLesson: (ehl) => {
+            if (ehl && ehl.id) handleExamHowToLesson(ehl);
+        },
+        examPaper: (ep) => {
+            if (ep && ep.id) handleExamPaper(ep);
+        },
+        startExamPracticeSession: (seps) => {
+            if (seps && seps.id) handleStartExamPracticeSession(seps);
+        },
+        examQuestion: (eq) => {
+            if (eq && eq.id) analyzeQuestionNode(eq, { origin: 'exam_question' });
+        },
+        quizContent: (qc) => {
+            if (qc && qc.id) analyzeQuestionNode(qc, { origin: 'standalone' });
+        },
+        standaloneQuestion: (sq) => {
+            if (sq && sq.id) analyzeQuestionNode(sq, { origin: 'standalone' });
+        },
+    });
+    for (let i = 0; i < ANSWER_RESPONSE_KEYS.length; i++) {
+        const key = ANSWER_RESPONSE_KEYS[i];
+        GRAPHQL_RESPONSE_HANDLERS[key] = (payload) => {
+            if (payload) processAnswerMutationResponse(key, payload);
+        };
+    }
+
     function handleApiResponse(data) {
         if (!data || typeof data !== 'object') return;
         if (Array.isArray(data)) {
-            data.forEach(handleApiResponse);
+            for (let i = 0; i < data.length; i++) handleApiResponse(data[i]);
             return;
         }
         const d = data.data || data;
         if (!d || typeof d !== 'object') return;
 
-        // Capture global feature flags & user profile/flags if present
-        if ('featureFlagsEnabledGlobally' in d) {
-            latestGlobalFeatureFlags = d.featureFlagsEnabledGlobally;
+        const keys = Object.keys(d);
+        for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            const handler = GRAPHQL_RESPONSE_HANDLERS[k];
+            if (handler) handler(d[k]);
         }
-        if (d.currentUser && typeof d.currentUser === 'object') {
-            if (d.currentUser.email || d.currentUser.roles || d.currentUser.enrolments) {
-                latestUserProfile = d.currentUser;
-            }
-            if (d.currentUser.featureFlags !== undefined || d.currentUser.student || d.currentUser.managedSchool) {
-                latestFeatureFlags = d.currentUser.featureFlags !== undefined ? d.currentUser.featureFlags : d.currentUser;
-            }
-        }
+    }
 
-        // 0. Subsection overview lesson durations (video, article, examHowTo, summary)
-        if (d.subsection && typeof d.subsection === 'object') {
-            const sub = d.subsection;
-            const lessonLists = [sub.videoLessons, sub.articleLessons, sub.examHowToLessons];
-            for (let l = 0; l < lessonLists.length; l++) {
-                const list = lessonLists[l];
-                if (!Array.isArray(list)) continue;
-                for (let i = 0; i < list.length; i++) {
-                    const item = list[i];
-                    if (!item || !item.id) continue;
-                    const itemDur = parseDurationToSeconds(item.length) || parseDurationToSeconds(item.duration) || 0;
-                    if (itemDur > 0) recordLessonDuration(item.id, itemDur);
+    // Body rewriting helpers for timeSpent & percentWatched
+    const KNOWN_QUESTION_OPS = new Set([
+        'AnswerProgressQuizQuestion',
+        'AnswerInVideoQuestion',
+        'AnswerPreVideoQuestion',
+        'AnswerDiagnosticQuestion',
+        'AnswerSpacedPracticeQuizQuestion',
+        'AnswerStrengthenQuizQuestion',
+        'AnswerExamQuestion',
+        'SaveExamQuestionMarks',
+        'SaveExamPracticeQuestionMarks',
+    ]);
+
+    const KNOWN_GROUP_OPS = new Set([
+        'CompleteProgressQuizGroup',
+        'CompleteSpacedPracticeQuiz',
+        'CompleteStrengthenQuiz',
+        'CompleteDiagnosticQuizSession',
+        'CompleteExamQuestionWalkthrough',
+        'CompleteExamPracticeSession',
+        'SaveExamPracticeAnswers',
+    ]);
+
+    const KNOWN_LESSON_OPS = new Set([
+        'CompleteVideoLesson',
+        'CompleteSubsectionSummary',
+        'CompleteArticleLesson',
+    ]);
+
+    function isQuestionAnswerOp(opName, qStr) {
+        if (KNOWN_QUESTION_OPS.has(opName)) return true;
+        if (OP_ANSWER_QUESTION_RE.test(opName)) return true;
+        if (OP_SAVE_EXAM_RE.test(opName)) return true;
+        if (qStr) {
+            if (QSTR_ANSWER_QUESTION_RE.test(qStr)) return true;
+            if (QSTR_SAVE_EXAM_RE.test(qStr)) return true;
+        }
+        return false;
+    }
+
+    function isQuizGroupOp(opName, qStr) {
+        if (KNOWN_GROUP_OPS.has(opName)) return true;
+        if (OP_COMPLETE_GROUP_RE.test(opName)) return true;
+        if (qStr && QSTR_COMPLETE_GROUP_RE.test(qStr)) return true;
+        return false;
+    }
+
+    function isLessonCompletionOp(opName, qStr) {
+        if (KNOWN_LESSON_OPS.has(opName)) return true;
+        if (OP_COMPLETE_LESSON_RE.test(opName)) return true;
+        if (qStr && QSTR_COMPLETE_LESSON_RE.test(qStr)) return true;
+        return false;
+    }
+
+    function resolveTimeField(vars) {
+        if (vars.timeSpent != null) return 'timeSpent';
+        if (vars.timeSpentAnswering != null) return 'timeSpentAnswering';
+        if (vars.timeSpentMarking != null) return 'timeSpentMarking';
+        return null;
+    }
+
+    function formatUpdatedDuration(rawVal, newTotal) {
+        if (typeof rawVal === 'string') {
+            const c0 = rawVal.charCodeAt(0);
+            return (c0 === 80 || c0 === 112) ? toIso(newTotal) : String(round3(newTotal));
+        }
+        return typeof rawVal === 'number' ? round3(newTotal) : String(round3(newTotal));
+    }
+
+    function computeManualExtra(questionDesc, origSeconds, opName, qStr) {
+        if (settings.manualTimeStacksWithAuto && settings.timeBoostEnabled) {
+            const autoExtra = settings.dynamicTimeEnabled
+                ? computeDynamicExtraSeconds(questionDesc, origSeconds, opName, qStr)
+                : pickExtraSeconds();
+            return sessionState.queuedSeconds + autoExtra;
+        }
+        return sessionState.queuedSeconds;
+    }
+
+    function estimateArticleDurationSeconds() {
+        try {
+            if (typeof document !== 'undefined' && typeof document.querySelector === 'function') {
+                const el = document.querySelector('main, article, [class*="article"], #react-content');
+                if (el && el.textContent) {
+                    const words = countWords(el.textContent);
+                    if (words > 20) return Math.min(420, Math.max(45, Math.ceil(words / 3.0)));
                 }
             }
-            if (sub.summary && sub.summary.id) {
-                const sumVidDur = parseDurationToSeconds(sub.summary.wistiaVideoDuration) || 0;
-                if (sumVidDur > 0) recordLessonDuration(sub.summary.id, sumVidDur);
-            }
-        }
+        } catch {}
+        return 0;
+    }
 
-        // 0b. Experiment group activity metadata
-        if (d.experimentGroup && Array.isArray(d.experimentGroup.activities)) {
-            for (const actWrap of d.experimentGroup.activities) {
-                const act = actWrap && actWrap.activity;
-                if (!act || !act.id) continue;
-                const dur = parseDurationToSeconds(act.length) || 0;
-                if (dur > 0) recordLessonDuration(act.id, dur);
-                if (act.__typename === 'ArticleLesson') {
-                    const artDur = dur || Math.max(45, Math.ceil(countWords(act.extraContent) / 3.0));
-                    recordLessonDuration(act.id, artDur);
-                    initOrUpdateSession({
-                        sessionType: 'ArticleLesson',
-                        sessionId: act.id,
-                        title: act.title || 'Article Lesson',
-                        durationSeconds: artDur,
-                        predictedOp: 'CompleteArticleLesson',
-                        variablesTemplate: { lessonId: String(act.id) },
-                    });
+    function completeSessionAccumulators(sessionToComplete) {
+        if (sessionToComplete) {
+            sessionToComplete.completed = true;
+            sessionToComplete.totalExtraQuestionSeconds = 0;
+            sessionToComplete.totalSubmittedQuestionSeconds = 0;
+        }
+        sessionState.accumulatedExtraSeconds = 0;
+        sessionState.accumulatedQuestionCount = 0;
+    }
+
+    function applyPercentWatched(vars) {
+        if (!settings.fullVideoWatchedEnabled || vars.percentWatched === undefined) return false;
+        const beforePercent = vars.percentWatched;
+        const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
+        if (beforePercent !== targetPercent) {
+            vars.percentWatched = targetPercent;
+            bumpStat('videosMaxed');
+            return true;
+        }
+        return false;
+    }
+
+    function resolveLessonDuration(lessonId, isVideo, isArticle, session) {
+        let knownDur = (lessonId && sessionState.knownLessonDurations.get(lessonId)) || 0;
+        if (knownDur <= 0 && session && (!lessonId || session.sessionId === lessonId)) {
+            knownDur = session.durationSeconds || 0;
+        }
+        const curVid = videoState.currentVideoLesson;
+        if (isVideo) {
+            if (knownDur <= 0 && curVid && (curVid.id === lessonId || !lessonId)) {
+                knownDur = curVid.duration || 0;
+            }
+            if (knownDur <= 0) {
+                const activeVid = findActiveVideoElement();
+                if (activeVid && isFinite(activeVid.duration) && activeVid.duration > 0) {
+                    knownDur = Math.round(activeVid.duration);
                 }
             }
-        }
-
-        // 1. GetProgressQuizGroup response
-        if (d.progressQuizGroup && d.progressQuizGroup.id) {
-            const pg = d.progressQuizGroup;
-            const rawQs = Array.isArray(pg.progressQuizQuestions) ? pg.progressQuizQuestions : [];
-            const qIds = [];
-            for (let i = 0; i < rawQs.length; i++) {
-                const desc = analyzeQuestionNode(rawQs[i], {
-                    origin: 'progress',
-                    sessionId: pg.id,
-                    indexInSession: i,
-                });
-                if (desc) qIds.push(desc.id);
+            if (knownDur <= 0 && curVid && curVid.duration > 0) {
+                knownDur = curVid.duration;
             }
-            initOrUpdateSession({
-                sessionType: 'ProgressQuizGroup',
-                sessionId: pg.id,
-                title: pg.name || 'Progress Quiz',
-                moduleUniqueCode: pg.module && pg.module.uniqueCode,
-                subsectionUniqueCode: pg.subsection && pg.subsection.uniqueCode,
-                questionIds: qIds,
-                predictedOp: 'CompleteProgressQuizGroup',
-                variablesTemplate: { progressQuizGroupId: String(pg.id) },
-            });
+        } else if (isArticle && knownDur <= 0) {
+            knownDur = estimateArticleDurationSeconds();
+        }
+        return knownDur;
+    }
+
+    // Deduplicated helper for walkthrough answering & marking time fields
+    function applyWalkthroughPhaseTime(vars, fieldName, sessionSubmitted, sessionExtra, opLabel, qDesc, allowManual) {
+        if (vars[fieldName] == null) {
+            return { delta: 0, changed: false, manualUsed: false };
+        }
+        const rawVal = vars[fieldName];
+        const origVal = parseDurationToSeconds(rawVal);
+        if (origVal === null) {
+            return { delta: 0, changed: false, manualUsed: false };
         }
 
-        // 2. GetStrengthenQuiz response
-        if (d.subsection && d.subsection.strengthenQuiz && d.subsection.strengthenQuiz.id) {
-            const sub = d.subsection;
-            const sq = sub.strengthenQuiz;
-            const rawQs = Array.isArray(sq.questions) ? sq.questions : [];
-            const qIds = [];
-            for (let i = 0; i < rawQs.length; i++) {
-                const desc = analyzeQuestionNode(rawQs[i], {
-                    origin: 'strengthen',
-                    sessionId: sq.id,
-                    indexInSession: i,
-                    questionNumber: i + 1,
-                });
-                if (desc) qIds.push(desc.id);
+        let targetVal = origVal;
+        if (sessionSubmitted > 0) {
+            targetVal = origVal + (sessionExtra || 0);
+            if (settings.predictFinalCallEnabled !== false) {
+                targetVal = Math.max(targetVal, sessionSubmitted);
             }
-            initOrUpdateSession({
-                sessionType: 'StrengthenQuiz',
-                sessionId: sq.id,
-                title: sub.name ? `${sub.name} (Strengthen)` : 'Strengthen Quiz',
-                moduleUniqueCode: sub.module && sub.module.uniqueCode,
-                subsectionUniqueCode: sub.uniqueCode,
-                questionIds: qIds,
-                predictedOp: 'CompleteStrengthenQuiz',
-                variablesTemplate: { strengthenQuizSessionId: String(sq.id) },
-            });
+        } else if (settings.timeBoostEnabled) {
+            const extra = settings.dynamicTimeEnabled
+                ? computeDynamicExtraSeconds(qDesc, origVal, opLabel, '')
+                : pickExtraSeconds();
+            targetVal = origVal + extra;
         }
 
-        // 3. GetSpacedPracticeQuizGroup response (only when questions array is present)
-        if (d.spacedPracticeQuiz && Array.isArray(d.spacedPracticeQuiz.questions)) {
-            const sp = d.spacedPracticeQuiz;
-            const modCode = (sp.module && sp.module.uniqueCode) || '';
-            const subCode = (sp.subsection && sp.subsection.uniqueCode) || '';
-            const spSessionId = `${modCode}:${subCode}` || 'spaced-practice';
-            const qIds = [];
-            for (let i = 0; i < sp.questions.length; i++) {
-                const desc = analyzeQuestionNode(sp.questions[i], {
-                    origin: 'spaced',
-                    sessionId: spSessionId,
-                    indexInSession: i,
-                    questionNumber: i + 1,
-                });
-                if (desc) qIds.push(desc.id);
+        let manualUsed = false;
+        if (allowManual && sessionState.queuedSeconds !== null) {
+            targetVal += computeManualExtra(qDesc, origVal, opLabel, '');
+            manualUsed = true;
+        }
+
+        targetVal = round3(targetVal);
+        if (targetVal > origVal) {
+            vars[fieldName] = formatUpdatedDuration(rawVal, targetVal);
+            return { delta: targetVal - origVal, changed: true, manualUsed };
+        }
+        return { delta: 0, changed: false, manualUsed };
+    }
+
+    function patchWalkthroughOp(vars, opName, qStr, source) {
+        let changed = false;
+        let manualResetNeeded = false;
+        const lessonId = String(vars.lessonId || '');
+        const qDesc = lookupQuestion(lessonId) || identifyCurrentQuestion();
+        const curSession = sessionState.activeSession;
+        const matchSession = (curSession && curSession.sessionType === 'ExamQuestionWalkthrough' && (!lessonId || curSession.sessionId === lessonId))
+            ? curSession
+            : null;
+
+        let vidDuration = (lessonId && sessionState.knownLessonDurations.get(lessonId)) || (matchSession ? matchSession.durationSeconds : 0) || 0;
+        if (vidDuration <= 0) {
+            const activeVid = findActiveVideoElement();
+            if (activeVid && isFinite(activeVid.duration) && activeVid.duration > 0) {
+                vidDuration = Math.round(activeVid.duration);
             }
-            initOrUpdateSession({
-                sessionType: 'SpacedPracticeQuiz',
-                sessionId: spSessionId,
-                title: (sp.subsection && sp.subsection.name) ? `${sp.subsection.name} (Spaced)` : 'Spaced Practice Quiz',
-                moduleUniqueCode: modCode,
-                subsectionUniqueCode: subCode,
-                questionIds: qIds,
-                predictedOp: 'CompleteSpacedPracticeQuiz',
-                variablesTemplate: { moduleUniqueCode: modCode, subsectionUniqueCode: subCode },
-            });
         }
 
-        // 4. GetSubsectionDiagnosticQuiz response
-        if (d.subsection && d.subsection.diagnosticQuiz && d.subsection.diagnosticQuiz.id) {
-            const sub = d.subsection;
-            const dq = sub.diagnosticQuiz;
-            const rawQs = Array.isArray(dq.questions) ? dq.questions : [];
-            const qIds = [];
-            for (let i = 0; i < rawQs.length; i++) {
-                const desc = analyzeQuestionNode(rawQs[i], {
-                    origin: 'diagnostic',
-                    sessionId: dq.id,
-                    indexInSession: i,
-                    questionNumber: i + 1,
-                });
-                if (desc) qIds.push(desc.id);
+        let totalAdded = 0;
+        const ansRes = applyWalkthroughPhaseTime(
+            vars,
+            'timeSpentAnswering',
+            matchSession ? matchSession.answeringSubmittedSeconds : 0,
+            matchSession ? matchSession.answeringExtraSeconds : 0,
+            'AnswerExamQuestion',
+            qDesc,
+            vars.timeSpentMarking == null
+        );
+        if (ansRes.changed) {
+            totalAdded += ansRes.delta;
+            changed = true;
+        }
+        if (ansRes.manualUsed) manualResetNeeded = true;
+
+        const markRes = applyWalkthroughPhaseTime(
+            vars,
+            'timeSpentMarking',
+            matchSession ? matchSession.markingSubmittedSeconds : 0,
+            matchSession ? matchSession.markingExtraSeconds : 0,
+            'SaveExamQuestionMarks',
+            qDesc,
+            !ansRes.manualUsed
+        );
+        if (markRes.changed) {
+            totalAdded += markRes.delta;
+            changed = true;
+        }
+        if (markRes.manualUsed) manualResetNeeded = true;
+
+        if (settings.addVideoDurationToTimeSpent && vidDuration > 0) {
+            if (vars.timeSpentWatching != null) {
+                const rawWatch = vars.timeSpentWatching;
+                const origWatch = parseDurationToSeconds(rawWatch) || 0;
+                vars.timeSpentWatching = formatUpdatedDuration(rawWatch, origWatch + vidDuration);
+                bumpStat('videoTimeAdded', vidDuration);
+                changed = true;
+            } else if (!qStr || qStr.includes('$timeSpentWatching')) {
+                vars.timeSpentWatching = toIso(vidDuration);
+                bumpStat('videoTimeAdded', vidDuration);
+                changed = true;
             }
-            initOrUpdateSession({
-                sessionType: 'DiagnosticQuiz',
-                sessionId: dq.id,
-                title: sub.name ? `${sub.name} (Diagnostic)` : 'Diagnostic Quiz',
-                moduleUniqueCode: sub.module && sub.module.uniqueCode,
-                subsectionUniqueCode: sub.uniqueCode,
-                questionIds: qIds,
-                predictedOp: 'CompleteDiagnosticQuizSession',
-                variablesTemplate: { diagnosticQuizSessionId: String(dq.id) },
-            });
         }
 
-        // 5. GetVideoLesson response
-        if (d.videoLesson) {
-            const vl = d.videoLesson;
-            if (vl && vl.id) {
-                const lessonId = String(vl.id);
-                const dur = parseDurationToSeconds(vl.length) || parseDurationToSeconds(vl.duration) || 0;
-                if (dur > 0) {
-                    recordLessonDuration(lessonId, dur);
+        if (applyPercentWatched(vars)) {
+            changed = true;
+        }
+
+        if (totalAdded > 0) {
+            bumpStat('groupExtra', round3(totalAdded));
+        }
+        if (changed) {
+            bumpStat('seen');
+            bumpStat('finalCallsModified');
+            LOG(`[${source}] CompleteExamQuestionWalkthrough synced: ans=${vars.timeSpentAnswering}, mark=${vars.timeSpentMarking}, watch=${vars.timeSpentWatching}, pct=${vars.percentWatched}`);
+        }
+        completeSessionAccumulators(matchSession);
+        bumpContextRevision();
+        return { changed, manualResetNeeded };
+    }
+
+    function patchLessonCompletionOp(vars, opName, qStr, source) {
+        let changed = false;
+        let manualResetNeeded = false;
+        const isVideo = opName === VIDEO_OP || qStr.includes(VIDEO_OP) || qStr.includes('completeVideoLesson');
+        const isSummary = opName === 'CompleteSubsectionSummary' || qStr.includes('completeSubsectionSummary');
+        const isArticle = opName === 'CompleteArticleLesson' || qStr.includes('completeArticleLesson');
+        const lessonId = String(vars.lessonId || vars.subsectionSummaryId || '');
+        const displayOp = opName || (isVideo ? VIDEO_OP : (isSummary ? 'CompleteSubsectionSummary' : 'CompleteArticleLesson'));
+        const curSession = sessionState.activeSession;
+
+        let lessonTouched = false;
+
+        if ((isVideo || isSummary) && settings.fullVideoWatchedEnabled && vars.percentWatched !== undefined) {
+            const beforePercent = vars.percentWatched;
+            if (applyPercentWatched(vars)) {
+                lessonTouched = true;
+                changed = true;
+                LOG(`[${source}] ${displayOp}: percentWatched ${beforePercent} → ${vars.percentWatched} (id: ${lessonId || 'unknown'})`);
+            }
+        }
+
+        const knownDur = resolveLessonDuration(lessonId, isVideo, isArticle, curSession);
+        const rawTimeSpent = vars.timeSpent;
+        const origTimeSpent = (typeof rawTimeSpent === 'number' && isFinite(rawTimeSpent))
+            ? rawTimeSpent
+            : (parseDurationToSeconds(rawTimeSpent) || 0);
+
+        let extraTime = 0;
+        if ((isVideo || isSummary) && settings.addVideoDurationToTimeSpent && knownDur > 0) {
+            extraTime += knownDur;
+        } else if (isArticle && settings.timeBoostEnabled) {
+            extraTime += (knownDur > 0)
+                ? knownDur
+                : (settings.dynamicTimeEnabled ? computeDynamicExtraSeconds(null, origTimeSpent, displayOp, qStr) : pickExtraSeconds());
+        }
+
+        const matchVidSession = (isVideo && curSession && curSession.sessionType === 'VideoLesson' && (!lessonId || curSession.sessionId === lessonId))
+            ? curSession
+            : null;
+        if (isVideo && settings.predictFinalCallEnabled !== false) {
+            const qExtra = matchVidSession ? (matchVidSession.totalExtraQuestionSeconds || 0) : sessionState.accumulatedExtraSeconds;
+            if (qExtra > 0) {
+                extraTime += qExtra;
+            }
+        }
+
+        if (sessionState.queuedSeconds !== null) {
+            extraTime += computeManualExtra(null, origTimeSpent, displayOp, qStr);
+            manualResetNeeded = true;
+        }
+
+        let newTimeSpent = round3(origTimeSpent + extraTime);
+        if (matchVidSession && settings.predictFinalCallEnabled !== false && matchVidSession.totalSubmittedQuestionSeconds > 0) {
+            const floorTotal = round3(matchVidSession.totalSubmittedQuestionSeconds + (settings.addVideoDurationToTimeSpent ? knownDur : 0));
+            if (newTimeSpent < floorTotal) {
+                newTimeSpent = floorTotal;
+            }
+        }
+
+        if (rawTimeSpent !== undefined && newTimeSpent > origTimeSpent) {
+            vars.timeSpent = formatUpdatedDuration(rawTimeSpent, newTimeSpent);
+
+            if ((isVideo || isSummary) && settings.addVideoDurationToTimeSpent && knownDur > 0) {
+                bumpStat('videoTimeAdded', knownDur);
+            }
+            lessonTouched = true;
+            changed = true;
+
+            const deltaLogged = round3(newTimeSpent - origTimeSpent);
+            LOG(`[${source}] ${displayOp}: timeSpent ${rawTimeSpent} (+${formatSeconds(deltaLogged)}) → ${vars.timeSpent} (id: ${lessonId || 'unknown'})`);
+        }
+
+        if (lessonTouched) {
+            bumpStat('seen');
+            bumpStat('finalCallsModified');
+        }
+        completeSessionAccumulators(curSession && (!lessonId || curSession.sessionId === lessonId) ? curSession : null);
+        bumpContextRevision();
+        return { changed, manualResetNeeded };
+    }
+
+    function patchQuizGroupOp(vars, timeField, opName, qStr, source, boostActive, predictActive) {
+        let changed = false;
+        let manualResetNeeded = false;
+        const curSession = sessionState.activeSession;
+        const isExamPracticeComplete = opName === 'CompleteExamPracticeSession' || qStr.includes('completeExamPracticeSession');
+        const isSaveExamAnswers = opName === 'SaveExamPracticeAnswers' || qStr.includes('saveExamPracticeAnswers');
+
+        if (isExamPracticeComplete && !timeField) {
+            completeSessionAccumulators(curSession && curSession.sessionType === 'ExamPracticeSession' ? curSession : null);
+            bumpContextRevision();
+            return { changed, manualResetNeeded };
+        }
+
+        if (timeField && (boostActive || predictActive)) {
+            const rawVal = vars[timeField];
+            const total = parseDurationToSeconds(rawVal);
+            if (total !== null) {
+                const useSessionBonus = curSession && (curSession.totalExtraQuestionSeconds > 0 || curSession.totalSubmittedQuestionSeconds > 0);
+                let bonus = useSessionBonus ? curSession.totalExtraQuestionSeconds : sessionState.accumulatedExtraSeconds;
+                let isManual = false;
+
+                if (bonus === 0 && settings.timeBoostEnabled && settings.predictFinalCallEnabled !== false) {
+                    const activeQ = identifyCurrentQuestion();
+                    bonus = settings.dynamicTimeEnabled
+                        ? computeDynamicExtraSeconds(activeQ, total, opName, qStr)
+                        : pickExtraSeconds();
                 }
 
-                const preQs = Array.isArray(vl.preVideoQuestions) ? vl.preVideoQuestions : [];
-                const inQs = Array.isArray(vl.inVideoQuizQuestions) ? vl.inVideoQuizQuestions : [];
-                const qIds = [];
-                const preIds = [];
-                const inMeta = [];
+                if (sessionState.queuedSeconds !== null) {
+                    isManual = true;
+                    bonus += computeManualExtra(identifyCurrentQuestion(), total, opName, qStr);
+                    manualResetNeeded = true;
+                }
 
-                for (let i = 0; i < preQs.length; i++) {
-                    const desc = analyzeQuestionNode(preQs[i], {
-                        origin: 'pre_video',
-                        sessionId: lessonId,
-                        lessonId,
-                        indexInSession: qIds.length,
-                    });
-                    if (desc) {
-                        preIds.push(desc.id);
-                        qIds.push(desc.id);
+                if (bonus > 0) {
+                    let finalTotal = round3(total + bonus);
+                    if (settings.predictFinalCallEnabled !== false && curSession && curSession.totalSubmittedQuestionSeconds > 0) {
+                        const minTotal = round3(curSession.totalSubmittedQuestionSeconds + Math.min(bonus, 12));
+                        if (finalTotal < minTotal) finalTotal = minTotal;
+                    }
+                    const addedDelta = round3(finalTotal - total);
+                    if (addedDelta > 0) {
+                        vars[timeField] = formatUpdatedDuration(rawVal, finalTotal);
+                        bumpStat('groupExtra', addedDelta);
+                        bumpStat('finalCallsModified');
+                        changed = true;
+                        const count = sessionState.accumulatedQuestionCount;
+                        LOG(`[${source}] ${opName || 'QuizGroup'}: ${rawVal} → ${vars[timeField]} ` +
+                            `(+${addedDelta}s${count > 0 ? ` from ${count} question(s)` : ''}${isManual ? ' [manual]' : ''})`);
+                        VLOG('group bonus applied; per-question accumulator reset', { bonus: addedDelta, count, opName });
                     }
                 }
-                for (let i = 0; i < inQs.length; i++) {
-                    const desc = analyzeQuestionNode(inQs[i], {
-                        origin: 'in_video',
-                        sessionId: lessonId,
-                        lessonId,
-                        indexInSession: qIds.length,
-                    });
-                    if (desc) {
-                        qIds.push(desc.id);
-                        inMeta.push({
-                            id: desc.id,
-                            triggerTime: desc.triggerTime,
-                            postQuestionResumeTime: desc.postQuestionResumeTime,
-                        });
-                    }
-                }
-                inMeta.sort((a, b) => {
-                    if (a.triggerTime == null && b.triggerTime == null) return 0;
-                    if (a.triggerTime == null) return 1;
-                    if (b.triggerTime == null) return -1;
-                    return a.triggerTime - b.triggerTime;
-                });
-
-                currentVideoLesson = {
-                    id: lessonId,
-                    uniqueCode: vl.uniqueCode ? String(vl.uniqueCode) : '',
-                    title: vl.title || '',
-                    duration: dur,
-                    preVideoQuestionIds: preIds,
-                    inVideoQuestions: inMeta,
-                };
-
-                initOrUpdateSession({
-                    sessionType: 'VideoLesson',
-                    sessionId: lessonId,
-                    title: vl.title || 'Video Lesson',
-                    moduleUniqueCode: vl.module && vl.module.uniqueCode,
-                    subsectionUniqueCode: vl.subsection && vl.subsection.uniqueCode,
-                    durationSeconds: dur,
-                    questionIds: qIds,
-                    preVideoQuestionIds: preIds,
-                    inVideoQuestions: inMeta,
-                    predictedOp: 'CompleteVideoLesson',
-                    variablesTemplate: { lessonId, percentWatched: 1 },
-                });
-
-                if (settings.autoSkipVideoEnabled) {
-                    checkAndAutoSkipVideo(false);
-                }
-            }
-        }
-
-        // 6. GetExamHowToLesson response (Exam Question Walkthrough)
-        if (d.examHowToLesson && d.examHowToLesson.id) {
-            const ehl = d.examHowToLesson;
-            const lessonId = String(ehl.id);
-            const dur = parseDurationToSeconds(ehl.duration) || 0;
-            if (dur > 0) recordLessonDuration(lessonId, dur);
-
-            const extraTimePct = (ehl.module && ehl.module.currentUserEnrolment && ehl.module.currentUserEnrolment.additionalExamTimePercentage) || 0;
-            const qIds = [];
-            if (ehl.examQuestion) {
-                const desc = analyzeQuestionNode(ehl.examQuestion, {
-                    origin: 'exam_walkthrough',
-                    sessionId: lessonId,
-                    lessonId,
-                    indexInSession: 0,
-                    additionalExamTimePercentage: extraTimePct,
-                });
-                if (desc) qIds.push(desc.id);
             }
 
-            initOrUpdateSession({
-                sessionType: 'ExamQuestionWalkthrough',
-                sessionId: lessonId,
-                title: ehl.title || 'Exam Question Walkthrough',
-                moduleUniqueCode: ehl.module && ehl.module.uniqueCode,
-                subsectionUniqueCode: ehl.subsection && ehl.subsection.uniqueCode,
-                durationSeconds: dur,
-                additionalExamTimePercentage: extraTimePct,
-                questionIds: qIds,
-                predictedOp: 'CompleteExamQuestionWalkthrough',
-                variablesTemplate: { lessonId },
-            });
-        }
-
-        // 7. GetExamPaper & StartExamPracticeSession
-        if (d.examPaper && d.examPaper.id) {
-            const ep = d.examPaper;
-            latestExamPaperData = ep;
-            const dur = parseDurationToSeconds(ep.duration) || 0;
-            const extraTimePct = (ep.module && ep.module.currentUserEnrolment && ep.module.currentUserEnrolment.additionalExamTimePercentage) || 0;
-            const rawQs = Array.isArray(ep.questions) ? ep.questions : [];
-            const qIds = [];
-            for (let i = 0; i < rawQs.length; i++) {
-                const desc = analyzeQuestionNode(rawQs[i], {
-                    origin: 'exam_paper',
-                    sessionId: ep.id,
-                    indexInSession: i,
-                    questionNumber: i + 1,
-                    additionalExamTimePercentage: extraTimePct,
-                });
-                if (desc) qIds.push(desc.id);
-            }
-            const existingSessionId = (activeSession && activeSession.sessionType === 'ExamPracticeSession' && activeSession.sessionId)
-                ? activeSession.sessionId
-                : ep.id;
-            initOrUpdateSession({
-                sessionType: 'ExamPracticeSession',
-                sessionId: existingSessionId,
-                title: ep.name || 'Exam Paper',
-                moduleUniqueCode: ep.module && ep.module.uniqueCode,
-                durationSeconds: dur,
-                additionalExamTimePercentage: extraTimePct,
-                questionIds: qIds,
-                predictedOp: 'SaveExamPracticeAnswers',
-                variablesTemplate: { sessionId: String(existingSessionId) },
-            });
-        }
-
-        if (d.startExamPracticeSession && d.startExamPracticeSession.id) {
-            const sid = String(d.startExamPracticeSession.id);
-            if (activeSession && activeSession.sessionType === 'ExamPracticeSession') {
-                activeSession.sessionId = sid;
-                activeSession.variablesTemplate = { sessionId: sid };
-                updatePredictedFinalCall(activeSession);
-                bumpContextRevision();
+            const prevAcc = sessionState.accumulatedExtraSeconds;
+            if (curSession && isSaveExamAnswers) {
+                sessionState.accumulatedExtraSeconds = 0;
+                sessionState.accumulatedQuestionCount = 0;
+                curSession.phase = 'answers_saved';
+                updatePredictedFinalCall(curSession);
             } else {
-                initOrUpdateSession({
-                    sessionType: 'ExamPracticeSession',
-                    sessionId: sid,
-                    title: 'Exam Practice Session',
-                    questionIds: [],
-                    predictedOp: 'SaveExamPracticeAnswers',
-                    variablesTemplate: { sessionId: sid },
+                completeSessionAccumulators(curSession);
+            }
+            if (!changed && prevAcc > 0) notifyStatsChange();
+            bumpContextRevision();
+        }
+        return { changed, manualResetNeeded };
+    }
+
+    function patchQuestionOp(vars, timeField, opName, qStr, source, isQuestion, identifiedQ) {
+        let changed = false;
+        let manualResetNeeded = false;
+        const hasManual = sessionState.queuedSeconds !== null;
+        if (!hasManual && !isQuestion && !KNOWN_LESSON_OPS.has(opName)) {
+            return { changed, manualResetNeeded };
+        }
+
+        const rawVal = vars[timeField];
+        const total = parseDurationToSeconds(rawVal);
+        if (total === null) return { changed, manualResetNeeded };
+
+        let extra = 0;
+        const isManual = hasManual;
+        if (hasManual) {
+            extra = computeManualExtra(identifiedQ, total, opName, qStr);
+            // Always reset manual override after consumption, including explicit +0s
+            manualResetNeeded = true;
+        } else if (settings.timeBoostEnabled) {
+            extra = settings.dynamicTimeEnabled
+                ? computeDynamicExtraSeconds(identifiedQ, total, opName, qStr)
+                : pickExtraSeconds();
+        } else {
+            return { changed, manualResetNeeded };
+        }
+
+        if (extra > 0) {
+            const newSubmitted = round3(total + extra);
+            vars[timeField] = formatUpdatedDuration(rawVal, newSubmitted);
+            sessionState.accumulatedExtraSeconds = round3(sessionState.accumulatedExtraSeconds + extra);
+            sessionState.accumulatedQuestionCount += 1;
+
+            if (identifiedQ) {
+                identifiedQ.attempts = (identifiedQ.attempts || 0) + 1;
+                identifiedQ.lastSubmittedTimeSeconds = newSubmitted;
+                identifiedQ.lastExtraTimeSeconds = extra;
+                identifiedQ.lastAnsweredAt = Date.now();
+            }
+
+            const curSession = sessionState.activeSession;
+            if (curSession) {
+                curSession.totalOriginalQuestionSeconds = round3((curSession.totalOriginalQuestionSeconds || 0) + total);
+                curSession.totalExtraQuestionSeconds = round3((curSession.totalExtraQuestionSeconds || 0) + extra);
+                curSession.totalSubmittedQuestionSeconds = round3((curSession.totalSubmittedQuestionSeconds || 0) + newSubmitted);
+
+                if (opName === 'AnswerExamQuestion' || qStr.includes('answerExamQuestion')) {
+                    curSession.answeringSubmittedSeconds = round3((curSession.answeringSubmittedSeconds || 0) + newSubmitted);
+                    curSession.answeringExtraSeconds = round3((curSession.answeringExtraSeconds || 0) + extra);
+                } else if (opName === 'SaveExamQuestionMarks' || qStr.includes('saveExamQuestionMarks')) {
+                    curSession.markingSubmittedSeconds = round3((curSession.markingSubmittedSeconds || 0) + newSubmitted);
+                    curSession.markingExtraSeconds = round3((curSession.markingExtraSeconds || 0) + extra);
+                }
+                updatePredictedFinalCall(curSession);
+            }
+
+            bumpStat('seen');
+            bumpStat('boosted');
+            if (isManual) {
+                bumpStat('manualBoosted');
+            }
+            bumpContextRevision();
+            changed = true;
+
+            const displayOp = opName || 'Question';
+            const qLabel = identifiedQ ? ` [${identifiedQ.primaryType}, rec ${identifiedQ.recommendedSeconds}s]` : '';
+            if (isManual) {
+                LOG(`[${source}] ${displayOp}${qLabel} (manual time): ${rawVal} (+${formatSeconds(sessionState.queuedSeconds)}${settings.manualTimeStacksWithAuto && settings.timeBoostEnabled ? ' + auto' : ''}) → ${vars[timeField]} ` +
+                    `(accumulated ${sessionState.accumulatedExtraSeconds}s / ${sessionState.accumulatedQuestionCount} q)`);
+            } else {
+                LOG(`[${source}] ${displayOp}${qLabel}: ${rawVal} → ${vars[timeField]} ` +
+                    `(+${extra}s, accumulated ${sessionState.accumulatedExtraSeconds}s / ${sessionState.accumulatedQuestionCount} q)`);
+                VLOG('boost roll', {
+                    opName: displayOp,
+                    questionId: identifiedQ ? identifiedQ.id : null,
+                    questionType: identifiedQ ? identifiedQ.primaryType : null,
+                    dynamic: settings.dynamicTimeEnabled,
+                    rolled: extra,
+                    range: `[${settings.extraSecondsMin}–${settings.extraSecondsMax}]`,
+                    newAccumulated: sessionState.accumulatedExtraSeconds,
+                    questionCount: sessionState.accumulatedQuestionCount,
                 });
             }
         }
+        return { changed, manualResetNeeded };
+    }
 
-        // 8. GetSubsectionSummary response (distinguished from overview by article / wistiaVideoId / summaryOnly)
-        if (
-            d.subsection &&
-            d.subsection.summary &&
-            d.subsection.summary.id &&
-            ('article' in d.subsection.summary || 'wistiaVideoId' in d.subsection.summary || 'summaryOnly' in d.subsection)
-        ) {
-            const sub = d.subsection;
-            const sum = sub.summary;
-            let dur = parseDurationToSeconds(sum.wistiaVideoDuration) || 0;
-            if (dur <= 0 && sum.article && Array.isArray(sum.article.parts)) {
-                let words = 0;
-                for (let i = 0; i < sum.article.parts.length; i++) {
-                    words += countWords(sum.article.parts[i] && sum.article.parts[i].content);
-                }
-                if (words > 0) dur = Math.max(45, Math.ceil(words / 3.0));
+    function maybeBumpTimeSpent(body, source, fastOpName, dispatch) {
+        if (typeof body !== 'string' || body.length > MAX_SCAN) return { body, changed: false };
+
+        const boostActive = settings.timeBoostEnabled || sessionState.queuedSeconds !== null || sessionState.accumulatedExtraSeconds > 0;
+        const videoActive = settings.fullVideoWatchedEnabled || settings.addVideoDurationToTimeSpent;
+        const predictActive = settings.predictFinalCallEnabled !== false;
+        if (!boostActive && !videoActive && !predictActive) return { body, changed: false };
+
+        const resolvedDispatch = dispatch !== undefined
+            ? dispatch
+            : (fastOpName ? (OP_DISPATCH.get(fastOpName.toLowerCase()) || null) : null);
+        if (resolvedDispatch) {
+            if (!resolvedDispatch.timeSpent) return { body, changed: false };
+        } else if (!TIME_SPENT_RE.test(body)) {
+            return { body, changed: false };
+        }
+
+        let json;
+        try { json = JSON.parse(body); }
+        catch { return { body, changed: false }; }
+
+        let changed = false;
+        let manualResetNeeded = false;
+
+        const patch = (obj) => {
+            if (!obj || !obj.variables) return;
+            const vars = obj.variables;
+
+            const opName = obj.operationName || '';
+            const qStr = typeof obj.query === 'string'
+                ? obj.query
+                : (typeof obj.mutation === 'string' ? obj.mutation : '');
+
+            const isQuestion = isQuestionAnswerOp(opName, qStr);
+            const identifiedQ = isQuestion ? identifyCurrentQuestion(vars, opName, qStr) : null;
+            if (identifiedQ) {
+                sessionState.lastSubmittedQuestionId = identifiedQ.id;
             }
-            if (dur > 0) recordLessonDuration(sum.id, dur);
-            initOrUpdateSession({
-                sessionType: 'SubsectionSummary',
-                sessionId: sum.id,
-                title: sub.name ? `${sub.name} (Summary)` : 'Subsection Summary',
-                moduleUniqueCode: sub.module && sub.module.uniqueCode,
-                subsectionUniqueCode: sub.uniqueCode,
-                durationSeconds: dur,
-                predictedOp: 'CompleteSubsectionSummary',
-                variablesTemplate: { subsectionSummaryId: String(sum.id), percentWatched: 1 },
-            });
-        }
 
-        // 9. GetSubsectionActivity ArticleLesson response
-        if (d.subsection && d.subsection.activity && d.subsection.activity.__typename === 'ArticleLesson' && d.subsection.activity.id) {
-            const sub = d.subsection;
-            const act = sub.activity;
-            let dur = knownLessonDurations.get(String(act.id)) || 0;
-            if (dur <= 0 && act.extraContent) {
-                const words = countWords(act.extraContent);
-                if (words > 0) dur = Math.max(45, Math.ceil(words / 3.0));
+            if (opName === 'CompleteExamQuestionWalkthrough' || qStr.includes('completeExamQuestionWalkthrough')) {
+                const res = patchWalkthroughOp(vars, opName, qStr, source);
+                if (res.changed) changed = true;
+                if (res.manualResetNeeded) manualResetNeeded = true;
+                return;
             }
-            if (dur > 0) recordLessonDuration(act.id, dur);
-            initOrUpdateSession({
-                sessionType: 'ArticleLesson',
-                sessionId: act.id,
-                title: act.title || 'Article Lesson',
-                moduleUniqueCode: sub.module && sub.module.uniqueCode,
-                subsectionUniqueCode: sub.uniqueCode,
-                durationSeconds: dur,
-                predictedOp: 'CompleteArticleLesson',
-                variablesTemplate: { lessonId: String(act.id) },
-            });
-        }
 
-        // 10. Standalone ExamQuestion / QuizContent / StandaloneQuestion
-        if (d.examQuestion && d.examQuestion.id) {
-            analyzeQuestionNode(d.examQuestion, { origin: 'exam_question' });
-        }
-        if (d.quizContent && d.quizContent.id) {
-            analyzeQuestionNode(d.quizContent, { origin: 'standalone' });
-        }
-        if (d.standaloneQuestion && d.standaloneQuestion.id) {
-            analyzeQuestionNode(d.standaloneQuestion, { origin: 'standalone' });
-        }
+            if (isLessonCompletionOp(opName, qStr)) {
+                const res = patchLessonCompletionOp(vars, opName, qStr, source);
+                if (res.changed) changed = true;
+                if (res.manualResetNeeded) manualResetNeeded = true;
+                return;
+            }
 
-        // 11. Answer / Marking mutation responses
-        for (let i = 0; i < ANSWER_RESPONSE_KEYS.length; i++) {
-            const k = ANSWER_RESPONSE_KEYS[i];
-            if (d[k]) processAnswerMutationResponse(k, d[k]);
+            const timeField = resolveTimeField(vars);
+
+            if (isQuizGroupOp(opName, qStr)) {
+                const res = patchQuizGroupOp(vars, timeField, opName, qStr, source, boostActive, predictActive);
+                if (res.changed) changed = true;
+                if (res.manualResetNeeded) manualResetNeeded = true;
+                return;
+            }
+
+            if (boostActive && timeField) {
+                const res = patchQuestionOp(vars, timeField, opName, qStr, source, isQuestion, identifiedQ);
+                if (res.changed) changed = true;
+                if (res.manualResetNeeded) manualResetNeeded = true;
+            }
+        };
+
+        if (Array.isArray(json)) json.forEach(patch);
+        else patch(json);
+
+        if (manualResetNeeded && sessionState.queuedSeconds !== null) {
+            scheduleReset();
         }
+        if (changed) {
+            return { body: JSON.stringify(json), changed: true };
+        }
+        return { body, changed: false };
+    }
+
+    function rewriteBodyText(text) {
+        return maybeBumpTimeSpent(text, 'rewriteBodyText').body;
+    }
+
+    // ============================================================
+    // 12. VIDEO LESSON STATE & AUTO-SKIP PROGRESSION
+    // ============================================================
+    function throttleAutoSkip() {
+        videoState.autoSkipThrottled = true;
+        if (videoState.autoSkipThrottleTimer) clearTimeout(videoState.autoSkipThrottleTimer);
+        videoState.autoSkipThrottleTimer = setTimeout(() => {
+            videoState.autoSkipThrottleTimer = null;
+            videoState.autoSkipThrottled = false;
+        }, 1500);
     }
 
     function findActiveVideoElement() {
         try {
-            // 1. Standard HTML5 video elements in main document
             const videos = document.querySelectorAll('video');
             for (let i = 0; i < videos.length; i++) {
                 const v = videos[i];
@@ -3068,7 +3854,6 @@
             }
             if (videos.length > 0 && videos[0].isConnected) return videos[0];
 
-            // 2. Mux player custom elements
             const muxPlayers = document.querySelectorAll('mux-player');
             for (let i = 0; i < muxPlayers.length; i++) {
                 const mp = muxPlayers[i];
@@ -3079,7 +3864,6 @@
                 if (typeof mp.currentTime === 'number') return mp;
             }
 
-            // 3. Wistia player custom elements or embed containers
             const wistiaPlayers = document.querySelectorAll('wistia-player, .wistia_embed');
             for (let i = 0; i < wistiaPlayers.length; i++) {
                 const wp = wistiaPlayers[i];
@@ -3123,31 +3907,49 @@
         'next question',
     ]);
 
+    const QUESTION_SUBMIT_LABELS = new Set([
+        'submit',
+        'submit answer',
+        'submit answers',
+        'submit response',
+        'check',
+        'check answer',
+        'check answers',
+        'save',
+        'save answer',
+        'save answers',
+        'save marks',
+        'submit marks',
+        'mark',
+        'confirm',
+        'confirm answer',
+        'done',
+    ]);
+
+    const QUESTION_SUBMIT_RE  = /^(submit|check|save|confirm|mark)(\s+(answer|answers|marks|response|part))?$/i;
+    const NON_SUBMIT_LABEL_RE = /search|find|filter|menu|login|sign|logout|cancel|close/i;
+
     function isSubmitLabel(txt) {
         return Boolean(txt) && (QUESTION_SUBMIT_LABELS.has(txt) || QUESTION_SUBMIT_RE.test(txt));
     }
 
     function isQuestionActiveOnPage() {
         try {
-            // Fast path: Check lastResolvedSubmitBtn first
-            if (lastResolvedSubmitBtn && lastResolvedSubmitBtn.isConnected && isCandidateSubmitButton(lastResolvedSubmitBtn)) {
+            if (uiState.lastResolvedSubmitBtn && uiState.lastResolvedSubmitBtn.isConnected && isCandidateSubmitButton(uiState.lastResolvedSubmitBtn)) {
                 return true;
             }
 
             if (typeof document.querySelectorAll === 'function') {
-                // Check question modals / overlays first (very fast, only a few elements)
                 const modals = document.querySelectorAll('[role="dialog"], .quiz-content, [data-testid*="question"]');
                 for (let i = 0; i < modals.length; i++) {
                     if (isElementVisible(modals[i])) return true;
                 }
 
-                // Check visible quiz option inputs
                 const inputs = document.querySelectorAll('input[type="radio"], input[type="checkbox"]');
                 for (let i = 0; i < inputs.length; i++) {
                     if (isElementVisible(inputs[i])) return true;
                 }
 
-                // Single consolidated button loop checking quiz action labels and candidate submit buttons
                 const buttons = document.querySelectorAll('button, [role="button"], input[type="submit"]');
                 for (let i = 0; i < buttons.length; i++) {
                     const btn = buttons[i];
@@ -3156,7 +3958,7 @@
                     if (!txt) continue;
                     const submitMatch = isSubmitLabel(txt);
                     if ((submitMatch || QUIZ_ACTION_LABELS.has(txt)) && isElementVisible(btn)) {
-                        if (submitMatch) lastResolvedSubmitBtn = btn;
+                        if (submitMatch) uiState.lastResolvedSubmitBtn = btn;
                         return true;
                     }
                 }
@@ -3179,62 +3981,66 @@
 
     function checkAndAutoSkipVideo(force = false) {
         if (!settings.autoSkipVideoEnabled && !force) return;
-        if (autoSkipThrottled && !force) return;
+        if (videoState.autoSkipThrottled && !force) return;
 
-        // If already skipped to end-1s and on same active video, avoid redundant layout checks
-        if (!force && lastSkippedTarget === 'end-1s' && lastActiveVideoElement && lastActiveVideoElement.isConnected && !lastActiveVideoElement.ended) {
+        if (
+            !force &&
+            videoState.lastSkippedTarget === 'end-1s' &&
+            videoState.lastActiveVideoElement &&
+            videoState.lastActiveVideoElement.isConnected &&
+            !videoState.lastActiveVideoElement.ended
+        ) {
             return;
         }
 
         const video = findActiveVideoElement();
         if (!video || !video.isConnected || video.ended) return;
 
-        if (video !== lastActiveVideoElement) {
-            lastActiveVideoElement = video;
-            lastSkippedTarget = null;
-            bindVideoEvents(video);
+        if (video !== videoState.lastActiveVideoElement) {
+            videoState.lastActiveVideoElement = video;
+            videoState.lastSkippedTarget = null;
+            // Light-DOM <video> events are already caught by document capture listeners;
+            // only attach direct element listeners when the video lives inside a ShadowRoot.
+            if (typeof video.getRootNode === 'function' && video.getRootNode() !== document) {
+                bindVideoEvents(video);
+            }
         }
 
-        // In real browser playback, wait if video is mid-seek or hasn't loaded metadata yet
         if (!force && (video.seeking || (typeof video.readyState === 'number' && video.readyState < 1))) {
             return;
         }
 
+        const curVid = videoState.currentVideoLesson;
         const duration = (isFinite(video.duration) && video.duration > 0)
             ? video.duration
-            : (currentVideoLesson?.duration || 0);
+            : (curVid?.duration || 0);
 
-        if (duration > 0 && currentVideoLesson && currentVideoLesson.duration <= 0) {
-            currentVideoLesson.duration = duration;
-            if (currentVideoLesson.id) {
-                recordLessonDuration(currentVideoLesson.id, duration);
+        if (duration > 0 && curVid && curVid.duration <= 0) {
+            curVid.duration = duration;
+            if (curVid.id) {
+                recordLessonDuration(curVid.id, duration);
             }
         }
 
-        // If an in-video question or feedback overlay is active on screen, wait for user to answer & click Continue
         if (isQuestionActiveOnPage()) {
             return;
         }
 
-        // If a question was just answered, wait until the user clicks Continue and the video resumes playing
-        if (!force && waitingForPostAnswerResume) {
-            if (video.paused || (Date.now() - lastQuestionAnsweredAt < 1500)) {
+        if (!force && videoState.waitingForPostAnswerResume) {
+            if (video.paused || (Date.now() - videoState.lastQuestionAnsweredAt < 1500)) {
                 return;
             }
-            waitingForPostAnswerResume = false;
+            videoState.waitingForPostAnswerResume = false;
         }
 
-        // In automatic mode, verify that GetVideoLesson metadata has arrived and matches the current lesson URL
         if (!force) {
-            if (!currentVideoLesson) {
-                return;
-            }
+            if (!curVid) return;
             if (
-                currentVideoLesson.uniqueCode &&
+                curVid.uniqueCode &&
                 typeof location !== 'undefined' &&
                 location.pathname &&
                 location.pathname.length > 1 &&
-                !location.pathname.includes(currentVideoLesson.uniqueCode)
+                !location.pathname.includes(curVid.uniqueCode)
             ) {
                 return;
             }
@@ -3242,15 +4048,13 @@
 
         const currentTime = video.currentTime || 0;
 
-        // Skip straight to one second before the video ends (guard duration > 2.0 to avoid seeking 0-duration clips)
         if (duration > 2.0) {
             const target = Math.max(0, duration - 1.0);
-            if (force || (currentTime < target - 0.2 && lastSkippedTarget !== 'end-1s')) {
-                lastSkippedTarget = 'end-1s';
+            if (force || (currentTime < target - 0.2 && videoState.lastSkippedTarget !== 'end-1s')) {
+                videoState.lastSkippedTarget = 'end-1s';
                 throttleAutoSkip();
 
                 LOG(`[autoSkip] Skipping straight to 1s before video ends (${formatSeconds(target)} / ${formatSeconds(duration)})`);
-                nativeConsole.log(`[UpLearn Video] Auto-skipping video from ${formatSeconds(currentTime)} to 1 second before end (${formatSeconds(target)} / ${formatSeconds(duration)})`);
                 try {
                     video.currentTime = target;
                     video.dispatchEvent(new Event('timeupdate', { bubbles: true }));
@@ -3281,13 +4085,12 @@
         }
     }
 
-    let mediaListenersInstalled = false;
     function installVideoMediaListeners() {
-        if (mediaListenersInstalled) return;
-        mediaListenersInstalled = true;
-        document.addEventListener('loadedmetadata', onVideoMediaEvent, true);
-        document.addEventListener('play', onVideoMediaEvent, true);
-        document.addEventListener('playing', onVideoMediaEvent, true);
+        if (videoState.mediaListenersInstalled) return;
+        videoState.mediaListenersInstalled = true;
+        safeDocAdd('loadedmetadata', onVideoMediaEvent, true);
+        safeDocAdd('play', onVideoMediaEvent, true);
+        safeDocAdd('playing', onVideoMediaEvent, true);
     }
 
     function initVideoAutoSkipController() {
@@ -3297,9 +4100,9 @@
         }
     }
 
-    /* ------------------------------------------------------------
-     * Manual "Add Time" Button UI & Styles
-     * ------------------------------------------------------------ */
+    // ============================================================
+    // 13. MANUAL "ADD TIME" BUTTON (SINGLE-PASS FINDER & INLINE UI)
+    // ============================================================
     const MANUAL_BUTTON_CSS = `
 #${MANUAL_BUTTON_ID} {
     display: inline-flex;
@@ -3311,7 +4114,7 @@
     height: 40px;
     border-radius: 20px;
     border: none;
-    background-color: var(--lg-glass, rgba(255, 255, 255, 0.65));
+    background-color: var(--lg-glass, rgba(255, 255, 255, 0.72));
     -webkit-backdrop-filter: blur(18px) saturate(1.8);
     backdrop-filter: blur(18px) saturate(1.8);
     box-shadow: inset 0 0 0 0.5px var(--lg-edge, rgba(0, 0, 0, 0.08)), 0 1px 3px var(--lg-drop, rgba(0, 0, 0, 0.06));
@@ -3332,8 +4135,8 @@
     min-width: 110px;
 }
 html.ul-dark-mode #${MANUAL_BUTTON_ID} {
-    background-color: var(--lg-glass, rgba(40, 40, 40, 0.65));
-    box-shadow: inset 0 0 0 0.5px var(--lg-edge, rgba(255, 255, 255, 0.08));
+    background-color: var(--lg-glass, rgba(40, 40, 40, 0.72));
+    box-shadow: inset 0 0 0 0.5px var(--lg-edge, rgba(255, 255, 255, 0.12));
     color: var(--lg-foreground, #ffffff);
 }
 #${MANUAL_BUTTON_ID}::after {
@@ -3347,29 +4150,41 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID} {
     transition: opacity 200ms ease-in-out;
 }
 #${MANUAL_BUTTON_ID}:hover {
-    background-color: var(--lg-glass-active, rgba(236, 236, 240, 0.85));
+    background-color: var(--lg-glass-active, rgba(236, 236, 240, 0.88));
     transform: translateY(-0.5px);
 }
 html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
-    background-color: var(--lg-glass-active, rgba(70, 70, 70, 0.62));
+    background-color: var(--lg-glass-active, rgba(70, 70, 70, 0.72));
 }
 #${MANUAL_BUTTON_ID}:active {
     transform: scale(0.97);
-    background-color: var(--lg-glass-active);
+    background-color: var(--lg-glass-active, rgba(220, 220, 226, 0.92));
+}
+html.ul-dark-mode #${MANUAL_BUTTON_ID}:active {
+    background-color: var(--lg-glass-active, rgba(85, 85, 85, 0.78));
 }
 #${MANUAL_BUTTON_ID}:active::after {
     opacity: 1;
 }
 #${MANUAL_BUTTON_ID}.us-active {
-    background-color: var(--lg-fill, #0088ff) !important;
+    background-color: var(--ul-accent, #007aff) !important;
     color: #ffffff !important;
-    box-shadow: 0 2px 10px rgba(0, 136, 255, 0.35), inset 0 0 0 0.5px rgba(255, 255, 255, 0.25) !important;
+    box-shadow: 0 2px 10px color-mix(in srgb, var(--ul-accent, #007aff) 35%, transparent), inset 0 0 0 0.5px rgba(255, 255, 255, 0.25) !important;
+}
+#${MANUAL_BUTTON_ID}.us-error {
+    background-color: #ff3b30 !important;
+    color: #ffffff !important;
+    box-shadow: 0 2px 10px rgba(255, 59, 48, 0.35), inset 0 0 0 0.5px rgba(255, 255, 255, 0.25) !important;
+    animation: us-pop .35s ease;
 }
 #${MANUAL_BUTTON_ID}.us-editing {
     padding: 0;
     background-color: var(--lg-surface, rgba(255, 255, 255, 0.95));
-    box-shadow: 0 0 0 2px var(--lg-fill, #0088ff);
+    box-shadow: 0 0 0 2px var(--ul-accent, #007aff);
     cursor: text;
+}
+html.ul-dark-mode #${MANUAL_BUTTON_ID}.us-editing {
+    background-color: var(--lg-surface, rgba(28, 28, 32, 0.95));
 }
 #${MANUAL_BUTTON_ID} input.us-input {
     border: none;
@@ -3403,28 +4218,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         (document.head || document.documentElement).appendChild(style);
     }
 
-    const QUESTION_SUBMIT_LABELS = new Set([
-        'submit',
-        'submit answer',
-        'submit answers',
-        'submit response',
-        'check',
-        'check answer',
-        'check answers',
-        'save',
-        'save answer',
-        'save answers',
-        'save marks',
-        'submit marks',
-        'mark',
-        'confirm',
-        'confirm answer',
-        'done',
-    ]);
-
-    const QUESTION_SUBMIT_RE = /^(submit|check|save|confirm|mark)(\s+(answer|answers|marks|response|part))?$/i;
-    const NON_SUBMIT_LABEL_RE = /search|find|filter|menu|login|sign|logout|cancel|close/i;
-
     const cleanedTextCache = new WeakMap();
 
     function getCleanElementText(el) {
@@ -3439,77 +4232,68 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         return cleaned;
     }
 
-    let lastResolvedSubmitBtn = null;
+    function matchesSubmitCandidateFast(btn) {
+        if (!btn || btn.id === MANUAL_BUTTON_ID) return false;
+        const txt = getCleanElementText(btn);
+        if (isSubmitLabel(txt)) return true;
+        if (
+            typeof btn.getAttribute === 'function' &&
+            btn.getAttribute('type') === 'submit' &&
+            txt.length > 0 &&
+            txt.length < 30 &&
+            !NON_SUBMIT_LABEL_RE.test(txt)
+        ) {
+            return true;
+        }
+        return false;
+    }
 
     function isCandidateSubmitButton(btn) {
-        if (!btn || !btn.isConnected || btn.id === MANUAL_BUTTON_ID) return false;
-
-        const txt = getCleanElementText(btn);
-        let matches = isSubmitLabel(txt);
-        if (!matches && typeof btn.getAttribute === 'function' && btn.getAttribute('type') === 'submit' && txt.length > 0 && txt.length < 30) {
-            if (!NON_SUBMIT_LABEL_RE.test(txt)) {
-                matches = true;
-            }
-        }
-        if (!matches) return false;
-
-        // Check layout visibility ONLY after text confirms candidate status (avoids forced layout reflows)
+        if (!btn || !btn.isConnected || !matchesSubmitCandidateFast(btn)) return false;
+        // Layout visibility check runs ONLY after fast tag/text checks confirm candidate status
         return isElementVisible(btn);
     }
 
+    // Consolidated single-pass submit button finder with zero Set allocations
+    // and zero layout reads on non-matching buttons.
     function findSubmitButton() {
-        // Fast-path: Check previously resolved button if still connected and valid
-        if (lastResolvedSubmitBtn && lastResolvedSubmitBtn.isConnected && isCandidateSubmitButton(lastResolvedSubmitBtn)) {
-            return lastResolvedSubmitBtn;
+        if (uiState.lastResolvedSubmitBtn && uiState.lastResolvedSubmitBtn.isConnected && isCandidateSubmitButton(uiState.lastResolvedSubmitBtn)) {
+            return uiState.lastResolvedSubmitBtn;
         }
 
-        let checkedBtns = null;
-
-        // 1. Search inside active question/quiz containers first
-        const containers = document.querySelectorAll('[role="dialog"], .quiz-content, [data-testid*="question"], [data-testid*="quiz"], .question');
-        for (let c = 0; c < containers.length; c++) {
-            const container = containers[c];
-            if (!isElementVisible(container)) continue;
-
-            const btns = container.querySelectorAll('button, input[type="submit"], [role="button"]');
-            if (btns.length > 0 && !checkedBtns) checkedBtns = new Set();
-            for (let i = 0; i < btns.length; i++) {
-                const b = btns[i];
-                if (checkedBtns) setAdd.call(checkedBtns, b);
-                if (isCandidateSubmitButton(b)) {
-                    lastResolvedSubmitBtn = b;
-                    return b;
-                }
-            }
-        }
-
-        // 2. Global search across all buttons in document (skipping buttons already checked above)
         const allButtons = document.querySelectorAll('button, input[type="submit"], [role="button"]');
+        let fallbackCandidate = null;
+
         for (let i = 0; i < allButtons.length; i++) {
             const b = allButtons[i];
-            if (checkedBtns && setHas.call(checkedBtns, b)) continue;
-            if (isCandidateSubmitButton(b)) {
-                lastResolvedSubmitBtn = b;
+            if (!matchesSubmitCandidateFast(b)) continue;
+            if (!isElementVisible(b)) continue;
+
+            if (typeof b.closest === 'function' && b.closest('[role="dialog"], .quiz-content, [data-testid*="question"], [data-testid*="quiz"], .question')) {
+                uiState.lastResolvedSubmitBtn = b;
                 return b;
+            }
+            if (!fallbackCandidate) {
+                fallbackCandidate = b;
             }
         }
 
-        lastResolvedSubmitBtn = null;
-        return null;
+        uiState.lastResolvedSubmitBtn = fallbackCandidate;
+        return fallbackCandidate;
     }
 
-    let pulseTimer = null;
     const stopPropagation = (e) => e.stopPropagation();
 
     function buildButtonContextSuffix() {
         const q = identifyCurrentQuestion();
-        const pred = activeSession && activeSession.predictedFinalCall;
+        const session = sessionState.activeSession;
+        const pred = session && session.predictedFinalCall;
         const parts = [];
         if (q) {
-            const idxNum = (activeSession && activeSession.questionIds && activeSession.questionIds.length > 0)
-                ? (activeSession.questionIds.indexOf(q.id) + 1) || ((activeSession.currentQuestionIndex || 0) + 1)
+            const idxNum = (session && session.questionIds && session.questionIds.length > 0)
+                ? (session.questionIds.indexOf(q.id) + 1) || ((session.currentQuestionIndex || 0) + 1)
                 : 0;
-            const totalQ = (activeSession && activeSession.questionIds) ? activeSession.questionIds.length : 0;
+            const totalQ = (session && session.questionIds) ? session.questionIds.length : 0;
             const prefix = (idxNum > 0 && totalQ > 0) ? `Q${idxNum}/${totalQ} ` : '';
             parts.push(`Active: ${prefix}${q.primaryType || 'Question'} (~${q.recommendedSeconds}s)`);
         }
@@ -3520,35 +4304,35 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     }
 
     function updateLabel(btn, pulse) {
-        if (editing) return;          // never clobber the input
+        if (sessionState.editing) return;
         btn = btn || document.getElementById(MANUAL_BUTTON_ID);
         if (!btn) return;
 
-        const nextText = (queuedSeconds !== null) ? ('\u23F1 +' + formatSeconds(queuedSeconds)) : '\u23F1 Add time';
+        const qSec = sessionState.queuedSeconds;
+        const nextText = (qSec !== null) ? ('\u23F1 +' + formatSeconds(qSec)) : '\u23F1 Add time';
         if (btn.textContent !== nextText) {
             btn.textContent = nextText;
         }
 
-        const nextActive = queuedSeconds !== null;
+        const nextActive = qSec !== null;
         if (btn.classList.contains('us-active') !== nextActive) {
             btn.classList.toggle('us-active', nextActive);
         }
 
-        const ctxSuffix = buildButtonContextSuffix();
-        const nextTitle = (queuedSeconds !== null)
-            ? 'Extra: +' + toIso(queuedSeconds) + ' (added on top of UpLearn\'s own timeSpent). Click to edit.' + ctxSuffix
-            : 'Set extra time added on top of UpLearn\'s own timeSpent' + ctxSuffix;
-        if (btn.title !== nextTitle) {
-            btn.title = nextTitle;
+        const baseTitle = (qSec !== null)
+            ? 'Extra: +' + toIso(qSec) + ' (added on top of UpLearn\'s own timeSpent). Click to edit.'
+            : 'Set extra time added on top of UpLearn\'s own timeSpent';
+        if (btn.title !== baseTitle) {
+            btn.title = baseTitle;
         }
 
         if (pulse) {
-            if (pulseTimer) clearTimeout(pulseTimer);
+            if (sessionState.pulseTimer) clearTimeout(sessionState.pulseTimer);
             btn.classList.remove('us-reset');
             void btn.offsetWidth;
             btn.classList.add('us-reset');
-            pulseTimer = setTimeout(() => {
-                pulseTimer = null;
+            sessionState.pulseTimer = setTimeout(() => {
+                sessionState.pulseTimer = null;
                 btn.classList.remove('us-reset');
             }, 500);
         }
@@ -3556,9 +4340,15 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
     function enterEditMode() {
         const btn = document.getElementById(MANUAL_BUTTON_ID);
-        if (!btn || editing) return;
+        if (!btn || sessionState.editing) return;
 
-        editing = true;
+        if (sessionState.errorTimer) {
+            clearTimeout(sessionState.errorTimer);
+            sessionState.errorTimer = null;
+            btn.classList.remove('us-error');
+        }
+
+        sessionState.editing = true;
         btn.classList.add('us-editing');
         btn.textContent = '';
 
@@ -3569,7 +4359,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         input.spellcheck   = false;
         input.className    = 'us-input';
         input.placeholder  = 'seconds';
-        input.value        = queuedSeconds !== null ? String(round3(queuedSeconds)) : '';
+        input.value        = sessionState.queuedSeconds !== null ? String(round3(sessionState.queuedSeconds)) : '';
 
         input.addEventListener('click',     stopPropagation);
         input.addEventListener('mousedown', stopPropagation);
@@ -3595,12 +4385,12 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     }
 
     function onInputBlur(e) {
-        if (!editing) return;
+        if (!sessionState.editing) return;
         commitEdit(e.target.value);
     }
 
     function teardownInput() {
-        editing = false;
+        sessionState.editing = false;
         const btn = document.getElementById(MANUAL_BUTTON_ID);
         if (!btn) return null;
         btn.classList.remove('us-editing');
@@ -3610,41 +4400,48 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     }
 
     function commitEdit(rawValue) {
-        if (!editing) return;
-        teardownInput();
+        if (!sessionState.editing) return;
+        const btn = teardownInput();
 
         const raw = (rawValue || '').trim();
 
         if (!raw) {
-            queuedSeconds = null;
+            sessionState.queuedSeconds = null;
+            if (sessionState.activeSession) updatePredictedFinalCall(sessionState.activeSession);
+            bumpContextRevision();
             updateLabel();
             return;
         }
 
         const secs = parseDurationToSeconds(raw);
         if (secs == null || secs < 0) {
-            window.alert(
-                'Could not understand "' + raw + '".\n\n' +
-                'Enter a number of seconds (e.g. 120), or 1:30, 2m30s, PT45S.'
-            );
-            updateLabel();
+            WARN(`[timeSpent] Invalid manual duration "${raw}". Try seconds (e.g. 120), 1:30, 2m30s, or PT45S.`);
+            if (btn) {
+                btn.classList.add('us-error');
+                btn.textContent = '⚠ Invalid';
+                btn.title = `Could not parse "${raw}". Enter seconds (e.g. 120), 1:30, 2m30s, or PT45S.`;
+                if (sessionState.errorTimer) clearTimeout(sessionState.errorTimer);
+                sessionState.errorTimer = setTimeout(() => {
+                    sessionState.errorTimer = null;
+                    btn.classList.remove('us-error');
+                    updateLabel(btn);
+                }, 1600);
+            }
             return;
         }
 
-        queuedSeconds = secs;
+        sessionState.queuedSeconds = secs;
+        if (sessionState.activeSession) updatePredictedFinalCall(sessionState.activeSession);
+        bumpContextRevision();
         updateLabel(null, true);
         LOG(
             '[timeSpent] manual extra set to +' + formatSeconds(secs) +
             ' (' + toIso(secs) + ')'
         );
-        nativeConsole.log(
-            '[UpLearn timeSpent] extra set to +' + formatSeconds(secs) +
-            ' (' + toIso(secs) + ')'
-        );
     }
 
     function cancelEdit() {
-        if (!editing) return;
+        if (!sessionState.editing) return;
         teardownInput();
         updateLabel();
     }
@@ -3652,12 +4449,12 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     function onButtonClick(e) {
         e.preventDefault();
         e.stopPropagation();
-        if (editing) return;
+        if (sessionState.editing) return;
         enterEditMode();
     }
 
     function onButtonKeyDown(e) {
-        if (editing) return;
+        if (sessionState.editing) return;
         if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
             enterEditMode();
@@ -3673,7 +4470,15 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         btn.addEventListener('keydown', onButtonKeyDown, false);
         let btnRect = null;
         const refreshRect = () => { btnRect = btn.getBoundingClientRect(); };
-        btn.addEventListener('pointerenter', refreshRect);
+        const updateTitleWithContext = () => {
+            const qSec = sessionState.queuedSeconds;
+            const baseTitle = (qSec !== null)
+                ? 'Extra: +' + toIso(qSec) + ' (added on top of UpLearn\'s own timeSpent). Click to edit.'
+                : 'Set extra time added on top of UpLearn\'s own timeSpent';
+            btn.title = baseTitle + buildButtonContextSuffix();
+        };
+        btn.addEventListener('pointerenter', () => { refreshRect(); updateTitleWithContext(); });
+        btn.addEventListener('focus', updateTitleWithContext);
         btn.addEventListener('pointerdown', refreshRect);
         btn.addEventListener('pointerleave', () => { btnRect = null; });
         btn.addEventListener('pointermove', (e) => {
@@ -3688,21 +4493,29 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     function removeButton() {
         const mine = document.getElementById(MANUAL_BUTTON_ID);
         if (mine && mine.isConnected) mine.remove();
-        editing = false;
+        sessionState.editing = false;
+    }
+
+    function clearManualButtonState() {
+        if (uiState.manualBtnTimer !== null) {
+            clearTimeout(uiState.manualBtnTimer);
+            uiState.manualBtnTimer = null;
+        }
+        uiState.lastResolvedSubmitBtn = null;
+        removeButton();
+        sessionState.queuedSeconds = null;
+        sessionState.editing = false;
     }
 
     function ensureButton() {
         if (!settings.manualTimeButtonEnabled) {
-            removeButton();
-            queuedSeconds = null;
-            editing = false;
+            clearManualButtonState();
             return;
         }
 
         const submit = findSubmitButton();
-
         if (!submit) {
-            if (!editing) {
+            if (!sessionState.editing) {
                 removeButton();
             }
             return;
@@ -3711,14 +4524,12 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         injectButtonStyles();
 
         let mine = document.getElementById(MANUAL_BUTTON_ID);
-
         if (mine && mine.isConnected && submit.nextElementSibling === mine) {
             updateLabel(mine);
             return;
         }
 
-        if (editing) return;
-
+        if (sessionState.editing) return;
         if (!mine) mine = createButton();
 
         if (submit.parentNode) {
@@ -3728,540 +4539,19 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     }
 
     function scheduleReset() {
-        if (resetScheduled) return;
-        resetScheduled = true;
+        if (sessionState.resetScheduled) return;
+        sessionState.resetScheduled = true;
         setTimeout(() => {
-            queuedSeconds = null;
-            resetScheduled = false;
+            sessionState.queuedSeconds = null;
+            sessionState.resetScheduled = false;
+            if (sessionState.activeSession) updatePredictedFinalCall(sessionState.activeSession);
+            bumpContextRevision();
             updateLabel();
         }, 0);
     }
 
-    function isRelevantQuestionMutationNode(node) {
-        if (!node || node.nodeType !== 1) return false;
-        if (node === uiHostEl) return false;
-        const tid = node.id;
-        if (tid === MANUAL_BUTTON_ID || (typeof tid === 'string' && tid.includes('__ul-'))) return false;
-
-        const tag = node.tagName;
-        if (tag === 'BUTTON' || tag === 'INPUT') return true;
-
-        const role = typeof node.getAttribute === 'function' ? node.getAttribute('role') : null;
-        if (role === 'button' || role === 'dialog') return true;
-
-        const cls = typeof node.className === 'string' ? node.className : '';
-        if (cls.includes('quiz') || cls.includes('question') || cls.includes('modal') || cls.includes('dialog')) return true;
-
-        if (node.firstElementChild !== null && typeof node.querySelector === 'function') {
-            return !!node.querySelector('button, input[type="submit"], [role="button"], [role="dialog"], .quiz-content, [data-testid*="question"], [data-testid*="quiz"], .question');
-        }
-        return false;
-    }
-
-    let manualBtnScheduled = false;
-    function scheduleEnsureButton() {
-        if (!settings.manualTimeButtonEnabled || manualBtnScheduled) return;
-        manualBtnScheduled = true;
-        setTimeout(() => {
-            manualBtnScheduled = false;
-            ensureButton();
-        }, 150);
-    }
-
-
-
-    /* ------------------------------------------------------------
-     * Body Rewriting & Network Injection
-     * ------------------------------------------------------------ */
-    const TIME_SPENT_RE = /timeSpent|completeVideoLesson|completeSubsectionSummary|completeArticleLesson|completeExamQuestionWalkthrough|completeProgressQuizGroup|completeStrengthenQuiz|completeSpacedPracticeQuiz|completeDiagnosticQuizSession|saveExamPractice|completeExamPracticeSession/i;
-
-    function resolveTimeField(vars) {
-        if (vars.timeSpent != null) return 'timeSpent';
-        if (vars.timeSpentAnswering != null) return 'timeSpentAnswering';
-        if (vars.timeSpentMarking != null) return 'timeSpentMarking';
-        return null;
-    }
-
-    function formatUpdatedDuration(rawVal, newTotal) {
-        if (typeof rawVal === 'string') {
-            const c0 = rawVal.charCodeAt(0);
-            return (c0 === 80 || c0 === 112) ? toIso(newTotal) : String(round3(newTotal));
-        }
-        return typeof rawVal === 'number' ? round3(newTotal) : String(round3(newTotal));
-    }
-
-    function computeManualExtra(questionDesc, origSeconds, opName, qStr) {
-        if (settings.manualTimeStacksWithAuto && settings.timeBoostEnabled) {
-            const autoExtra = settings.dynamicTimeEnabled
-                ? computeDynamicExtraSeconds(questionDesc, origSeconds, opName, qStr)
-                : pickExtraSeconds();
-            return queuedSeconds + autoExtra;
-        }
-        return queuedSeconds;
-    }
-
-    function estimateArticleDurationSeconds() {
-        try {
-            if (typeof document !== 'undefined' && typeof document.querySelector === 'function') {
-                const el = document.querySelector('main, article, [class*="article"], #react-content');
-                if (el && el.textContent) {
-                    const words = countWords(el.textContent);
-                    if (words > 20) return Math.min(420, Math.max(45, Math.ceil(words / 3.0)));
-                }
-            }
-        } catch {}
-        return 0;
-    }
-
-    function completeSessionAccumulators(sessionToComplete) {
-        if (sessionToComplete) {
-            sessionToComplete.completed = true;
-            sessionToComplete.totalExtraQuestionSeconds = 0;
-            sessionToComplete.totalSubmittedQuestionSeconds = 0;
-        }
-        accumulatedExtraSeconds = 0;
-        accumulatedQuestionCount = 0;
-    }
-
-    function maybeBumpTimeSpent(body, source) {
-        if (typeof body !== 'string' || body.length > MAX_SCAN) return { body, changed: false };
-
-        const boostActive = settings.timeBoostEnabled || queuedSeconds !== null || accumulatedExtraSeconds > 0;
-        const videoActive = settings.fullVideoWatchedEnabled || settings.addVideoDurationToTimeSpent;
-        const predictActive = settings.predictFinalCallEnabled !== false;
-        if (!boostActive && !videoActive && !predictActive) return { body, changed: false };
-
-        if (!TIME_SPENT_RE.test(body)) return { body, changed: false };
-
-        let json;
-        try { json = JSON.parse(body); }
-        catch { return { body, changed: false }; }
-
-        let changed = false;
-        let manualResetNeeded = false;
-
-        const patch = (obj) => {
-            if (!obj || !obj.variables) return;
-            const vars = obj.variables;
-
-            const opName = obj.operationName || '';
-            const qStr = typeof obj.query === 'string'
-                ? obj.query
-                : (typeof obj.mutation === 'string' ? obj.mutation : '');
-
-            const isQuestion = isQuestionAnswerOp(opName, qStr);
-            const identifiedQ = isQuestion ? identifyCurrentQuestion(vars, opName, qStr) : null;
-            if (identifiedQ) {
-                lastSubmittedQuestionId = identifiedQ.id;
-            }
-
-            // 1. CompleteExamQuestionWalkthrough (has timeSpentAnswering, timeSpentMarking, timeSpentWatching, percentWatched)
-            const isWalkthrough = opName === 'CompleteExamQuestionWalkthrough' || qStr.includes('completeExamQuestionWalkthrough');
-            if (isWalkthrough) {
-                const lessonId = String(vars.lessonId || '');
-                const qDesc = lookupQuestion(lessonId) || identifyCurrentQuestion();
-                const matchSession = (activeSession && activeSession.sessionType === 'ExamQuestionWalkthrough' && (!lessonId || activeSession.sessionId === lessonId))
-                    ? activeSession
-                    : null;
-
-                let vidDuration = (lessonId && knownLessonDurations.get(lessonId)) || (matchSession ? matchSession.durationSeconds : 0) || 0;
-                if (vidDuration <= 0) {
-                    const activeVid = findActiveVideoElement();
-                    if (activeVid && isFinite(activeVid.duration) && activeVid.duration > 0) {
-                        vidDuration = Math.round(activeVid.duration);
-                    }
-                }
-
-                let totalAdded = 0;
-                let manualConsumed = false;
-
-                if (vars.timeSpentAnswering != null) {
-                    const rawAns = vars.timeSpentAnswering;
-                    const origAns = parseDurationToSeconds(rawAns);
-                    if (origAns !== null) {
-                        let targetAns = origAns;
-                        if (matchSession && matchSession.answeringSubmittedSeconds > 0) {
-                            targetAns = origAns + (matchSession.answeringExtraSeconds || 0);
-                            if (settings.predictFinalCallEnabled !== false) {
-                                targetAns = Math.max(targetAns, matchSession.answeringSubmittedSeconds);
-                            }
-                        } else if (settings.timeBoostEnabled) {
-                            const extraAns = settings.dynamicTimeEnabled
-                                ? computeDynamicExtraSeconds(qDesc, origAns, 'AnswerExamQuestion', '')
-                                : pickExtraSeconds();
-                            targetAns = origAns + extraAns;
-                        }
-                        if (queuedSeconds !== null && vars.timeSpentMarking == null) {
-                            targetAns += computeManualExtra(qDesc, origAns, 'AnswerExamQuestion', '');
-                            manualResetNeeded = true;
-                            manualConsumed = true;
-                        }
-                        targetAns = round3(targetAns);
-                        if (targetAns > origAns) {
-                            vars.timeSpentAnswering = formatUpdatedDuration(rawAns, targetAns);
-                            totalAdded += (targetAns - origAns);
-                            changed = true;
-                        }
-                    }
-                }
-
-                if (vars.timeSpentMarking != null) {
-                    const rawMark = vars.timeSpentMarking;
-                    const origMark = parseDurationToSeconds(rawMark);
-                    if (origMark !== null) {
-                        let targetMark = origMark;
-                        if (matchSession && matchSession.markingSubmittedSeconds > 0) {
-                            targetMark = origMark + (matchSession.markingExtraSeconds || 0);
-                            if (settings.predictFinalCallEnabled !== false) {
-                                targetMark = Math.max(targetMark, matchSession.markingSubmittedSeconds);
-                            }
-                        } else if (settings.timeBoostEnabled) {
-                            const extraMark = settings.dynamicTimeEnabled
-                                ? computeDynamicExtraSeconds(qDesc, origMark, 'SaveExamQuestionMarks', '')
-                                : pickExtraSeconds();
-                            targetMark = origMark + extraMark;
-                        }
-                        if (queuedSeconds !== null && !manualConsumed) {
-                            targetMark += computeManualExtra(qDesc, origMark, 'SaveExamQuestionMarks', '');
-                            manualResetNeeded = true;
-                            manualConsumed = true;
-                        }
-                        targetMark = round3(targetMark);
-                        if (targetMark > origMark) {
-                            vars.timeSpentMarking = formatUpdatedDuration(rawMark, targetMark);
-                            totalAdded += (targetMark - origMark);
-                            changed = true;
-                        }
-                    }
-                }
-
-                if (settings.addVideoDurationToTimeSpent && vidDuration > 0) {
-                    if (vars.timeSpentWatching != null) {
-                        const rawWatch = vars.timeSpentWatching;
-                        const origWatch = parseDurationToSeconds(rawWatch) || 0;
-                        vars.timeSpentWatching = formatUpdatedDuration(rawWatch, origWatch + vidDuration);
-                        bumpStat('videoTimeAdded', vidDuration);
-                        changed = true;
-                    } else if (!qStr || qStr.includes('$timeSpentWatching')) {
-                        vars.timeSpentWatching = toIso(vidDuration);
-                        bumpStat('videoTimeAdded', vidDuration);
-                        changed = true;
-                    }
-                }
-
-                if (settings.fullVideoWatchedEnabled && vars.percentWatched !== undefined) {
-                    const beforePercent = vars.percentWatched;
-                    const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
-                    if (beforePercent !== targetPercent) {
-                        vars.percentWatched = targetPercent;
-                        bumpStat('videosMaxed');
-                        changed = true;
-                    }
-                }
-
-                if (totalAdded > 0) {
-                    bumpStat('groupExtra', round3(totalAdded));
-                }
-                if (changed) {
-                    bumpStat('seen');
-                    bumpStat('finalCallsModified');
-                    LOG(`[${source}] CompleteExamQuestionWalkthrough synced: ans=${vars.timeSpentAnswering}, mark=${vars.timeSpentMarking}, watch=${vars.timeSpentWatching}, pct=${vars.percentWatched}`);
-                }
-                completeSessionAccumulators(matchSession);
-                bumpContextRevision();
-                return;
-            }
-
-            // 2. Lesson & Summary completion calls (CompleteVideoLesson, CompleteSubsectionSummary, CompleteArticleLesson)
-            if (isLessonCompletionOp(opName, qStr)) {
-                const isVideo = opName === VIDEO_OP || qStr.includes(VIDEO_OP) || qStr.includes('completeVideoLesson');
-                const isSummary = opName === 'CompleteSubsectionSummary' || qStr.includes('completeSubsectionSummary');
-                const isArticle = opName === 'CompleteArticleLesson' || qStr.includes('completeArticleLesson');
-                const lessonId = String(vars.lessonId || vars.subsectionSummaryId || '');
-                const displayOp = opName || (isVideo ? VIDEO_OP : (isSummary ? 'CompleteSubsectionSummary' : 'CompleteArticleLesson'));
-
-                let lessonTouched = false;
-
-                // 2a. Force 100% full watched (Video & Summary)
-                if ((isVideo || isSummary) && settings.fullVideoWatchedEnabled && vars.percentWatched !== undefined) {
-                    const beforePercent = vars.percentWatched;
-                    const targetPercent = (typeof beforePercent === 'string') ? '1' : 1;
-                    if (beforePercent !== targetPercent) {
-                        vars.percentWatched = targetPercent;
-                        bumpStat('videosMaxed');
-                        lessonTouched = true;
-                        changed = true;
-
-                        LOG(`[${source}] ${displayOp}: percentWatched ${beforePercent} → ${targetPercent} (id: ${lessonId || 'unknown'})`);
-                        if (isVideo) {
-                            nativeConsole.log(
-                                `[UpLearn Video] ${VIDEO_OP} lessonId=${lessonId || 'unknown'} original percentWatched=${beforePercent} → ${targetPercent}`
-                            );
-                        }
-                    }
-                }
-
-                // 2b. Resolve duration and combine with session question bonuses
-                let knownDur = (lessonId && knownLessonDurations.get(lessonId)) || 0;
-                if (knownDur <= 0 && activeSession && (!lessonId || activeSession.sessionId === lessonId)) {
-                    knownDur = activeSession.durationSeconds || 0;
-                }
-                if (isVideo) {
-                    if (knownDur <= 0 && currentVideoLesson && (currentVideoLesson.id === lessonId || !lessonId)) {
-                        knownDur = currentVideoLesson.duration || 0;
-                    }
-                    if (knownDur <= 0) {
-                        const activeVid = findActiveVideoElement();
-                        if (activeVid && isFinite(activeVid.duration) && activeVid.duration > 0) {
-                            knownDur = Math.round(activeVid.duration);
-                        }
-                    }
-                    if (knownDur <= 0 && currentVideoLesson && currentVideoLesson.duration > 0) {
-                        knownDur = currentVideoLesson.duration;
-                    }
-                } else if (isArticle && knownDur <= 0) {
-                    knownDur = estimateArticleDurationSeconds();
-                }
-
-                const rawTimeSpent = vars.timeSpent;
-                const origTimeSpent = (typeof rawTimeSpent === 'number' && isFinite(rawTimeSpent))
-                    ? rawTimeSpent
-                    : (parseDurationToSeconds(rawTimeSpent) || 0);
-
-                let extraTime = 0;
-                if ((isVideo || isSummary) && settings.addVideoDurationToTimeSpent && knownDur > 0) {
-                    extraTime += knownDur;
-                } else if (isArticle && settings.timeBoostEnabled) {
-                    extraTime += (knownDur > 0)
-                        ? knownDur
-                        : (settings.dynamicTimeEnabled ? computeDynamicExtraSeconds(null, origTimeSpent, displayOp, qStr) : pickExtraSeconds());
-                }
-
-                const matchVidSession = (isVideo && activeSession && activeSession.sessionType === 'VideoLesson' && (!lessonId || activeSession.sessionId === lessonId))
-                    ? activeSession
-                    : null;
-                if (isVideo && settings.predictFinalCallEnabled !== false) {
-                    const qExtra = matchVidSession ? (matchVidSession.totalExtraQuestionSeconds || 0) : accumulatedExtraSeconds;
-                    if (qExtra > 0) {
-                        extraTime += qExtra;
-                    }
-                }
-
-                if (queuedSeconds !== null) {
-                    extraTime += computeManualExtra(null, origTimeSpent, displayOp, qStr);
-                    manualResetNeeded = true;
-                }
-
-                let newTimeSpent = round3(origTimeSpent + extraTime);
-                if (matchVidSession && settings.predictFinalCallEnabled !== false && matchVidSession.totalSubmittedQuestionSeconds > 0) {
-                    const floorTotal = round3(matchVidSession.totalSubmittedQuestionSeconds + (settings.addVideoDurationToTimeSpent ? knownDur : 0));
-                    if (newTimeSpent < floorTotal) {
-                        newTimeSpent = floorTotal;
-                    }
-                }
-
-                if (rawTimeSpent !== undefined && newTimeSpent > origTimeSpent) {
-                    vars.timeSpent = formatUpdatedDuration(rawTimeSpent, newTimeSpent);
-
-                    if ((isVideo || isSummary) && settings.addVideoDurationToTimeSpent && knownDur > 0) {
-                        bumpStat('videoTimeAdded', knownDur);
-                    }
-                    lessonTouched = true;
-                    changed = true;
-
-                    const deltaLogged = round3(newTimeSpent - origTimeSpent);
-                    LOG(`[${source}] ${displayOp}: timeSpent ${rawTimeSpent} (+${formatSeconds(deltaLogged)}) → ${vars.timeSpent} (id: ${lessonId || 'unknown'})`);
-                    if (isVideo) {
-                        nativeConsole.log(
-                            `[UpLearn Video] ${VIDEO_OP} lessonId=${lessonId || 'unknown'} original timeSpent=${rawTimeSpent} (+${formatSeconds(deltaLogged)}) → ${vars.timeSpent}`
-                        );
-                    }
-                }
-
-                if (lessonTouched) {
-                    bumpStat('seen');
-                    bumpStat('finalCallsModified');
-                }
-                completeSessionAccumulators(activeSession && (!lessonId || activeSession.sessionId === lessonId) ? activeSession : null);
-                bumpContextRevision();
-                return;
-            }
-
-            const timeField = resolveTimeField(vars);
-
-            // 3. Quiz Group / Session completion final calls
-            if (isQuizGroupOp(opName, qStr)) {
-                const isExamPracticeComplete = opName === 'CompleteExamPracticeSession' || qStr.includes('completeExamPracticeSession');
-                const isSaveExamAnswers = opName === 'SaveExamPracticeAnswers' || qStr.includes('saveExamPracticeAnswers');
-
-                if (isExamPracticeComplete && !timeField) {
-                    completeSessionAccumulators(activeSession && activeSession.sessionType === 'ExamPracticeSession' ? activeSession : null);
-                    bumpContextRevision();
-                    return;
-                }
-
-                if (timeField && (boostActive || predictActive)) {
-                    const rawVal = vars[timeField];
-                    const total = parseDurationToSeconds(rawVal);
-                    if (total !== null) {
-                        const useSessionBonus = activeSession && (activeSession.totalExtraQuestionSeconds > 0 || activeSession.totalSubmittedQuestionSeconds > 0);
-                        let bonus = useSessionBonus ? activeSession.totalExtraQuestionSeconds : accumulatedExtraSeconds;
-                        let isManual = false;
-
-                        if (bonus === 0 && settings.timeBoostEnabled && settings.predictFinalCallEnabled !== false) {
-                            const activeQ = identifyCurrentQuestion();
-                            bonus = settings.dynamicTimeEnabled
-                                ? computeDynamicExtraSeconds(activeQ, total, opName, qStr)
-                                : pickExtraSeconds();
-                        }
-
-                        if (queuedSeconds !== null) {
-                            isManual = true;
-                            bonus += computeManualExtra(identifyCurrentQuestion(), total, opName, qStr);
-                            manualResetNeeded = true;
-                        }
-
-                        if (bonus > 0) {
-                            let finalTotal = round3(total + bonus);
-                            if (settings.predictFinalCallEnabled !== false && activeSession && activeSession.totalSubmittedQuestionSeconds > 0) {
-                                const minTotal = round3(activeSession.totalSubmittedQuestionSeconds + Math.min(bonus, 12));
-                                if (finalTotal < minTotal) finalTotal = minTotal;
-                            }
-                            const addedDelta = round3(finalTotal - total);
-                            if (addedDelta > 0) {
-                                vars[timeField] = formatUpdatedDuration(rawVal, finalTotal);
-                                bumpStat('groupExtra', addedDelta);
-                                bumpStat('finalCallsModified');
-                                changed = true;
-                                const count = accumulatedQuestionCount;
-                                LOG(`[${source}] ${opName || 'QuizGroup'}: ${rawVal} → ${vars[timeField]} ` +
-                                    `(+${addedDelta}s${count > 0 ? ` from ${count} question(s)` : ''}${isManual ? ' [manual]' : ''})`);
-                                VLOG('group bonus applied; per-question accumulator reset', { bonus: addedDelta, count, opName });
-                            }
-                        }
-                    }
-
-                    const prevAcc = accumulatedExtraSeconds;
-                    if (activeSession && isSaveExamAnswers) {
-                        accumulatedExtraSeconds = 0;
-                        accumulatedQuestionCount = 0;
-                        activeSession.phase = 'answers_saved';
-                        updatePredictedFinalCall(activeSession);
-                    } else {
-                        completeSessionAccumulators(activeSession);
-                    }
-                    if (!changed && prevAcc > 0) notifyStatsChange();
-                    bumpContextRevision();
-                }
-                return;
-            }
-
-            // 4. Per-question operations
-            if (boostActive && timeField) {
-                const hasManual = queuedSeconds !== null;
-                if (!hasManual && !isQuestion && !KNOWN_LESSON_OPS.has(opName)) {
-                    return;
-                }
-
-                const rawVal = vars[timeField];
-                const total = parseDurationToSeconds(rawVal);
-                if (total === null) return;
-
-                let extra = 0;
-                let isManual = false;
-
-                if (hasManual) {
-                    isManual = true;
-                    extra = computeManualExtra(identifiedQ, total, opName, qStr);
-                } else if (settings.timeBoostEnabled) {
-                    extra = settings.dynamicTimeEnabled
-                        ? computeDynamicExtraSeconds(identifiedQ, total, opName, qStr)
-                        : pickExtraSeconds();
-                } else {
-                    return;
-                }
-
-                if (extra > 0) {
-                    const newSubmitted = round3(total + extra);
-                    vars[timeField] = formatUpdatedDuration(rawVal, newSubmitted);
-                    accumulatedExtraSeconds = round3(accumulatedExtraSeconds + extra);
-                    accumulatedQuestionCount += 1;
-
-                    if (identifiedQ) {
-                        identifiedQ.attempts = (identifiedQ.attempts || 0) + 1;
-                        identifiedQ.lastSubmittedTimeSeconds = newSubmitted;
-                        identifiedQ.lastExtraTimeSeconds = extra;
-                        identifiedQ.lastAnsweredAt = Date.now();
-                    }
-
-                    if (activeSession) {
-                        activeSession.totalOriginalQuestionSeconds = round3((activeSession.totalOriginalQuestionSeconds || 0) + total);
-                        activeSession.totalExtraQuestionSeconds = round3((activeSession.totalExtraQuestionSeconds || 0) + extra);
-                        activeSession.totalSubmittedQuestionSeconds = round3((activeSession.totalSubmittedQuestionSeconds || 0) + newSubmitted);
-
-                        if (opName === 'AnswerExamQuestion' || qStr.includes('answerExamQuestion')) {
-                            activeSession.answeringSubmittedSeconds = round3((activeSession.answeringSubmittedSeconds || 0) + newSubmitted);
-                            activeSession.answeringExtraSeconds = round3((activeSession.answeringExtraSeconds || 0) + extra);
-                        } else if (opName === 'SaveExamQuestionMarks' || qStr.includes('saveExamQuestionMarks')) {
-                            activeSession.markingSubmittedSeconds = round3((activeSession.markingSubmittedSeconds || 0) + newSubmitted);
-                            activeSession.markingExtraSeconds = round3((activeSession.markingExtraSeconds || 0) + extra);
-                        }
-                        updatePredictedFinalCall(activeSession);
-                    }
-
-                    bumpStat('seen');
-                    bumpStat('boosted');
-                    if (isManual) {
-                        bumpStat('manualBoosted');
-                        manualResetNeeded = true;
-                    }
-                    bumpContextRevision();
-                    changed = true;
-
-                    const displayOp = opName || 'Question';
-                    const qLabel = identifiedQ ? ` [${identifiedQ.primaryType}, rec ${identifiedQ.recommendedSeconds}s]` : '';
-                    if (isManual) {
-                        LOG(`[${source}] ${displayOp}${qLabel} (manual time): ${rawVal} (+${formatSeconds(queuedSeconds)}${settings.manualTimeStacksWithAuto && settings.timeBoostEnabled ? ' + auto' : ''}) → ${vars[timeField]} ` +
-                            `(accumulated ${accumulatedExtraSeconds}s / ${accumulatedQuestionCount} q)`);
-                        nativeConsole.log(
-                            `[UpLearn timeSpent] ${displayOp} original=${rawVal} (+${formatSeconds(extra)}) → ${vars[timeField]}`
-                        );
-                    } else {
-                        LOG(`[${source}] ${displayOp}${qLabel}: ${rawVal} → ${vars[timeField]} ` +
-                            `(+${extra}s, accumulated ${accumulatedExtraSeconds}s / ${accumulatedQuestionCount} q)`);
-                        VLOG('boost roll', {
-                            opName: displayOp,
-                            questionId: identifiedQ ? identifiedQ.id : null,
-                            questionType: identifiedQ ? identifiedQ.primaryType : null,
-                            dynamic: settings.dynamicTimeEnabled,
-                            rolled: extra,
-                            range: `[${settings.extraSecondsMin}–${settings.extraSecondsMax}]`,
-                            newAccumulated: accumulatedExtraSeconds,
-                            questionCount: accumulatedQuestionCount,
-                        });
-                    }
-                }
-            }
-        };
-
-        if (Array.isArray(json)) json.forEach(patch);
-        else patch(json);
-
-        if (changed) {
-            if (manualResetNeeded && queuedSeconds !== null) {
-                scheduleReset();
-            }
-            return { body: JSON.stringify(json), changed: true };
-        }
-        return { body, changed: false };
-    }
-
-    function rewriteBodyText(text) {
-        return maybeBumpTimeSpent(text, 'rewriteBodyText').body;
-    }
-
     // ============================================================
-    // FETCH INTERCEPTOR
+    // 14. NETWORK INTERCEPTORS (FETCH, XHR, SENDBEACON)
     // ============================================================
     const origFetch = window.fetch;
     const JSON_OK_INIT = {
@@ -4289,7 +4579,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
     function processFetchResponse(fetchPromise, url, reqKind = 'none') {
         if (reqKind === 'ingest') {
-            // Passive ingestion: zero added latency, handle in background asynchronously
             fetchPromise.then((res) => {
                 if (res && res.ok && typeof res.clone === 'function') {
                     res.clone().json().then(handleApiResponse).catch(() => {});
@@ -4299,44 +4588,30 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         }
 
         if (reqKind !== 'transform') {
-            // Unrelated operations: do not clone or delay response
             return fetchPromise;
         }
 
-        // Only await cloned.text() for feature flags transformation
         return fetchPromise.then((res) => {
             try {
                 if (res && res.ok && typeof res.clone === 'function') {
                     const cloned = res.clone();
                     if (typeof cloned.text === 'function') {
                         return cloned.text().then((rt) => {
-                            const ingest = shouldIngestGraphQLResponse(rt);
-                            const transform = shouldTransformFeatureFlags(rt);
-                            if (ingest || transform) {
-                                try {
-                                    const parsed = JSON.parse(rt);
-                                    if (ingest) handleApiResponse(parsed);
-                                    if (transform) {
-                                        const transformed = stripFullscreenFeatureFlags(parsed);
-                                        const transformedText = JSON.stringify(transformed);
-                                        reportFeatureFlagsTransformed('fetch', url || 'API');
-                                        const newHeaders = new Headers();
-                                        res.headers.forEach((v, k) => {
-                                            const lk = k.toLowerCase();
-                                            if (lk !== 'content-encoding' && lk !== 'content-length') {
-                                                newHeaders.set(k, v);
-                                            }
-                                        });
-                                        newHeaders.set('content-type', 'application/json');
-                                        return new Response(transformedText, {
-                                            status: res.status,
-                                            statusText: res.statusText,
-                                            headers: newHeaders,
-                                        });
+                            const incoming = processIncomingApiPayload(rt, reqKind, 'fetch', url);
+                            if (incoming.transformed) {
+                                const newHeaders = new Headers();
+                                res.headers.forEach((v, k) => {
+                                    const lk = k.toLowerCase();
+                                    if (lk !== 'content-encoding' && lk !== 'content-length') {
+                                        newHeaders.set(k, v);
                                     }
-                                } catch (e) {
-                                    WARN('Failed to transform feature flags response:', e);
-                                }
+                                });
+                                newHeaders.set('content-type', 'application/json');
+                                return new Response(incoming.text, {
+                                    status: res.status,
+                                    statusText: res.statusText,
+                                    headers: newHeaders,
+                                });
                             }
                             return res;
                         }).catch(() => res);
@@ -4364,7 +4639,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 
                     const anyMatch = matchAnyTelemetryService(url);
                     if (anyMatch) {
-                        // ---- Telemetry block ----
                         if (isServiceMatchBlocked(anyMatch)) {
                             bumpStat('blocked');
                             const isJitsu = anyMatch.key === 'jitsu';
@@ -4379,7 +4653,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                             }));
                         }
 
-                        // ---- Jitsu allowed: log the packet, then pass through ----
                         if (anyMatch.key === 'jitsu') {
                             bumpStat('jitsuPackets');
                             return withCapturedFetchBody(
@@ -4409,38 +4682,27 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                                 if (ct.includes('application/json') && (!cl || cl <= MAX_SCAN)) {
                                     const passInit = init;
                                     return input.clone().text().then((text) => {
-                                        const mocked = interceptBlockedMutation(text, url, 'fetch · Request body');
-                                        if (mocked) {
-                                            return new Response(mocked.payload, JSON_OK_INIT);
+                                        const out = processOutgoingApiPayload(text, url, 'fetch-Req');
+                                        if (out.blocked) {
+                                            return new Response(out.mocked.payload, JSON_OK_INIT);
                                         }
-                                        const reqK = classifyApiRequest(text);
-                                        const { body: newBody, changed } = maybeBumpTimeSpent(text, 'fetch-Req');
-                                        const reqToFetch = changed
-                                            ? new Request(input, { body: newBody, method: input.method })
+                                        const reqToFetch = out.changed
+                                            ? new Request(input, { body: out.body, method: input.method })
                                             : input;
                                         const fetchPromise = origFetch.call(self, reqToFetch, passInit);
-                                        return processFetchResponse(fetchPromise, url, reqK);
-                                    }, () => {
-                                        // Rejection handler fallback if input stream was disturbed/locked
-                                        return origFetch.call(self, input, passInit);
-                                    });
+                                        return processFetchResponse(fetchPromise, url, out.reqKind);
+                                    }, () => origFetch.call(self, input, passInit));
                                 }
                             }
 
                             if (body != null) {
-                                const mocked = interceptBlockedMutation(body, url, 'fetch');
-                                if (mocked) {
-                                    return Promise.resolve(new Response(mocked.payload, JSON_OK_INIT));
+                                const out = processOutgoingApiPayload(body, url, 'fetch');
+                                if (out.blocked) {
+                                    return Promise.resolve(new Response(out.mocked.payload, JSON_OK_INIT));
                                 }
-
-                                reqKind = classifyApiRequest(body);
-                                const { body: newBody, changed } = maybeBumpTimeSpent(body, 'fetch');
-                                if (changed) {
-                                    const wasBuffer = typeof ArrayBuffer !== 'undefined' && (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body));
-                                    const encodedBody = (wasBuffer && sharedTextEncoder)
-                                        ? sharedTextEncoder.encode(newBody)
-                                        : newBody;
-                                    init = Object.assign({}, init, { body: encodedBody });
+                                reqKind = out.reqKind;
+                                if (out.changed) {
+                                    init = Object.assign({}, init, { body: reencodeBodyLike(init.body, out.body) });
                                     bodyChanged = true;
                                 }
                             }
@@ -4470,9 +4732,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         VLOG('fetch hook installed');
     }
 
-    // ============================================================
-    // XHR INTERCEPTOR
-    // ============================================================
+    // XHR Interceptor
     const SPOOFED_XHR_PROPS = ['readyState', 'status', 'statusText', 'responseText', 'response'];
     function saveAndDefineSpoofedXHRProps(xhr, info, descs) {
         if (info) {
@@ -4573,12 +4833,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 return reflectApply(origOpen, this, arguments);
             }
         }).open;
-        origDefineProperty(OrigXHR.prototype, 'open', {
-            value: cloak(patchedOpen, 'open'),
-            writable: true,
-            enumerable: true,
-            configurable: true,
-        });
+        patchMethod(OrigXHR.prototype, 'open', patchedOpen, 'open');
 
         if (typeof origAbort === 'function') {
             const patchedAbort = ({
@@ -4589,12 +4844,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                     return reflectApply(origAbort, this, arguments);
                 }
             }).abort;
-            origDefineProperty(OrigXHR.prototype, 'abort', {
-                value: cloak(patchedAbort, 'abort'),
-                writable: true,
-                enumerable: true,
-                configurable: true,
-            });
+            patchMethod(OrigXHR.prototype, 'abort', patchedAbort, 'abort');
         }
 
         const patchedSend = ({
@@ -4618,18 +4868,14 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                         const bodyText = extractSyncBodyText(body);
                         let reqKind = 'none';
                         if (bodyText !== null) {
-                            const mocked = interceptBlockedMutation(bodyText, url, 'XHR');
-                            if (mocked) {
-                                mockBlockedXHR(this, mocked.payload, mocked.json, info, sentSeq);
+                            const out = processOutgoingApiPayload(bodyText, url, 'XHR');
+                            if (out.blocked) {
+                                mockBlockedXHR(this, out.mocked.payload, out.mocked.json, info, sentSeq);
                                 return;
                             }
-
-                            reqKind = classifyApiRequest(bodyText);
-                            const { body: newBody, changed } = maybeBumpTimeSpent(bodyText, 'xhr');
-                            if (changed) {
-                                body = (typeof body === 'string' || !sharedTextEncoder)
-                                    ? newBody
-                                    : sharedTextEncoder.encode(newBody);
+                            reqKind = out.reqKind;
+                            if (out.changed) {
+                                body = reencodeBodyLike(body, out.body);
                                 bodyChanged = true;
                             }
                         }
@@ -4657,36 +4903,35 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                                         if (selfXhr.status === 200) {
                                             if (selfXhr.responseType === 'json') {
                                                 if (selfXhr.response && typeof selfXhr.response === 'object') {
-                                                    handleApiResponse(selfXhr.response);
+                                                    const res = transformParsedApiPayload(selfXhr.response, reqKind, 'XHR', url, true);
+                                                    if (res.transformed) {
+                                                        saveAndDefineSpoofedXHRProps(selfXhr, info, {
+                                                            response: {
+                                                                get() { return res.json; },
+                                                                configurable: true,
+                                                            },
+                                                        });
+                                                    }
                                                 }
                                                 return;
                                             }
                                             if (!selfXhr.responseType || selfXhr.responseType === 'text') {
-                                                const rt = selfXhr.responseText;
-                                                const ingest = shouldIngestGraphQLResponse(rt);
-                                                const transform = shouldTransformFeatureFlags(rt);
-                                                if (ingest || transform) {
-                                                    try {
-                                                        const parsed = JSON.parse(rt);
-                                                        if (ingest) handleApiResponse(parsed);
-                                                        if (transform) {
-                                                            const modifiedJson = stripFullscreenFeatureFlags(parsed);
-                                                            const modifiedText = JSON.stringify(modifiedJson);
-                                                            reportFeatureFlagsTransformed('XHR', url || 'API');
-                                                            saveAndDefineSpoofedXHRProps(selfXhr, info, {
-                                                                responseText: {
-                                                                    get() { return modifiedText; },
-                                                                    configurable: true,
-                                                                },
-                                                                response: {
-                                                                    get() {
-                                                                        return selfXhr.responseType === 'json' ? modifiedJson : modifiedText;
-                                                                    },
-                                                                    configurable: true,
-                                                                },
-                                                            });
-                                                        }
-                                                    } catch {}
+                                                const incoming = processIncomingApiPayload(selfXhr.responseText, reqKind, 'XHR', url);
+                                                if (incoming.transformed) {
+                                                    const modifiedText = incoming.text;
+                                                    const modifiedJson = incoming.json;
+                                                    saveAndDefineSpoofedXHRProps(selfXhr, info, {
+                                                        responseText: {
+                                                            get() { return modifiedText; },
+                                                            configurable: true,
+                                                        },
+                                                        response: {
+                                                            get() {
+                                                                return selfXhr.responseType === 'json' ? modifiedJson : modifiedText;
+                                                            },
+                                                            configurable: true,
+                                                        },
+                                                    });
                                                 }
                                             }
                                         }
@@ -4708,18 +4953,11 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 return reflectApply(origSend, this, arguments);
             }
         }).send;
-        origDefineProperty(OrigXHR.prototype, 'send', {
-            value: cloak(patchedSend, 'send'),
-            writable: true,
-            enumerable: true,
-            configurable: true,
-        });
+        patchMethod(OrigXHR.prototype, 'send', patchedSend, 'send');
         VLOG('XHR hook installed');
     }
 
-    // ============================================================
-    // SEND-BEACON INTERCEPTOR
-    // ============================================================
+    // sendBeacon Interceptor
     if (navigator.sendBeacon) {
         const origBeacon = navigator.sendBeacon;
         const patchedBeacon = ({
@@ -4747,30 +4985,20 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 return reflectApply(origBeacon, navThis, arguments);
             }
         }).sendBeacon;
-        cloak(patchedBeacon, 'sendBeacon');
         const navProto = typeof Navigator !== 'undefined' && Navigator.prototype ? Navigator.prototype : null;
-        if (navProto && !origGetOwnPropDesc(navigator, 'sendBeacon') && origGetOwnPropDesc(navProto, 'sendBeacon')) {
-            try {
-                origDefineProperty(navProto, 'sendBeacon', {
-                    value: patchedBeacon, writable: true, enumerable: true, configurable: true,
-                });
-            } catch {
-                navigator.sendBeacon = patchedBeacon;
-            }
-        } else {
-            try {
-                origDefineProperty(navigator, 'sendBeacon', {
-                    value: patchedBeacon, writable: true, enumerable: true, configurable: true,
-                });
-            } catch {
-                navigator.sendBeacon = patchedBeacon;
-            }
+        const beaconTarget = (navProto && !origGetOwnPropDesc(navigator, 'sendBeacon') && origGetOwnPropDesc(navProto, 'sendBeacon'))
+            ? navProto
+            : navigator;
+        try {
+            patchMethod(beaconTarget, 'sendBeacon', patchedBeacon, 'sendBeacon');
+        } catch {
+            navigator.sendBeacon = cloak(patchedBeacon, 'sendBeacon');
         }
         VLOG('sendBeacon hook installed');
     }
 
     // ============================================================
-    // VISIBILITY / FOCUS / ANTI-BLUR SPOOFING
+    // 15. VISIBILITY / FOCUS SPOOFING & AUTO-FULLSCREEN BLOCKER
     // ============================================================
     const ORIG_VIS = (() => {
         try {
@@ -4849,12 +5077,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
             try { delete document.hasFocus; } catch {}
             if (typeof Document !== 'undefined' && Document.prototype && Document.prototype.hasFocus !== SPOOFED_HAS_FOCUS) {
                 const desc = origGetOwnPropDesc(Document.prototype, 'hasFocus');
-                origDefineProperty(Document.prototype, 'hasFocus', {
-                    value: SPOOFED_HAS_FOCUS,
-                    writable: true,
-                    enumerable: desc ? desc.enumerable : true,
-                    configurable: true,
-                });
+                patchMethod(Document.prototype, 'hasFocus', SPOOFED_HAS_FOCUS, 'hasFocus', desc ? desc.enumerable : true);
             }
         } catch {}
     }
@@ -4866,14 +5089,30 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         'blur', 'pagehide', 'freeze', 'resume'
     ]);
 
-    const origWinAdd = window.addEventListener ? window.addEventListener.bind(window) : null;
-    const origDocAdd = document.addEventListener ? document.addEventListener.bind(document) : null;
-    const origProtoAdd = (typeof EventTarget !== 'undefined' && EventTarget.prototype && EventTarget.prototype.addEventListener)
-        ? EventTarget.prototype.addEventListener
-        : null;
+    // Internal hooks invoked before KILL stops propagation, so Glisse UI
+    // press/drag cleanups always run even while spoofVisibility is active.
+    const internalBlurListeners = new Set();
+    const internalVisListeners  = new Set();
+    function addInternalBlurListener(fn) {
+        internalBlurListeners.add(fn);
+        return () => internalBlurListeners.delete(fn);
+    }
+    function addInternalVisListener(fn) {
+        internalVisListeners.add(fn);
+        return () => internalVisListeners.delete(fn);
+    }
 
     const __ul_seenKilled = new Set();
     const KILL = (e) => {
+        if (e.type === 'blur' && e.currentTarget === window && (e.target === window || e.target === rawWin)) {
+            for (const fn of internalBlurListeners) {
+                try { fn(e); } catch {}
+            }
+        } else if (e.type === 'visibilitychange' && e.currentTarget === document) {
+            for (const fn of internalVisListeners) {
+                try { fn(e); } catch {}
+            }
+        }
         if (!settings.spoofVisibility) return;
         if (e.type === 'blur' || e.type === 'focusout') {
             if (
@@ -4895,18 +5134,15 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         if (typeof e.stopPropagation === 'function') e.stopPropagation();
     };
 
-    // Register capture-phase KILL listeners BEFORE wrapping addEventListener so they are never blocked by our own wrapper.
-    // Register focusout on window ONLY (window capture already intercepts all focusout events before document).
     ['visibilitychange', 'webkitvisibilitychange', 'mozvisibilitychange', 'msvisibilitychange', 'blur', 'focusout', 'pagehide', 'freeze'].forEach((evt) => {
         let winRegistered = false;
         try {
-            if (origWinAdd) { origWinAdd(evt, KILL, true); winRegistered = true; }
-            else if (origProtoAdd) { origProtoAdd.call(window, evt, KILL, true); winRegistered = true; }
+            safeWinAdd(evt, KILL, true);
+            winRegistered = true;
         } catch {}
         if (evt === 'focusout' && winRegistered) return;
         try {
-            if (origDocAdd) origDocAdd(evt, KILL, true);
-            else if (origProtoAdd) origProtoAdd.call(document, evt, KILL, true);
+            safeDocAdd(evt, KILL, true);
         } catch {}
     });
 
@@ -4926,12 +5162,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                     return reflectApply(origProtoAdd, this, arguments);
                 }
             }).addEventListener;
-            origDefineProperty(EventTarget.prototype, 'addEventListener', {
-                value: cloak(patchedAddEventListener, 'addEventListener'),
-                writable: true,
-                enumerable: true,
-                configurable: true,
-            });
+            patchMethod(EventTarget.prototype, 'addEventListener', patchedAddEventListener, 'addEventListener');
         }
     } catch {}
 
@@ -4983,9 +5214,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         });
     });
 
-    // ============================================================
-    // AUTO FULLSCREEN BLOCKER
-    // ============================================================
+    // Auto Fullscreen Blocker
     const FULLSCREEN_METHODS = [
         'requestFullscreen', 'webkitRequestFullscreen', 'webkitRequestFullScreen',
         'mozRequestFullScreen', 'msRequestFullscreen',
@@ -5019,13 +5248,10 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
                 }
             })[name];
             wsAdd.call(patchedFullscreenFns, wrapped);
-            cloak(wrapped, name);
             try {
-                origDefineProperty(proto, name, {
-                    value: wrapped, writable: true, enumerable: true, configurable: true,
-                });
+                patchMethod(proto, name, wrapped, name);
             } catch {
-                proto[name] = wrapped;
+                proto[name] = cloak(wrapped, name);
             }
         });
     }
@@ -5033,7 +5259,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     VLOG('fullscreen blocker installed');
 
     // ============================================================
-    // KEYBIND HELPERS
+    // 16. KEYBIND HELPERS
     // ============================================================
     const KEY_DISPLAY_MAP = {
         'ControlRight': 'Right Ctrl', 'ControlLeft': 'Left Ctrl',
@@ -5058,6 +5284,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         if (/^F\d+$/.test(code)) return code;
         return code;
     }
+
     function formatKeybind(kb) {
         if (!kb || !kb.code) return 'None';
         const parts = [];
@@ -5068,9 +5295,11 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         parts.push(formatKeyCode(kb.code));
         return parts.join(' + ');
     }
+
     function isModifierCode(code) {
         return /^(Control|Shift|Alt|Meta)(Left|Right)$/.test(code);
     }
+
     function captureKeybindFromEvent(e) {
         const kb = { code: e.code, ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, meta: e.metaKey };
         if (e.code === 'ControlLeft' || e.code === 'ControlRight') kb.ctrl  = false;
@@ -5079,6 +5308,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         if (e.code === 'MetaLeft'    || e.code === 'MetaRight')    kb.meta  = false;
         return kb;
     }
+
     function matchesKeybind(e, kb) {
         if (!kb || !kb.code) return false;
         if (isModifierCode(kb.code)) return e.code === kb.code;
@@ -5090,19 +5320,8 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
     }
 
     // ============================================================
-    // HEROUI v3 DESIGN SYSTEM & UI COMPONENTS
+    // 17. ZERO-DEPENDENCY VANILLA DOM GLISSE ENGINE & CONTROL PANEL
     // ============================================================
-    let uiHostEl = null;
-    let uiShadowRoot = null;
-    let uiContainerEl = null;
-    let reactRootInstance = null;
-    let capturingKeybind = false;
-    let isModalOpenGlobal = false;
-    let reactSetSettings = null;
-    let reactSetStats = null;
-    let reactSetModalOpen = null;
-    let reactSetCapturingKeybind = null;
-
     const POSITION_STYLES = {
         'bottom-right': { right: '15px', bottom: '15px', left: 'auto', top: 'auto' },
         'bottom-left':  { left: '15px',  bottom: '15px', right: 'auto', top: 'auto' },
@@ -5126,47 +5345,58 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
         { name: 'Apple Red',    hex: '#ff3b30' },
     ];
 
-    function ensureUIHost() {
-        if (uiShadowRoot && document.getElementById('__ul-heroui-host')) {
-            return uiShadowRoot;
-        }
+    const PRESET_OPTIONS = [
+        { id: 'off', label: 'Off', desc: 'Allows all telemetry traffic without blocking' },
+        { id: 'simple', label: 'Simple', desc: 'Silently blocks LogImproperUse only' },
+        { id: 'harsh', label: 'Harsh', desc: 'Aggressive network & script suppression' },
+        { id: 'custom', label: 'Custom', desc: 'Individually selected tracker blockers' },
+    ];
 
-        let host = document.getElementById('__ul-heroui-host');
-        if (!host) {
-            host = document.createElement('div');
-            host.id = '__ul-heroui-host';
-            host.setAttribute('data-glisse-backdrop', '');
-            host.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483645;';
-            (document.body || document.documentElement).appendChild(host);
-        }
-        uiHostEl = host;
+    const PILL_MODE_OPTIONS = [
+        { id: 'minimal', label: 'Settings Button Only', desc: 'Cleanest floating circle button (Default)' },
+        { id: 'boost', label: 'Time Boost & Settings', desc: 'Shows active boost status & settings' },
+        { id: 'compact', label: 'Compact Details', desc: 'Shows boost status & blocked network count' },
+        { id: 'full', label: 'Full Details', desc: 'Shows full metrics and boosted questions' },
+    ];
 
-        if (!host.shadowRoot) {
-            uiShadowRoot = host.attachShadow({ mode: 'open' });
-        } else {
-            uiShadowRoot = host.shadowRoot;
-        }
+    const PILL_POS_OPTIONS = [
+        { id: 'bottom-right', label: 'Bottom Right', desc: 'Floats in the bottom-right corner' },
+        { id: 'bottom-left', label: 'Bottom Left', desc: 'Floats in the bottom-left corner' },
+        { id: 'top-right', label: 'Top Right', desc: 'Floats in the top-right corner' },
+        { id: 'top-left', label: 'Top Left', desc: 'Floats in the top-left corner' },
+    ];
 
-        let styleEl = uiShadowRoot.getElementById('__ul-heroui-styles');
-        if (!styleEl) {
-            styleEl = document.createElement('style');
-            styleEl.id = '__ul-heroui-styles';
-            styleEl.textContent = getHeroUIStyles();
-            uiShadowRoot.appendChild(styleEl);
-        }
+    const THEME_OPTIONS = [
+        { id: 'dark', label: 'Dark', desc: 'Apple deep translucent dark glass' },
+        { id: 'light', label: 'Light', desc: 'Apple pure frosted light glass' },
+        { id: 'auto', label: 'Auto (System)', desc: 'Matches macOS / iOS system dark or light preference' },
+    ];
 
-        let container = uiShadowRoot.getElementById('__ul-root');
-        if (!container) {
-            container = document.createElement('div');
-            container.id = '__ul-root';
-            container.className = 'heroui-root';
-            container.setAttribute('data-glisse-backdrop', '');
-            uiShadowRoot.appendChild(container);
-        }
-        uiContainerEl = container;
+    const LOG_LEVEL_OPTIONS = [
+        { id: 'silent', label: 'Silent', desc: 'Mutes all console logs' },
+        { id: 'normal', label: 'Normal', desc: 'Logs key operations and warnings' },
+        { id: 'verbose', label: 'Verbose', desc: 'Full network packets and grouped reports' },
+    ];
 
-        mountReactUI();
-        return uiShadowRoot;
+    const KEYBIND_ACTION_OPTIONS = [
+        { id: 'toggle-pill', label: 'Toggle Floating Button', desc: 'Closes open settings first, then hides/shows the floating button' },
+        { id: 'open-modal',  label: 'Open Settings Directly',  desc: 'Opens the Control Panel directly without showing the button' },
+    ];
+
+    const SETTINGS_TAB_ITEMS = [
+        { value: 'telemetry', label: '🛡 Telemetry' },
+        { value: 'timeboost', label: '⏱ Time Boost' },
+        { value: 'preferences', label: '🎨 Preferences' },
+        { value: 'stats', label: '📊 Statistics' },
+    ];
+
+    function getEffectiveTheme(thm) {
+        const t = thm || settings.theme;
+        if (t === 'auto') {
+            try { return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark'; }
+            catch { return 'dark'; }
+        }
+        return t;
     }
 
     let cachedHeroUIStyles = null;
@@ -5193,15 +5423,12 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   --lg-on: #34c759;
   --lg-fill: #0088ff;
   --lg-ring: rgba(0, 0, 0, 0.4);
-  --lg-ease: cubic-bezier(0.25, 0.1, 0.25, 1);
   --lg-blur: 1px;
   --lg-bezel: 8px;
   --lg-thickness: 16px;
   --lg-zoom: 1.02;
   --lg-rim-saturation: 1.6;
   --lg-refraction: 1.05;
-  --lg-row-tint: rgba(0, 0, 0, 0.035);
-  --lg-card-tint: rgba(0, 0, 0, 0.02);
   --lg-dialog-tint: rgba(240, 240, 246, 0.92);
   --lg-pill-tint: rgba(240, 240, 245, 0.82);
 }
@@ -5232,28 +5459,18 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   --lg-zoom: 1.02;
   --lg-rim-saturation: 1.6;
   --lg-refraction: 1.05;
-  --lg-row-tint: rgba(255, 255, 255, 0.045);
-  --lg-card-tint: rgba(255, 255, 255, 0.025);
   --lg-dialog-tint: rgba(14, 14, 18, 0.88);
   --lg-pill-tint: rgba(18, 18, 22, 0.72);
 }
 
-
-
 /* Glass */
-
 .lg-glass {
   position: relative;
   background-color: var(--lg-glass);
   background-image: var(--lg-rim, none);
   background-size: 100% 100%;
-  --lg-blur: 1px;
-  --lg-bezel: 8px;
-  --lg-thickness: 16px;
-  --lg-zoom: 1.02;
-  --lg-rim-saturation: 1.6;
-  -webkit-backdrop-filter: blur(var(--lg-blur, 0px)) var(--lg-filter, saturate(1.8));
-  backdrop-filter: blur(var(--lg-blur, 0px)) var(--lg-filter, saturate(1.8));
+  -webkit-backdrop-filter: blur(var(--lg-blur, 1px)) var(--lg-filter, saturate(1.8));
+  backdrop-filter: blur(var(--lg-blur, 1px)) var(--lg-filter, saturate(1.8));
   box-shadow:
     inset 0 0 0 0.5px var(--lg-edge),
     0 1px 3px var(--lg-drop);
@@ -5281,7 +5498,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 }
 
 /* Button */
-
 .lg-button {
   display: inline-flex;
   align-items: center;
@@ -5309,13 +5525,17 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   -webkit-user-select: none;
   transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease, box-shadow 140ms ease;
 }
+
 .lg-button:hover {
   background-color: var(--lg-glass-active);
   border-color: rgba(255, 255, 255, 0.22);
   transform: translateY(-0.5px);
 }
-.lg-button:active {
+
+.lg-button:is(:active, [data-pressed]) {
+  background-color: var(--lg-glass-active);
   transform: scale(0.98);
+  transition-duration: 0s;
 }
 
 .lg-button[data-icon] {
@@ -5330,28 +5550,29 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   border-radius: 17px;
 }
 
-/* Destructive Action Buttons (e.g. Reset All Preferences) */
 .lg-button[data-destructive] {
   background-color: rgba(255, 59, 48, 0.12);
   border: 0.5px solid rgba(255, 59, 48, 0.35);
-  color: #ff453a;
+  color: var(--lg-destructive);
   font-weight: 590;
 }
+
 .lg-button[data-destructive]:hover {
   background-color: rgba(255, 59, 48, 0.22);
   border-color: rgba(255, 59, 48, 0.6);
   box-shadow: 0 2px 8px rgba(255, 59, 48, 0.2);
 }
 
-/* Filled Accent Buttons */
 .lg-button[data-variant="filled"] {
-  background-color: var(--accent, var(--lg-fill));
+  --lg-button-fill: var(--lg-tint, var(--accent, var(--lg-fill)));
+  background-color: var(--lg-button-fill);
   border-color: transparent;
   color: #ffffff;
-  box-shadow: 0 2px 6px color-mix(in srgb, var(--accent, var(--lg-fill)) 35%, transparent);
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--lg-button-fill) 35%, transparent);
 }
+
 .lg-button[data-variant="filled"]:hover {
-  background-color: color-mix(in srgb, var(--accent, var(--lg-fill)) 90%, #ffffff);
+  background-color: color-mix(in srgb, var(--lg-button-fill) 90%, #ffffff);
 }
 
 .lg-button > svg {
@@ -5360,54 +5581,10 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   height: 20px;
 }
 
-/* Lights up at once when pressed, as on iOS, and fades on release. */
-.lg-button:is(:active, [data-pressed]) {
-  background-color: var(--lg-glass-active);
-  transition-duration: 0s;
-}
-
-@media (hover: hover) and (pointer: fine) {
-  .lg-button:hover {
-    background-color: var(--lg-glass-active);
-  }
-}
-
 .lg-button:disabled {
   background-color: var(--lg-glass);
   opacity: 0.35;
   cursor: default;
-}
-
-.lg-button[data-destructive]:not([data-tint]) {
-  --lg-tint: var(--lg-destructive);
-}
-
-.lg-button:is([data-tint], [data-destructive]) {
-  color: var(--lg-tint);
-}
-
-.lg-button[data-variant="filled"] {
-  --lg-button-fill: var(--lg-tint, var(--lg-fill));
-  color: #fff;
-}
-
-.lg-button[data-variant="filled"],
-.lg-button[data-variant="filled"]:disabled {
-  background-color: var(--lg-button-fill);
-}
-
-.lg-button[data-variant="filled"]:is(:active, [data-pressed]) {
-  background-color: color-mix(in srgb, var(--lg-button-fill) 85%, #000);
-}
-
-@media (hover: hover) and (pointer: fine) {
-  .lg-button[data-variant="filled"]:hover {
-    background-color: color-mix(in srgb, var(--lg-button-fill) 88%, #fff);
-  }
-
-  .lg-button[data-variant="filled"]:hover:is(:active, [data-pressed]) {
-    background-color: color-mix(in srgb, var(--lg-button-fill) 85%, #000);
-  }
 }
 
 .lg-button:focus-visible,
@@ -5419,7 +5596,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 }
 
 /* Tab bar */
-
 .lg-tab-bar {
   --lg-tab-width: 84px;
   --lg-tab-height: 32px;
@@ -5470,19 +5646,22 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   justify-content: center;
   width: var(--lg-tab-width);
   height: var(--lg-tab-height);
+  padding: 0;
+  border: 0;
   font: inherit;
   font-size: 14px;
+  line-height: 1;
+  white-space: nowrap;
+  text-align: center;
+  box-sizing: border-box;
 }
 
 .lg-tab {
   position: relative;
   z-index: 1;
-  padding: 0;
-  border: 0;
   border-radius: calc(var(--lg-tab-height) / 2);
   color: var(--lg-muted);
   background: none;
-  text-decoration: none;
   cursor: pointer;
   -webkit-touch-callout: none;
   transition: color 200ms ease;
@@ -5533,9 +5712,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
   box-shadow: none;
-  transition:
-    opacity 140ms ease,
-    background-color 140ms ease;
+  transition: opacity 140ms ease, background-color 140ms ease;
 }
 
 .lg-tab-bar[data-lifted] .lg-tab-lens.lg-glass {
@@ -5573,7 +5750,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 }
 
 /* Input */
-
 .lg-input {
   display: flex;
   align-items: center;
@@ -5613,6 +5789,18 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   display: none;
 }
 
+.lg-input input[type="number"] {
+  text-align: center;
+  font-weight: 600;
+  -moz-appearance: textfield;
+}
+
+.lg-input input[type="number"]::-webkit-outer-spin-button,
+.lg-input input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
 .lg-input-icon {
   display: grid;
   place-items: center;
@@ -5647,12 +5835,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   height: 14px;
 }
 
-.lg-input:has(input:disabled) {
-  opacity: 0.35;
-}
-
 /* Switch and slider thumbs */
-
 .lg-switch-thumb,
 .lg-slider-thumb {
   position: absolute;
@@ -5676,7 +5859,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 }
 
 /* Switch */
-
 .lg-switch {
   --lg-scale: 0.375;
   position: relative;
@@ -5690,8 +5872,19 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   cursor: pointer;
   touch-action: pan-y;
   -webkit-tap-highlight-color: transparent;
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.25),
+    inset 0 0 0 0.5px var(--lg-edge),
+    0 1px 2px rgba(0, 0, 0, 0.08);
+  transition: box-shadow 150ms ease, opacity 150ms ease;
 }
 
+.lg-switch:hover {
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.35),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.25),
+    0 2px 6px rgba(0, 0, 0, 0.12);
+}
 
 .lg-switch::before {
   content: "";
@@ -5713,6 +5906,13 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   width: calc(146px * var(--lg-scale));
   height: calc(92px * var(--lg-scale));
   transform: translate(0, -50%) scale(0.65);
+  box-shadow:
+    0 3px 8px rgba(0, 0, 0, 0.22),
+    inset 0 1px 1px rgba(255, 255, 255, 0.8),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.1),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.4);
+  -webkit-backdrop-filter: blur(2px) saturate(1.3);
+  backdrop-filter: blur(2px) saturate(1.3);
 }
 
 .lg-switch[aria-checked="true"] .lg-switch-fill {
@@ -5729,7 +5929,6 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 }
 
 /* Slider */
-
 .lg-slider {
   position: relative;
   width: 100%;
@@ -5749,7 +5948,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 .lg-slider-fill {
   display: block;
   height: 100%;
-  background: var(--lg-fill);
+  background: var(--accent, var(--lg-fill));
   transform: scaleX(var(--lg-progress));
   transform-origin: left;
 }
@@ -5778,13 +5977,12 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   -webkit-tap-highlight-color: transparent;
 }
 
-.lg-slider input::-webkit-slider-runnable-track {
+.lg-slider input::-webkit-slider-runnable-track,
+.lg-slider input::-moz-range-track {
   height: 6px;
   background: transparent;
 }
 
-/* The native thumb only takes the touch; the glass thumb is drawn beneath.
-   iOS shades the native one even without its appearance, so hide it. */
 .lg-slider input::-webkit-slider-thumb {
   width: 36px;
   height: 40px;
@@ -5793,17 +5991,9 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   background: transparent;
   box-shadow: none;
   opacity: 0;
-  /* A touch on the thumb drags it rather than scrolling the page; the rest of
-     the track still scrolls. Blocking touchmove instead would stop Safari's
-     own drag. */
   touch-action: none;
   appearance: none;
   -webkit-appearance: none;
-}
-
-.lg-slider input::-moz-range-track {
-  height: 6px;
-  background: transparent;
 }
 
 .lg-slider input::-moz-range-thumb {
@@ -5820,16 +6010,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   outline-offset: 3px;
 }
 
-.lg-slider:has(input:disabled) {
-  opacity: 0.35;
-}
-
-.lg-slider input:disabled {
-  cursor: default;
-}
-
-/* Menu */
-
+/* Menu & Select Dropdown */
 .lg-menu {
   position: relative;
   display: inline-flex;
@@ -5839,22 +6020,18 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   position: absolute;
   top: 0;
   right: 0;
-  z-index: 10;
+  z-index: 100000;
   box-sizing: border-box;
-  width: 200px;
-  border-radius: 20px;
+  min-width: 240px;
+  max-width: 340px;
+  width: max-content;
+  border-radius: 18px;
   color: var(--lg-foreground);
   font-size: 14px;
   transform-origin: calc(100% - 20px) 20px;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
-}
-
-.lg-menu-card[data-align="start"] {
-  right: auto;
-  left: 0;
-  transform-origin: 20px 20px;
 }
 
 .lg-menu-card[data-phase="leaving"] {
@@ -5869,38 +6046,13 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   height: 100%;
   border-radius: inherit;
   background: var(--lg-surface);
-  -webkit-backdrop-filter: blur(22px) saturate(1.9);
-  backdrop-filter: blur(22px) saturate(1.9);
+  -webkit-backdrop-filter: blur(28px) saturate(2);
+  backdrop-filter: blur(28px) saturate(2);
   box-shadow:
     inset 0 0 0 0.5px var(--lg-surface-edge),
-    0 12px 40px var(--lg-shadow);
+    0 20px 60px var(--lg-shadow);
   pointer-events: none;
-}
-
-.lg-menu-card[data-align="start"] .lg-menu-surface {
-  right: auto;
-  left: 0;
-}
-
-.lg-menu-glyph {
-  position: absolute;
-  top: 0;
-  right: 0;
-  display: grid;
-  place-items: center;
-  width: 40px;
-  height: 40px;
-  pointer-events: none;
-}
-
-.lg-menu-card[data-align="start"] .lg-menu-glyph {
-  right: auto;
-  left: 0;
-}
-
-.lg-menu-glyph > svg {
-  width: 20px;
-  height: 20px;
+  z-index: -1;
 }
 
 .lg-menu-content {
@@ -5933,9 +6085,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   background: var(--lg-highlight);
   opacity: 0;
   pointer-events: none;
-  transition:
-    transform 100ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    opacity 80ms ease-out;
+  transition: transform 100ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 80ms ease-out;
 }
 
 .lg-menu-item {
@@ -5944,21 +6094,17 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 32px;
-  padding: 6px 12px;
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 12px;
   border: 0;
-  border-radius: 14px;
+  border-radius: 12px;
   color: inherit;
   background: transparent;
   font: inherit;
   text-align: left;
   cursor: pointer;
-}
-
-.lg-menu-item > svg {
-  flex: none;
-  width: 16px;
-  height: 16px;
+  box-sizing: border-box;
 }
 
 .lg-menu-item:focus-visible {
@@ -5967,7 +6113,7 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .lg-menu-item:hover:not(:disabled) {
+  .lg-menu-item:hover {
     background: var(--lg-highlight);
   }
 }
@@ -5977,1072 +6123,4397 @@ html.ul-dark-mode #${MANUAL_BUTTON_ID}:hover {
   outline: none;
 }
 
-.lg-menu-item[data-destructive] {
-  color: var(--lg-destructive);
-}
-
-.lg-menu-item:disabled {
-  opacity: 0.38;
-  cursor: default;
-}
-
-.lg-menu-separator {
-  flex: none;
-  margin: 7px 11px;
-  border-top: 0.5px solid var(--lg-separator);
-}
-
 @media (prefers-reduced-motion: reduce) {
   .lg-menu-plate {
     transition: opacity 80ms ease-out;
   }
-
   .lg-menu-card {
     animation: lg-menu-fade 100ms ease-out;
   }
 }
 
 @keyframes lg-menu-fade {
-  from {
-    opacity: 0;
-  }
+  from { opacity: 0; }
 }
 
+/* ============================================================
+   UpLearn Bypass Layout & App Styling (built on Glisse)
+   ============================================================ */
+:host, .heroui-root {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "SF Pro", -system-ui, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    box-sizing: border-box;
+    color: var(--lg-foreground);
+    --accent: var(--lg-fill);
+}
 
-            /* ============================================================
-               UpLearn Bypass Layout & App Styling (built on Glisse)
-               ============================================================ */
-            :host, .heroui-root {
-                font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "SF Pro", -system-ui, "Helvetica Neue", Helvetica, Arial, sans-serif;
-                font-feature-settings: "cv02", "cv03", "cv04", "cv11";
-                -webkit-font-smoothing: antialiased;
-                -moz-osx-font-smoothing: grayscale;
-                text-rendering: optimizeLegibility;
-                box-sizing: border-box;
-                color: var(--lg-foreground);
-                --accent: var(--lg-fill);
+*, *::before, *::after {
+    box-sizing: inherit;
+}
+
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+::-webkit-scrollbar-thumb {
+    background: var(--lg-separator);
+    border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: var(--lg-muted);
+}
+
+/* Opacity-only backdrop dim avoids stacked full-screen backdrop-filter GPU cost */
+.modal__backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483647;
+    background: rgba(0, 0, 0, 0.48);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    box-sizing: border-box;
+    pointer-events: auto;
+    animation: lg-fade-in 180ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.modal__backdrop--closing {
+    pointer-events: none;
+    animation: lg-fade-out 160ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.modal__backdrop--draggable {
+    background: transparent;
+    pointer-events: none;
+}
+
+@keyframes lg-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+@keyframes lg-fade-out {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+.modal__container {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: min(940px, 95vw);
+    height: min(700px, 88vh);
+    min-height: 520px;
+}
+
+.modal__container--draggable {
+    pointer-events: none;
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    display: block;
+    padding: 0;
+}
+
+.modal__dialog {
+    width: 100%;
+    height: 100%;
+    border-radius: 24px;
+    color: var(--lg-foreground);
+    background-color: var(--lg-dialog-tint, rgba(14, 14, 18, 0.88));
+    -webkit-backdrop-filter: blur(32px) saturate(1.8);
+    backdrop-filter: blur(32px) saturate(1.8);
+    border: 0.5px solid var(--lg-surface-edge, rgba(255, 255, 255, 0.14));
+    box-shadow:
+        inset 0 1px 1.5px 0 rgba(255, 255, 255, 0.20),
+        inset 0 0 0 0.5px var(--lg-surface-edge, rgba(255, 255, 255, 0.14)),
+        0 28px 72px rgba(0, 0, 0, 0.60),
+        0 6px 24px rgba(0, 0, 0, 0.35);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+    animation: lg-scale-in 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.modal__dialog--draggable {
+    pointer-events: auto;
+    position: absolute;
+    margin: 0;
+    width: min(920px, 92vw);
+    height: min(680px, 86vh);
+    min-height: 480px;
+    box-sizing: border-box;
+    transition: none;
+}
+
+:where([data-theme="light"], .heroui-root[data-theme="light"]) .modal__dialog {
+    background-color: var(--lg-dialog-tint, rgba(240, 240, 246, 0.92));
+    border-color: rgba(0, 0, 0, 0.12);
+    box-shadow:
+        inset 0 1px 1.5px 0 rgba(255, 255, 255, 0.85),
+        inset 0 0 0 0.5px rgba(255, 255, 255, 0.50),
+        0 24px 64px rgba(20, 20, 30, 0.22),
+        0 4px 16px rgba(20, 20, 30, 0.10);
+}
+
+.modal__dialog::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    background: linear-gradient(
+        135deg,
+        rgba(255, 255, 255, 0.24) 0%,
+        rgba(255, 255, 255, 0.08) 22%,
+        rgba(255, 255, 255, 0.01) 50%,
+        rgba(255, 255, 255, 0.06) 78%,
+        rgba(255, 255, 255, 0.18) 100%
+    );
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    padding: 1px;
+    z-index: 2;
+}
+
+.modal__backdrop--closing .modal__dialog {
+    animation: lg-scale-out 160ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+@keyframes lg-scale-in {
+    from { opacity: 0; transform: scale(0.96) translateY(8px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes lg-scale-out {
+    from { opacity: 1; transform: scale(1) translateY(0); }
+    to { opacity: 0; transform: scale(0.97) translateY(6px); }
+}
+
+.modal__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 18px;
+    border-bottom: 0.5px solid var(--lg-separator);
+    flex-shrink: 0;
+    gap: 16px;
+    position: relative;
+    z-index: 4;
+}
+
+.modal__header--draggable {
+    cursor: grab;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+}
+
+.modal__header--draggable:active,
+.modal__header--dragging {
+    cursor: grabbing;
+}
+
+.modal__header--draggable .modal__header-nav,
+.modal__header--draggable .lg-tab-bar,
+.modal__header--draggable .lg-button,
+.modal__header--draggable button {
+    cursor: default;
+    pointer-events: auto;
+}
+
+.modal__brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.modal__icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: color-mix(in srgb, var(--accent, var(--lg-fill)) 18%, transparent);
+    color: var(--accent, var(--lg-fill));
+    flex-shrink: 0;
+    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--accent, var(--lg-fill)) 30%, transparent);
+}
+
+.modal__heading {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    color: var(--lg-foreground);
+    white-space: nowrap;
+}
+
+.modal__header-nav {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+}
+
+.modal__body {
+    position: relative;
+    padding: 16px 20px 20px 20px;
+    overflow: hidden;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    z-index: 3;
+}
+
+.tabs__panel {
+    display: none;
+    flex-direction: column;
+    gap: 14px;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 2px 6px 80px 2px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--lg-separator) transparent;
+}
+.tabs__panel[data-active="true"] {
+    display: flex;
+}
+
+.grid-2col {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    align-items: start;
+    width: 100%;
+}
+.col-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+}
+@media (max-width: 840px) {
+    .grid-2col {
+        grid-template-columns: 1fr;
+    }
+}
+
+.card {
+    display: flex;
+    flex-direction: column;
+    border-radius: 20px;
+    background-color: var(--card-bg, rgba(255, 255, 255, 0.035));
+    border: 0.5px solid var(--lg-edge);
+    box-shadow:
+        inset 0 1px 1px 0 rgba(255, 255, 255, 0.08),
+        0 2px 8px -2px var(--lg-drop);
+    overflow: visible;
+    padding: 0;
+    position: relative;
+}
+:where([data-theme="light"], .heroui-root[data-theme="light"]) .card {
+    --card-bg: rgba(0, 0, 0, 0.025);
+    box-shadow:
+        inset 0 1px 1px 0 rgba(255, 255, 255, 0.6),
+        0 2px 8px -2px rgba(0, 0, 0, 0.04);
+}
+:where([data-theme="dark"], .heroui-root[data-theme="dark"]) .card {
+    --card-bg: rgba(255, 255, 255, 0.035);
+}
+
+:is(.card, .col-stack)[data-menu-open="true"] {
+    z-index: 9000;
+}
+:is(.field-row, .field-switch-row, .field-box)[data-menu-open="true"] {
+    z-index: 9200;
+}
+.lg-menu-select[data-menu-open="true"],
+.lg-menu[data-phase="open"],
+.lg-menu[data-open="true"] {
+    z-index: 9500;
+}
+[data-has-menu-open="true"] :is(.field-row, .field-switch-row, .field-box):not([data-menu-open="true"]):hover {
+    transform: none;
+    z-index: 1;
+}
+
+.card__header {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 12px 16px 10px 16px;
+    border-bottom: 0.5px solid var(--lg-separator);
+    border-top-left-radius: 18px;
+    border-top-right-radius: 18px;
+}
+
+.card__title {
+    font-size: 13.5px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--lg-foreground);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.card__description {
+    font-size: 11.5px;
+    color: var(--lg-muted);
+    line-height: 1.35;
+}
+
+.card__content {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px 14px 12px;
+}
+
+.field-row, .field-switch-row, .field-box {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    min-height: 48px;
+    padding: 12px 16px;
+    border-radius: 14px;
+    background-color: var(--row-bg, rgba(255, 255, 255, 0.045));
+    border: 0.5px solid var(--lg-edge);
+    color: var(--lg-foreground);
+    box-shadow:
+        inset 0 1px 1px 0 rgba(255, 255, 255, 0.08),
+        0 1px 3px var(--lg-drop);
+    transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease, box-shadow 140ms ease;
+    box-sizing: border-box;
+    position: relative;
+}
+.field-switch-row {
+    cursor: pointer;
+}
+.field-switch-row[data-disabled="true"] {
+    cursor: default;
+}
+:where([data-theme="light"], .heroui-root[data-theme="light"]) :is(.field-row, .field-switch-row, .field-box) {
+    --row-bg: rgba(0, 0, 0, 0.035);
+    box-shadow:
+        inset 0 1px 1px 0 rgba(255, 255, 255, 0.6),
+        0 1px 2px rgba(0, 0, 0, 0.04);
+}
+:where([data-theme="dark"], .heroui-root[data-theme="dark"]) :is(.field-row, .field-switch-row, .field-box) {
+    --row-bg: rgba(255, 255, 255, 0.045);
+}
+.field-row:hover, .field-switch-row:hover, .field-box:hover {
+    background-color: var(--lg-highlight);
+    border-color: rgba(255, 255, 255, 0.22);
+    transform: translateY(-0.5px);
+    box-shadow: 0 3px 10px -1px var(--lg-drop);
+}
+.field-row:active, .field-switch-row:active, .field-box:active {
+    transform: scale(0.995);
+}
+.field-row--danger {
+    border-color: rgba(255, 56, 60, 0.32);
+}
+.field-row--danger:hover {
+    border-color: rgba(255, 56, 60, 0.5);
+    background-color: rgba(255, 56, 60, 0.08);
+}
+
+.field-row > label,
+.field-row > div:first-child:not([class*="btn"]):not([class*="button"]) {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding-right: 12px;
+}
+.field-row > :last-child:not(label) {
+    flex-shrink: 0;
+}
+
+.field-box .lg-button {
+    height: 30px;
+    padding: 0 13px;
+    font-size: 12px;
+    border-radius: 9999px;
+}
+
+.keybind-btn {
+    min-width: 104px;
+    font-variant-numeric: tabular-nums;
+    border-color: var(--lg-separator);
+    font-weight: 600;
+}
+.keybind-btn--capturing {
+    border-color: var(--accent, var(--lg-fill));
+    background-color: color-mix(in srgb, var(--accent, var(--lg-fill)) 18%, transparent);
+    color: var(--accent, var(--lg-fill));
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, var(--lg-fill)) 28%, transparent);
+    animation: keybind-pulse 1.2s infinite ease-in-out;
+}
+@keyframes keybind-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+
+.field-callout {
+    padding: 10px 14px;
+    border-radius: 14px;
+    background: var(--lg-highlight);
+    border: 0.5px solid var(--lg-separator);
+    color: var(--lg-muted);
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    line-height: 1.4;
+    box-sizing: border-box;
+}
+
+.field-switch-content {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    flex: 1;
+    min-width: 0;
+}
+
+.field-switch-content [data-slot="label"],
+.field-row > label {
+    font-size: 13.5px;
+    font-weight: 590;
+    letter-spacing: -0.01em;
+    color: var(--lg-foreground);
+    line-height: 1.3;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.field-switch-content [data-slot="description"],
+.field-row small {
+    font-size: 12px;
+    color: var(--lg-muted);
+    font-weight: 450;
+    line-height: 1.45;
+    display: block;
+    margin-top: 2px;
+}
+
+.field-slider-wrapper {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    width: 260px;
+}
+.slider__output {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--lg-foreground);
+    min-width: 44px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.color-swatches {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.color-swatch {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    cursor: pointer;
+    position: relative;
+    transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 180ms ease;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #ffffff;
+}
+.color-swatch:hover {
+    transform: scale(1.15);
+}
+.color-swatch[data-active="true"] {
+    transform: scale(1.1);
+    box-shadow: 0 0 0 2px var(--lg-surface), 0 0 0 4px var(--accent, var(--lg-fill));
+}
+
+.services-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    box-sizing: border-box;
+    margin-bottom: 4px;
+}
+.services-search-field {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.services-search-field.lg-input {
+    width: 100%;
+    max-width: 100%;
+    height: 34px;
+    padding: 0 12px;
+    border-radius: 17px;
+    background-color: var(--row-bg, rgba(255, 255, 255, 0.045));
+    border: 0.5px solid var(--lg-edge);
+    box-shadow: inset 0 1px 1px 0 rgba(255, 255, 255, 0.08), 0 1px 2px var(--lg-drop);
+    box-sizing: border-box;
+}
+.services-search-field.lg-input:focus-within {
+    border-color: var(--accent, var(--lg-fill));
+    background-color: var(--lg-highlight);
+}
+.services-search-field input {
+    font-size: 12.5px;
+}
+.services-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+.services-action-btn {
+    height: 34px;
+    padding: 0 11px;
+    font-size: 12px;
+    font-weight: 550;
+    border-radius: 17px;
+}
+
+.services-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 8px;
+    max-height: 420px;
+    overflow-y: auto;
+    padding: 8px 0 2px 0;
+}
+
+.service-tile {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    min-height: 42px;
+    border-radius: 14px;
+    background-color: var(--row-bg, rgba(255, 255, 255, 0.04));
+    border: 0.5px solid var(--lg-edge);
+    box-shadow: 0 1px 3px var(--lg-drop);
+    font-size: 12.5px;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease;
+}
+.service-tile:hover {
+    background-color: var(--lg-highlight);
+    border-color: rgba(255, 255, 255, 0.22);
+    transform: translateY(-0.5px);
+}
+.service-tile:active {
+    transform: scale(0.98);
+}
+.service-tile__label {
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding-right: 8px;
+    flex: 1;
+    color: var(--lg-foreground);
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    gap: 10px;
+    padding: 4px 0 8px 0;
+}
+.stat-card {
+    background-color: var(--row-bg, rgba(255, 255, 255, 0.04));
+    border: 0.5px solid var(--lg-edge);
+    border-radius: 14px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    box-shadow: 0 1px 3px var(--lg-drop);
+    transition: transform 140ms ease, background-color 140ms ease, box-shadow 140ms ease;
+}
+.stat-card:hover {
+    background-color: var(--lg-highlight);
+    border-color: rgba(255, 255, 255, 0.22);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px -2px var(--lg-drop);
+}
+.stat-card__label {
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--lg-muted);
+}
+.stat-card__value {
+    font-size: 20px;
+    font-weight: 650;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+    color: var(--lg-foreground);
+}
+
+.badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    font-weight: 590;
+    border-radius: 9999px;
+    padding: 2.5px 9px;
+    font-size: 11.5px;
+    letter-spacing: 0.1px;
+    line-height: 1.25;
+}
+.badge--sm {
+    font-size: 10.5px;
+    padding: 2px 7px;
+}
+.badge--primary, .badge--accent {
+    background: var(--accent, var(--lg-fill));
+    color: #ffffff;
+}
+.badge--soft.badge--accent {
+    background: color-mix(in srgb, var(--accent, var(--lg-fill)) 16%, transparent);
+    color: var(--accent, var(--lg-fill));
+    box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--accent, var(--lg-fill)) 30%, transparent);
+}
+.badge--soft.badge--success {
+    background: rgba(52, 199, 89, 0.16);
+    color: #34c759;
+}
+.badge--secondary, .badge--default {
+    background: var(--lg-highlight);
+    color: var(--lg-foreground);
+}
+
+.heroui-pill.lg-glass {
+    position: fixed;
+    z-index: 2147483646;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: auto;
+    height: 38px;
+    padding: 0 8px 0 12px;
+    border-radius: 19px;
+    background-color: var(--lg-pill-tint, rgba(18, 18, 22, 0.72));
+    background-image: var(--lg-rim, none);
+    background-size: 100% 100%;
+    --lg-blur: 1px;
+    --lg-bezel: 8px;
+    --lg-thickness: 14px;
+    --lg-zoom: 1.02;
+    --lg-rim-saturation: 1.6;
+    --lg-refraction: 1.05;
+    -webkit-backdrop-filter: blur(var(--lg-blur, 12px)) var(--lg-filter, saturate(1.4));
+    backdrop-filter: blur(var(--lg-blur, 12px)) var(--lg-filter, saturate(1.4));
+    color: var(--lg-foreground);
+    box-shadow:
+        inset 0 1px 1px 0 rgba(255, 255, 255, 0.35),
+        inset 0 0 0 0.5px var(--lg-edge),
+        0 8px 32px -4px var(--lg-shadow);
+    transform: translateZ(0);
+    user-select: none;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.3;
+    pointer-events: auto;
+    cursor: pointer;
+    transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1),
+                box-shadow 200ms ease,
+                opacity 150ms ease,
+                width 280ms cubic-bezier(0.16, 1, 0.3, 1),
+                height 280ms cubic-bezier(0.16, 1, 0.3, 1),
+                padding 280ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.heroui-pill.lg-glass:hover {
+    transform: translateY(-1.5px) scale(1.03);
+    box-shadow: 0 16px 42px -4px var(--lg-shadow), inset 0 1px 1px 0 rgba(255, 255, 255, 0.3);
+}
+
+.heroui-pill.lg-glass:active {
+    transform: scale(0.96);
+}
+
+.heroui-pill.heroui-pill--minimal {
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    border-radius: 22px;
+    --lg-bezel: 10px;
+    --lg-thickness: 18px;
+    background-color: transparent;
+    justify-content: center;
+    gap: 0;
+}
+
+.heroui-pill--minimal .heroui-pill__main {
+    display: none;
+}
+
+.heroui-pill--minimal .heroui-pill__gear {
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
+    background: transparent;
+    border: none;
+}
+
+.heroui-pill__main {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+}
+
+.heroui-pill__badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    border-radius: 9999px;
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.1px;
+}
+
+.heroui-pill__dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 8px currentColor;
+    animation: heroui-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes heroui-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.35; transform: scale(0.8); }
+}
+
+.heroui-pill__stats {
+    font-size: 12px;
+    color: var(--lg-foreground);
+    font-weight: 550;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.heroui-pill__stat-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-variant-numeric: tabular-nums;
+}
+
+.heroui-pill__gear {
+    position: relative;
+    background: transparent;
+    border: none;
+    color: var(--lg-muted);
+    cursor: pointer;
+    border-radius: 50%;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: background-color 150ms, color 150ms, transform 240ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.heroui-pill__gear:hover {
+    background: var(--lg-highlight);
+    color: var(--lg-foreground);
+    transform: rotate(60deg);
+}
+
+.heroui-pill__gear:active {
+    transform: scale(0.92);
+}
+
+.heroui-pill__indicator-dot {
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent, var(--lg-on));
+    box-shadow: 0 0 6px var(--accent, var(--lg-on));
+    display: none;
+    animation: heroui-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Pop-up Options powered by Glisse Menu */
+.lg-menu-select {
+    display: inline-flex;
+    position: relative;
+}
+.lg-menu-select .lg-button {
+    width: auto;
+    min-width: 140px;
+    height: 34px;
+    padding: 0 12px 0 14px;
+    justify-content: space-between;
+}
+.lg-select-trigger-content {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+}
+.lg-select-current-label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--lg-foreground);
+    white-space: nowrap;
+}
+.lg-select-chevron {
+    width: 12px;
+    height: 12px;
+    color: var(--lg-muted);
+    flex-shrink: 0;
+    transition: transform 180ms ease;
+}
+.lg-menu-select[data-menu-open="true"] .lg-select-chevron {
+    transform: rotate(180deg);
+}
+.lg-select-item-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    gap: 12px;
+}
+.lg-select-item-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    text-align: left;
+}
+.lg-select-item-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--lg-foreground);
+}
+.lg-select-item-desc {
+    font-size: 11px;
+    color: var(--lg-muted);
+    font-weight: 400;
+    line-height: 1.3;
+}
+.lg-select-item-check {
+    color: var(--accent, var(--lg-fill));
+    flex-shrink: 0;
+}
+`);
+    }
+
+    // ------------------------------------------------------------
+    // Glisse Spring Physics Engine & Press Physics (Native Listeners)
+    // ------------------------------------------------------------
+    const isRealDocHidden = () => (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : document.hidden);
+    const movingSprings = new Set();
+    let springFrame = 0;
+    let springLastTime = 0;
+
+    function advanceSpring(s, dt) {
+        const x = s.value - s.target;
+        const v = s.velocity;
+        const half = s.damping / 2;
+        const discriminant = half * half - s.stiffness;
+        if (Math.abs(discriminant) < 1e-4) {
+            const decay = Math.exp(-half * dt);
+            const b = v + half * x;
+            s.value = s.target + decay * (x + b * dt);
+            s.velocity = decay * (v - half * b * dt);
+        } else if (discriminant > 0) {
+            const root = Math.sqrt(discriminant);
+            const r1 = -half + root;
+            const r2 = -half - root;
+            const a = (v - r2 * x) / (r1 - r2);
+            const b = x - a;
+            s.value = s.target + a * Math.exp(r1 * dt) + b * Math.exp(r2 * dt);
+            s.velocity = a * r1 * Math.exp(r1 * dt) + b * r2 * Math.exp(r2 * dt);
+        } else {
+            const omega = Math.sqrt(-discriminant);
+            const decay = Math.exp(-half * dt);
+            const cos = Math.cos(omega * dt);
+            const sin = Math.sin(omega * dt);
+            s.value = s.target + decay * (x * cos + (v + half * x) / omega * sin);
+            s.velocity = decay * (v * cos - (half * v + s.stiffness * x) / omega * sin);
+        }
+    }
+
+    function tickSprings(time) {
+        springFrame = 0;
+        const dt = Math.min(0.1, Math.max(0, (time - springLastTime) / 1e3));
+        springLastTime = time;
+        for (const s of movingSprings) {
+            advanceSpring(s, dt);
+            if (Math.abs(s.value - s.target) < 1e-4 && Math.abs(s.velocity) < 1e-3) {
+                s.value = s.target;
+                s.velocity = 0;
+                movingSprings.delete(s);
+            }
+            s.paint(s.value);
+        }
+        if (movingSprings.size) springFrame = requestAnimationFrame(tickSprings);
+    }
+
+    let cachedPrefersReducedMotion = false;
+    try {
+        if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+            const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
+            cachedPrefersReducedMotion = !!mql.matches;
+            if (typeof mql.addEventListener === 'function') {
+                mql.addEventListener('change', (e) => { cachedPrefersReducedMotion = !!e.matches; });
+            } else if (typeof mql.addListener === 'function') {
+                mql.addListener((e) => { cachedPrefersReducedMotion = !!e.matches; });
+            }
+        }
+    } catch {}
+
+    function createSpring(value, stiffness, damping, paint) {
+        const s = { value, target: value, velocity: 0, stiffness, damping, paint };
+        return {
+            paint: () => paint(s.value),
+            set(target, instant = false) {
+                s.target = target;
+                if (instant || isRealDocHidden() || cachedPrefersReducedMotion) {
+                    s.value = target;
+                    s.velocity = 0;
+                    movingSprings.delete(s);
+                    paint(target);
+                    return;
+                }
+                if (s.value === target && s.velocity === 0 && !movingSprings.has(s)) return;
+                movingSprings.add(s);
+                if (!springFrame) {
+                    springLastTime = Number((document.timeline && document.timeline.currentTime) ?? performance.now());
+                    springFrame = requestAnimationFrame(tickSprings);
+                }
+            },
+            tune(nextStiffness, nextDamping) {
+                s.stiffness = nextStiffness;
+                s.damping = nextDamping;
+            },
+            stop: () => { movingSprings.delete(s); },
+        };
+    }
+
+    const PRESS_POINTER = { grow: 6, press: [417.6, 29.2], release: [230, 23.7] };
+    const PRESS_TOUCH   = { grow: 15, press: [515, 27.3], release: [250, 11.8] };
+
+    function attachPressPhysics(elNode) {
+        if (!elNode) return () => {};
+        const value = [1, 1, 0, 0];
+        const paint = () => {
+            elNode.style.scale = `${value[0]} ${value[1]}`;
+            elNode.style.translate = `${value[2]}px ${value[3]}px`;
+        };
+        const springs = value.map((initial, i) => createSpring(initial, ...PRESS_POINTER.release, (next) => {
+            value[i] = next;
+            paint();
+        }));
+        let pointer = null;
+        const target = (next, [stiffness, damping]) => {
+            springs.forEach((spring, i) => {
+                spring.tune(stiffness, damping);
+                spring.set(next[i] ?? 0);
+            });
+        };
+        const track = (event) => {
+            if (!pointer) return;
+            const { box, feel } = pointer;
+            elNode.style.setProperty('--lg-x', `${(event.clientX - box.left) / box.width * 100}%`);
+            elNode.style.setProperty('--lg-y', `${(event.clientY - box.top) / box.height * 100}%`);
+            const { width, height } = box;
+            const base = 1 + feel.grow / Math.max(width, height);
+            const aspect = width / height;
+            const dx = (event.clientX - pointer.x) / aspect;
+            const dy = event.clientY - pointer.y;
+            const length = Math.hypot(dx, dy);
+            if (!length) return target([base, base, 0, 0], feel.press);
+            const nx = dx / length;
+            const ny = dy / length;
+            const rubber = 1 - 1 / (1 + length / height / (5 * aspect));
+            const stretch = 1 + 6 / height * rubber * Math.abs(Math.abs(nx) - Math.abs(ny));
+            const horizontal = Math.abs(nx) > Math.abs(ny);
+            target([
+                base * (horizontal ? stretch : 1 / stretch),
+                base * (horizontal ? 1 / stretch : stretch),
+                nx * 8 * rubber,
+                ny * 8 * rubber,
+            ], feel.press);
+        };
+        const move = (event) => { if (event.pointerId === pointer?.id) track(event); };
+        const end = (event) => {
+            if (event && event.pointerId !== pointer?.id) return;
+            const feel = pointer?.feel ?? PRESS_POINTER;
+            pointer = null;
+            delete elNode.dataset.pressed;
+            safeWinRem('pointermove', move);
+            safeWinRem('pointerup', end);
+            safeWinRem('pointercancel', end);
+            target([1, 1, 0, 0], feel.release);
+        };
+        const down = (event) => {
+            if (!event.isPrimary || event.button !== 0 || pointer || elNode.matches(':disabled')) return;
+            pointer = {
+                id: event.pointerId,
+                x: event.clientX,
+                y: event.clientY,
+                box: elNode.getBoundingClientRect(),
+                feel: event.pointerType === 'mouse' ? PRESS_POINTER : PRESS_TOUCH,
+            };
+            elNode.dataset.pressed = '';
+            safeWinAdd('pointermove', move);
+            safeWinAdd('pointerup', end);
+            safeWinAdd('pointercancel', end);
+            track(event);
+        };
+        const reset = () => end();
+        elNode.addEventListener('pointerdown', down);
+        const offBlur = addInternalBlurListener(reset);
+        return () => {
+            end();
+            springs.forEach((spring) => spring.stop());
+            elNode.removeEventListener('pointerdown', down);
+            offBlur();
+            elNode.style.removeProperty('scale');
+            elNode.style.removeProperty('translate');
+        };
+    }
+
+    // Async Glisse Optical Refraction & Specular Rim Engine
+    // Reuses a single scratch canvas + native URL.createObjectURL(blob) (zero base64/FileReader overhead)
+    // and prunes unused SVG filters & blob URLs on eviction and modal unmount.
+    const SVG_REFRACT_NS = 'http://www.w3.org/2000/svg';
+    const REFRACTS_BACKDROP = typeof navigator !== 'undefined' && /Chrom(?:e|ium)\//.test(navigator.userAgent);
+    const lenses = new Map();
+    const elementLensKeys = new WeakMap();
+    const profileCache = new Map();
+    let refractDefs = null;
+    let lensIdCounter = 0;
+    let scratchCanvas = null;
+    let scratchCtx = null;
+
+    function revokeObjectUrls(urls) {
+        if (!urls || !urls.length) return;
+        const revokeFn = origRevokeObjectURL
+            ? (u) => origRevokeObjectURL.call(URL, u)
+            : (typeof URL !== 'undefined' && URL.revokeObjectURL ? (u) => URL.revokeObjectURL(u) : null);
+        if (!revokeFn) return;
+        for (let i = 0; i < urls.length; i++) {
+            try { revokeFn(urls[i]); } catch {}
+        }
+    }
+
+    function disposeLensEntry(key, entry) {
+        if (entry) {
+            if (entry.filterNode && entry.filterNode.parentNode) {
+                entry.filterNode.remove();
+            }
+            if (entry.objectUrls) {
+                revokeObjectUrls(entry.objectUrls);
+                entry.objectUrls = null;
+            }
+            if (entry.subscribers) entry.subscribers.clear();
+        }
+        lenses.delete(key);
+    }
+
+    function pruneUnusedLenses() {
+        for (const [k, entry] of lenses.entries()) {
+            if (!entry || (entry.refCount || 0) === 0) {
+                disposeLensEntry(k, entry);
+            }
+        }
+    }
+
+    function createSvgEl(name, attrs) {
+        const element = document.createElementNS(SVG_REFRACT_NS, name);
+        for (const k in attrs) element.setAttribute(k, String(attrs[k]));
+        return element;
+    }
+
+    function ensureRefractDefs() {
+        if (refractDefs && refractDefs.isConnected) return refractDefs;
+        const root = createSvgEl('svg', { width: 0, height: 0, 'aria-hidden': 'true' });
+        root.style.cssText = 'position:absolute;pointer-events:none;width:0;height:0;';
+        refractDefs = createSvgEl('defs', {});
+        root.appendChild(refractDefs);
+        const target = uiState.shadowRoot || document.body || document.documentElement;
+        if (target) target.appendChild(root);
+        return refractDefs;
+    }
+
+    function getBezelProfile(bezel, thickness) {
+        const key = `${bezel}-${thickness}`;
+        const cached = profileCache.get(key);
+        if (cached) return cached;
+        const samples = new Float32Array(128);
+        let maximum = 0;
+        for (let i = 0; i < samples.length; i++) {
+            const t = Math.max(1e-3, i / (samples.length - 1));
+            const surface = (1 - (1 - t) ** 4) ** 0.25;
+            const incident = Math.atan((1 - t) ** 3 / surface ** 3);
+            const refracted = Math.asin(Math.sin(incident) / 1.5);
+            samples[i] = Math.tan(incident - refracted) * (thickness + surface * bezel);
+            maximum = Math.max(maximum, samples[i]);
+        }
+        const result = { samples, maximum };
+        profileCache.set(key, result);
+        return result;
+    }
+
+    function imageDataToUrlAsync(imageData, w, h, createdUrls) {
+        return new Promise((resolve) => {
+            try {
+                if (!scratchCanvas) {
+                    scratchCanvas = document.createElement('canvas');
+                    scratchCtx = scratchCanvas.getContext('2d');
+                }
+                if (!scratchCtx) return resolve(null);
+                if (scratchCanvas.width !== w) scratchCanvas.width = w;
+                if (scratchCanvas.height !== h) scratchCanvas.height = h;
+                scratchCtx.putImageData(imageData, 0, 0);
+                if (typeof scratchCanvas.toBlob === 'function') {
+                    scratchCanvas.toBlob((blob) => {
+                        if (!blob) return resolve(null);
+                        if (origCreateObjectURL || (typeof URL !== 'undefined' && URL.createObjectURL)) {
+                            const objUrl = origCreateObjectURL
+                                ? origCreateObjectURL.call(URL, blob)
+                                : URL.createObjectURL(blob);
+                            if (createdUrls) createdUrls.push(objUrl);
+                            return resolve(objUrl);
+                        }
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve(typeof reader.result === 'string' ? reader.result : null);
+                        reader.onerror = () => resolve(null);
+                        reader.readAsDataURL(blob);
+                    }, 'image/png');
+                } else {
+                    resolve(scratchCanvas.toDataURL('image/png'));
+                }
+            } catch {
+                resolve(null);
+            }
+        });
+    }
+
+    function computeGlisseMapsAsync(width, height, radius, selection, shape, needDisplacement, createdUrls) {
+        const bezel = shape.bezel ?? Math.min(10, Math.max(4, Math.min(width, height) * 0.12));
+        const thickness = shape.thickness ?? Math.min(24, Math.max(8, Math.min(width, height) * 0.2));
+        const { samples, maximum } = getBezelProfile(bezel, thickness);
+        const w = Math.ceil(width);
+        const h = Math.ceil(height);
+
+        const field = needDisplacement ? new ImageData(w, h) : null;
+        const fieldU32 = field ? new Uint32Array(field.data.buffer) : null;
+        if (fieldU32) fieldU32.fill(0xFF808080);
+
+        const shine = new ImageData(w, h);
+        const shineU32 = new Uint32Array(shine.data.buffer);
+        const useMagnify = needDisplacement && !selection && shape.zoom > 1;
+        const magnify = useMagnify ? new ImageData(w, h) : null;
+        const magnifyU32 = magnify ? new Uint32Array(magnify.data.buffer) : null;
+
+        const halfW = width / 2;
+        const halfH = height / 2;
+        const innerW = halfW - radius;
+        const innerH = halfH - radius;
+        const maxSampleIdx = samples.length - 1;
+        const reach = Math.max(width, height) / 2;
+        const direction = selection ? 1 : -1;
+        const bloomDenom = bezel * 0.22;
+        const radiusSqLimit = radius * radius + 1e-9;
+        const sqrt1_2 = Math.SQRT1_2;
+
+        if (magnifyU32) {
+            const magX = new Uint8Array(w);
+            for (let x = 0; x < w; x++) magX[x] = Math.round(127.5 - ((x + 0.5) - halfW) / reach * 127.5);
+            for (let y = 0; y < h; y++) {
+                const magYBits = 0xFF800000 | (Math.round(127.5 - ((y + 0.5) - halfH) / reach * 127.5) << 8);
+                const off = y * w;
+                for (let x = 0; x < w; x++) magnifyU32[off + x] = magYBits | magX[x];
+            }
+        }
+
+        let outShine = 0;
+        let outField = 0xFF808080;
+        function evalPixel(distance, nx, ny) {
+            outField = 0xFF808080;
+            if (distance < bezel && fieldU32) {
+                const sample = distance / bezel * maxSampleIdx;
+                const lower = Math.floor(sample);
+                const a = samples[lower];
+                const shift = a + (samples[Math.min(lower + 1, maxSampleIdx)] - a) * (sample - lower);
+                const rF = Math.round(127.5 + direction * nx * shift / maximum * 127.5);
+                const gF = Math.round(127.5 + direction * ny * shift / maximum * 127.5);
+                const rc = rF < 0 ? 0 : rF > 255 ? 255 : rF;
+                const gc = gF < 0 ? 0 : gF > 255 ? 255 : gF;
+                outField = (0xFF800000 | (gc << 8) | rc) >>> 0;
             }
 
-            *, *::before, *::after {
-                box-sizing: inherit;
+            const light = -(nx + ny) * sqrt1_2;
+            const glint = light > 0 ? light ** 3 : 0;
+            const reflected = light < 0 ? (-light) ** 3 : 0;
+            let r = 255, g = 255, b = 255, alpha = 0;
+
+            if (selection) {
+                const d0 = (distance - 0.18) / 0.22;
+                const d1 = (distance - 0.42) / 0.22;
+                const d2 = (distance - 0.66) / 0.22;
+                const b0 = Math.exp(-(d0 * d0));
+                const b1 = Math.exp(-(d1 * d1));
+                const b2 = Math.exp(-(d2 * d2));
+                const peak = Math.max(b0, b1, b2);
+                alpha = peak * (0.06 + 0.8 * glint + 0.35 * reflected) * 0.85;
+                const invPeak = peak ? 0.35 / peak : 0;
+                r = Math.round(255 * (0.65 + b0 * invPeak));
+                g = Math.round(255 * (0.65 + b1 * invPeak));
+                b = Math.round(255 * (0.65 + b2 * invPeak));
+                r = r >= 255 ? 255 : r > 0 ? r : 0;
+                g = g >= 255 ? 255 : g > 0 ? g : 0;
+                b = b >= 255 ? 255 : b > 0 ? b : 0;
+            } else {
+                const rim = Math.exp(-(((distance - 0.4) / 0.38) ** 2));
+                const bloom = Math.exp(-((distance / bloomDenom) ** 2));
+                alpha = rim * (0.045 + 0.52 * glint + 0.2 * reflected) + bloom * 0.02 * glint;
             }
 
-            /* Custom Glisse Scrollbars */
-            ::-webkit-scrollbar {
-                width: 6px;
-                height: 6px;
-            }
-            ::-webkit-scrollbar-track {
-                background: transparent;
-            }
-            ::-webkit-scrollbar-thumb {
-                background: var(--lg-separator);
-                border-radius: 9999px;
-            }
-            ::-webkit-scrollbar-thumb:hover {
-                background: var(--lg-muted);
-            }
+            const aByte = Math.round((alpha < 0 ? 0 : alpha > 1 ? 1 : alpha) * 255);
+            outShine = ((aByte << 24) | (b << 16) | (g << 8) | r) >>> 0;
+        }
 
-            /* Glisse Modal Container & Window */
-            .modal__backdrop {
-                position: fixed;
-                inset: 0;
-                z-index: 2147483647;
-                background: rgba(0, 0, 0, 0.45);
-                -webkit-backdrop-filter: blur(16px);
-                backdrop-filter: blur(16px);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                padding: 20px;
-                box-sizing: border-box;
-                pointer-events: auto;
-                animation: lg-fade-in 180ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
-            }
+        let templateBezelRowOffset = -1;
+        for (let y = 0; y < h; y++) {
+            const py = (y + 0.5) - halfH;
+            const qy = Math.abs(py) - innerH;
+            const signPy = py > 0 ? 1 : py < 0 ? -1 : 0;
+            const rowPixelOffset = y * w;
+            const qyNegBezel = qy < -bezel;
 
-            .modal__backdrop--closing {
-                pointer-events: none !important;
-                animation: lg-fade-out 160ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
-            }
-
-            .modal__backdrop--draggable {
-                background: transparent !important;
-                backdrop-filter: none !important;
-                -webkit-backdrop-filter: none !important;
-                pointer-events: none !important;
-            }
-
-            @keyframes lg-fade-in {
-                from { opacity: 0; }
-                to { opacity: 1; }
-            }
-            @keyframes lg-fade-out {
-                from { opacity: 1; }
-                to { opacity: 0; }
-            }
-
-            .modal__container {
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                width: min(940px, 95vw);
-                height: min(700px, 88vh);
-                min-height: 520px;
-            }
-
-            .modal__container--draggable {
-                pointer-events: none !important;
-                position: fixed !important;
-                inset: 0 !important;
-                width: 100vw !important;
-                height: 100vh !important;
-                max-width: none !important;
-                max-height: none !important;
-                display: block !important;
-                padding: 0 !important;
-            }
-
-            .modal__dialog {
-                width: 100%;
-                height: 100%;
-                border-radius: 24px;
-                color: var(--lg-foreground);
-                background-color: var(--lg-dialog-tint, rgba(14, 14, 18, 0.88)) !important;
-                -webkit-backdrop-filter: blur(36px) saturate(1.8) !important;
-                backdrop-filter: blur(36px) saturate(1.8) !important;
-                border: 0.5px solid var(--lg-surface-edge, rgba(255, 255, 255, 0.14));
-                box-shadow:
-                    inset 0 1px 1.5px 0 rgba(255, 255, 255, 0.20),
-                    inset 0 0 0 0.5px var(--lg-surface-edge, rgba(255, 255, 255, 0.14)),
-                    0 28px 72px rgba(0, 0, 0, 0.60),
-                    0 6px 24px rgba(0, 0, 0, 0.35) !important;
-                display: flex;
-                flex-direction: column;
-                overflow: hidden;
-                animation: lg-scale-in 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
-            }
-
-            .modal__dialog--draggable {
-                pointer-events: auto !important;
-                position: absolute !important;
-                margin: 0 !important;
-                width: min(920px, 92vw);
-                height: min(680px, 86vh);
-                min-height: 480px;
-                box-sizing: border-box;
-                will-change: left, top;
-                transition: none !important;
-            }
-
-            :where([data-theme="light"], .heroui-root[data-theme="light"]) .modal__dialog {
-                background-color: var(--lg-dialog-tint, rgba(240, 240, 246, 0.92)) !important;
-                border-color: rgba(0, 0, 0, 0.12);
-                box-shadow:
-                    inset 0 1px 1.5px 0 rgba(255, 255, 255, 0.85),
-                    inset 0 0 0 0.5px rgba(255, 255, 255, 0.50),
-                    0 24px 64px rgba(20, 20, 30, 0.22),
-                    0 4px 16px rgba(20, 20, 30, 0.10) !important;
-            }
-
-            .modal__dialog::before {
-                content: "";
-                position: absolute;
-                inset: 0;
-                border-radius: inherit;
-                pointer-events: none;
-                background: linear-gradient(
-                    135deg,
-                    rgba(255, 255, 255, 0.24) 0%,
-                    rgba(255, 255, 255, 0.08) 22%,
-                    rgba(255, 255, 255, 0.01) 50%,
-                    rgba(255, 255, 255, 0.06) 78%,
-                    rgba(255, 255, 255, 0.18) 100%
-                );
-                -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-                -webkit-mask-composite: xor;
-                mask-composite: exclude;
-                padding: 1px;
-                z-index: 2;
-            }
-
-            .modal__backdrop--closing .modal__dialog {
-                animation: lg-scale-out 160ms cubic-bezier(0.4, 0, 0.2, 1) forwards !important;
-            }
-
-            @keyframes lg-scale-in {
-                from { opacity: 0; transform: scale(0.96) translateY(8px); }
-                to { opacity: 1; transform: scale(1) translateY(0); }
-            }
-            @keyframes lg-scale-out {
-                from { opacity: 1; transform: scale(1) translateY(0); }
-                to { opacity: 0; transform: scale(0.97) translateY(6px); }
-            }
-
-            .modal__header {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                padding: 12px 18px;
-                border-bottom: 0.5px solid var(--lg-separator);
-                flex-shrink: 0;
-                gap: 16px;
-                position: relative;
-                z-index: 4;
-            }
-
-            .modal__header--draggable {
-                cursor: grab;
-                user-select: none;
-                -webkit-user-select: none;
-                touch-action: none;
-            }
-
-            .modal__header--draggable:active,
-            .modal__header--dragging {
-                cursor: grabbing !important;
-            }
-
-            .modal__header--draggable .modal__header-nav,
-            .modal__header--draggable .lg-tab-bar,
-            .modal__header--draggable .lg-button,
-            .modal__header--draggable button {
-                cursor: default;
-                pointer-events: auto;
-            }
-
-            .modal__brand {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }
-
-            .modal__icon {
-                width: 32px;
-                height: 32px;
-                border-radius: 10px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                background: color-mix(in srgb, var(--accent, var(--lg-fill)) 18%, transparent);
-                color: var(--accent, var(--lg-fill));
-                flex-shrink: 0;
-                box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--accent, var(--lg-fill)) 30%, transparent);
-            }
-
-            .modal__heading {
-                margin: 0;
-                font-size: 15px;
-                font-weight: 600;
-                letter-spacing: -0.015em;
-                color: var(--lg-foreground);
-                white-space: nowrap;
-            }
-
-            .modal__header-nav {
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                flex: 1;
-            }
-
-            .modal__body {
-                position: relative;
-                padding: 16px 20px 20px 20px;
-                overflow: hidden;
-                flex: 1;
-                min-height: 0;
-                display: flex;
-                flex-direction: column;
-                z-index: 3;
-            }
-
-            /* Tabs Panels */
-            .tabs__panel {
-                display: none;
-                flex-direction: column;
-                gap: 14px;
-                width: 100%;
-                height: 100%;
-                min-height: 0;
-                overflow-y: auto;
-                padding: 2px 6px 80px 2px;
-                scrollbar-width: thin;
-                scrollbar-color: var(--lg-separator) transparent;
-            }
-            .tabs__panel[data-active="true"] {
-                display: flex;
-            }
-
-            /* Responsive 2-Column Grid */
-            .grid-2col {
-                display: grid;
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 14px;
-                align-items: start;
-                width: 100%;
-            }
-            .col-stack {
-                display: flex;
-                flex-direction: column;
-                gap: 12px;
-                min-width: 0;
-            }
-            @media (max-width: 840px) {
-                .grid-2col {
-                    grid-template-columns: 1fr;
+            const spanLimit = qyNegBezel ? (innerW - bezel - 1e-9) : (innerW + (qy < 0 ? qy : 0) - 1e-9);
+            let flatStart = 0;
+            let flatEnd = 0;
+            if (spanLimit >= 0) {
+                flatStart = Math.max(0, Math.ceil(halfW - spanLimit - 0.5));
+                flatEnd = Math.min(w, Math.floor(halfW + spanLimit - 0.5) + 1);
+                if (flatEnd > flatStart) {
+                    if (!qyNegBezel) {
+                        const flatDist = radius - qy;
+                        if (flatDist < 0) {
+                            shineU32.fill(0x00FFFFFF, rowPixelOffset + flatStart, rowPixelOffset + flatEnd);
+                        } else {
+                            evalPixel(flatDist, 0, signPy);
+                            shineU32.fill(outShine, rowPixelOffset + flatStart, rowPixelOffset + flatEnd);
+                            if (fieldU32 && outField !== 0xFF808080) {
+                                fieldU32.fill(outField, rowPixelOffset + flatStart, rowPixelOffset + flatEnd);
+                            }
+                        }
+                    }
+                } else {
+                    flatStart = 0;
+                    flatEnd = 0;
                 }
             }
 
-            /* Clean Uniform Inset Cards (Lightweight & Smooth) */
-            .card {
-                display: flex;
-                flex-direction: column;
-                border-radius: 20px;
-                background-color: var(--card-bg, rgba(255, 255, 255, 0.035));
-                border: 0.5px solid var(--lg-edge);
-                box-shadow:
-                    inset 0 1px 1px 0 rgba(255, 255, 255, 0.08),
-                    0 2px 8px -2px var(--lg-drop);
-                overflow: visible;
-                padding: 0;
-                position: relative;
-            }
-            :where([data-theme="light"], .heroui-root[data-theme="light"]) .card {
-                --card-bg: rgba(0, 0, 0, 0.025);
-                box-shadow:
-                    inset 0 1px 1px 0 rgba(255, 255, 255, 0.6),
-                    0 2px 8px -2px rgba(0, 0, 0, 0.04);
-            }
-            :where([data-theme="dark"], .heroui-root[data-theme="dark"]) .card {
-                --card-bg: rgba(255, 255, 255, 0.035);
-            }
-            /* ============================================================
-               Dropdown Menus Z-Index Stacking & Popover Elevation
-               Ensures dropdown menus ALWAYS stay on top of all other cards,
-               rows, switches, sliders, and buttons in both static and floating mode
-               ============================================================ */
-            :is(.card, .col-stack)[data-menu-open="true"],
-            :is(.card, .col-stack):has([aria-expanded="true"]) {
-                z-index: 9000 !important;
+            if (qyNegBezel && templateBezelRowOffset !== -1) {
+                if (flatStart > 0) {
+                    shineU32.copyWithin(rowPixelOffset, templateBezelRowOffset, templateBezelRowOffset + flatStart);
+                    if (fieldU32) fieldU32.copyWithin(rowPixelOffset, templateBezelRowOffset, templateBezelRowOffset + flatStart);
+                }
+                if (flatEnd < w) {
+                    shineU32.copyWithin(rowPixelOffset + flatEnd, templateBezelRowOffset + flatEnd, templateBezelRowOffset + w);
+                    if (fieldU32) fieldU32.copyWithin(rowPixelOffset + flatEnd, templateBezelRowOffset + flatEnd, templateBezelRowOffset + w);
+                }
+                continue;
             }
 
-            :is(.card__content)[data-menu-open="true"] {
-                z-index: 9100 !important;
-            }
+            for (let seg = 0; seg < 2; seg++) {
+                const xStart = seg === 0 ? 0 : flatEnd;
+                const xEnd = seg === 0 ? flatStart : w;
+                for (let x = xStart; x < xEnd; x++) {
+                    const px = (x + 0.5) - halfW;
+                    const absPx = px < 0 ? -px : px;
+                    const qx = absPx - innerW;
+                    if (qx < -bezel && qyNegBezel) continue;
 
-            :is(.field-row, .field-switch-row, .field-box, .switch)[data-menu-open="true"] {
-                z-index: 9200 !important;
-            }
+                    let distance, nx, ny;
+                    if (qx <= 0) {
+                        distance = radius - (qy < 0 ? qx : qy);
+                        nx = qx > qy ? (px > 0 ? 1 : px < 0 ? -1 : 0) : 0;
+                        ny = qx > qy ? 0 : signPy;
+                    } else if (qy <= 0) {
+                        distance = radius - qx;
+                        nx = px > 0 ? 1 : px < 0 ? -1 : 0;
+                        ny = 0;
+                    } else {
+                        if (qx * qx + qy * qy > radiusSqLimit) {
+                            shineU32[rowPixelOffset + x] = 0x00FFFFFF;
+                            continue;
+                        }
+                        const length = Math.hypot(qx, qy);
+                        distance = radius - length;
+                        nx = qx / length * (px > 0 ? 1 : px < 0 ? -1 : 0);
+                        ny = qy / length * signPy;
+                    }
 
-            .lg-menu-select[data-menu-open="true"],
-            .lg-menu-select:has([aria-expanded="true"]),
-            .lg-menu[data-phase="open"],
-            .lg-menu[data-open="true"] {
-                z-index: 9500 !important;
+                    const pixelIdx = rowPixelOffset + x;
+                    if (distance < 0) {
+                        shineU32[pixelIdx] = 0x00FFFFFF;
+                        continue;
+                    }
+                    evalPixel(distance, nx, ny);
+                    shineU32[pixelIdx] = outShine;
+                    if (fieldU32 && outField !== 0xFF808080) fieldU32[pixelIdx] = outField;
+                }
+            }
+            if (qyNegBezel && templateBezelRowOffset === -1) {
+                templateBezelRowOffset = rowPixelOffset;
             }
-
-            /* Prevent other rows/buttons from elevating on hover above open dropdown menus */
-            [data-has-menu-open="true"] :is(.field-row, .field-switch-row, .field-box, .switch):not([data-menu-open="true"]):hover {
-                transform: none !important;
-                z-index: 1 !important;
-            }
-
-            .card__header {
-                display: flex;
-                flex-direction: column;
-                gap: 2px;
-                padding: 12px 16px 10px 16px;
-                border-bottom: 0.5px solid var(--lg-separator);
-                border-top-left-radius: 18px;
-                border-top-right-radius: 18px;
-            }
-
-            .card__title {
-                font-size: 13.5px;
-                font-weight: 600;
-                letter-spacing: -0.01em;
-                color: var(--lg-foreground);
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-            }
-
-            .card__description {
-                font-size: 11.5px;
-                color: var(--lg-muted);
-                line-height: 1.35;
-            }
-
-            .card__content {
-                display: flex;
-                flex-direction: column;
-                gap: 8px;
-                padding: 10px 12px 14px 12px;
-            }
-
-            /* Uniform Clean Setting Rows (Lightweight & Smooth) */
-            .field-row, .field-switch-row, .field-box, .switch {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                gap: 14px;
-                min-height: 48px;
-                padding: 12px 16px;
-                border-radius: 14px;
-                background-color: var(--row-bg, rgba(255, 255, 255, 0.045));
-                border: 0.5px solid var(--lg-edge);
-                color: var(--lg-foreground);
-                box-shadow:
-                    inset 0 1px 1px 0 rgba(255, 255, 255, 0.08),
-                    0 1px 3px var(--lg-drop);
-                transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease, box-shadow 140ms ease;
-                box-sizing: border-box;
-                position: relative;
-            }
-            :where([data-theme="light"], .heroui-root[data-theme="light"]) :is(.field-row, .field-switch-row, .field-box, .switch) {
-                --row-bg: rgba(0, 0, 0, 0.035);
-                box-shadow:
-                    inset 0 1px 1px 0 rgba(255, 255, 255, 0.6),
-                    0 1px 2px rgba(0, 0, 0, 0.04);
-            }
-            :where([data-theme="dark"], .heroui-root[data-theme="dark"]) :is(.field-row, .field-switch-row, .field-box, .switch) {
-                --row-bg: rgba(255, 255, 255, 0.045);
-            }
-            .field-row:hover, .field-switch-row:hover, .field-box:hover, .switch:hover {
-                background-color: var(--lg-highlight);
-                border-color: rgba(255, 255, 255, 0.22);
-                transform: translateY(-0.5px);
-                box-shadow: 0 3px 10px -1px var(--lg-drop);
-            }
-            .field-row:active, .field-switch-row:active, .field-box:active, .switch:active {
-                transform: scale(0.995);
-            }
-            .field-row--danger {
-                border-color: rgba(255, 56, 60, 0.32);
-            }
-            .field-row--danger:hover {
-                border-color: rgba(255, 56, 60, 0.5);
-                background-color: rgba(255, 56, 60, 0.08);
-            }
-
-            /* Uniform Action Buttons System (Clean, Legible & Never-Wrap) */
-            .field-row > label,
-            .field-row > div:first-child:not([class*="btn"]):not([class*="button"]) {
-                flex: 1 1 auto;
-                min-width: 0;
-                padding-right: 12px;
-            }
-            .field-row > :last-child:not(label) {
-                flex-shrink: 0;
-            }
-
-            /* Quick Range Presets Chips in TimeBoost */
-            .field-box .lg-button {
-                height: 30px !important;
-                padding: 0 13px !important;
-                font-size: 12px !important;
-                border-radius: 9999px !important;
-            }
-
-            /* Keybind Recorder Button */
-            .keybind-btn {
-                min-width: 104px !important;
-                font-variant-numeric: tabular-nums !important;
-                border-color: var(--lg-separator) !important;
-                font-weight: 600 !important;
-            }
-            .keybind-btn--capturing {
-                border-color: var(--accent, var(--lg-fill)) !important;
-                background-color: color-mix(in srgb, var(--accent, var(--lg-fill)) 18%, transparent) !important;
-                color: var(--accent, var(--lg-fill)) !important;
-                box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, var(--lg-fill)) 28%, transparent) !important;
-                animation: keybind-pulse 1.2s infinite ease-in-out !important;
-            }
-            @keyframes keybind-pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.7; }
-            }
-
-            .field-callout {
-                padding: 10px 14px;
-                border-radius: 14px;
-                background: var(--lg-highlight);
-                border: 0.5px solid var(--lg-separator);
-                color: var(--lg-muted);
-                font-size: 12px;
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                line-height: 1.4;
-                box-sizing: border-box;
-            }
-
-            .field-switch-content {
-                display: flex;
-                flex-direction: column;
-                gap: 3px;
-                flex: 1;
-                min-width: 0;
-            }
-
-            .field-switch-content [data-slot="label"],
-            .field-switch-row [data-slot="label"],
-            .field-row > label,
-            .switch [data-slot="label"] {
-                font-size: 13.5px;
-                font-weight: 590;
-                letter-spacing: -0.01em;
-                color: var(--lg-foreground);
-                line-height: 1.3;
-                display: flex;
-                flex-direction: column;
-                gap: 2px;
-            }
-
-            .field-switch-content [data-slot="description"],
-            .field-switch-row [data-slot="description"],
-            .field-row > label small,
-            .field-row small,
-            .switch [data-slot="description"] {
-                font-size: 12px;
-                color: var(--lg-muted);
-                font-weight: 450;
-                line-height: 1.45;
-                display: block;
-                margin-top: 2px;
-                opacity: 1;
-            }
-
-            /* Glisse Slider Container */
-            .field-slider-wrapper {
-                display: inline-flex;
-                align-items: center;
-                gap: 12px;
-                width: 260px;
-            }
-            .slider__output {
-                font-size: 13px;
-                font-weight: 600;
-                letter-spacing: -0.01em;
-                color: var(--lg-foreground);
-                min-width: 44px;
-                text-align: right;
-                font-variant-numeric: tabular-nums;
-            }
-
-            /* Color Swatches */
-            .color-swatches {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }
-            .color-swatch {
-                width: 26px;
-                height: 26px;
-                border-radius: 50%;
-                border: 2px solid transparent;
-                cursor: pointer;
-                position: relative;
-                transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 180ms ease;
-                box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
-            }
-            .color-swatch:hover {
-                transform: scale(1.15);
-            }
-            .color-swatch[data-active="true"] {
-                transform: scale(1.1);
-                box-shadow: 0 0 0 2px var(--lg-surface), 0 0 0 4px var(--accent, var(--lg-fill));
-            }
-
-            /* Services Search & Grid */
-.services-toolbar {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                width: 100%;
-                box-sizing: border-box;
-                margin-bottom: 4px;
-            }
-            .services-search-field {
-                flex: 1 1 auto;
-                min-width: 0 !important;
-            }
-            .services-search-field .lg-input,
-            .services-search-field.lg-input {
-                width: 100% !important;
-                max-width: 100% !important;
-                height: 34px !important;
-                padding: 0 12px !important;
-                border-radius: 17px !important;
-                background-color: var(--row-bg, rgba(255, 255, 255, 0.045)) !important;
-                border: 0.5px solid var(--lg-edge) !important;
-                box-shadow: inset 0 1px 1px 0 rgba(255, 255, 255, 0.08), 0 1px 2px var(--lg-drop) !important;
-                box-sizing: border-box !important;
-            }
-            .services-search-field .lg-input:focus-within,
-            .services-search-field.lg-input:focus-within {
-                border-color: var(--accent, var(--lg-fill)) !important;
-                background-color: var(--lg-highlight) !important;
-            }
-            .services-search-field input {
-                font-size: 12.5px !important;
-                min-width: 0 !important;
-            }
-            .services-actions {
-                display: inline-flex;
-                align-items: center;
-                gap: 6px;
-                flex-shrink: 0;
-            }
-            .services-actions .lg-button,
-            .services-action-btn {
-                height: 34px !important;
-                padding: 0 11px !important;
-                font-size: 12px !important;
-                font-weight: 550 !important;
-                border-radius: 17px !important;
-                white-space: nowrap !important;
-                flex-shrink: 0 !important;
-            }
-
-            .services-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-                gap: 8px;
-                max-height: 420px;
-                overflow-y: auto;
-                padding: 8px 0 2px 0;
-            }
-
-            .service-tile {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                padding: 8px 12px;
-                min-height: 42px;
-                border-radius: 14px;
-                background-color: var(--row-bg, rgba(255, 255, 255, 0.04));
-                border: 0.5px solid var(--lg-edge);
-                box-shadow: 0 1px 3px var(--lg-drop);
-                font-size: 12.5px;
-                cursor: pointer;
-                user-select: none;
-                transition: background-color 140ms ease, border-color 140ms ease, transform 100ms ease;
-            }
-            .service-tile:hover {
-                background-color: var(--lg-highlight);
-                border-color: rgba(255, 255, 255, 0.22);
-                transform: translateY(-0.5px);
-            }
-            .service-tile:active {
-                transform: scale(0.98);
-            }
-            .service-tile__label {
-                font-weight: 500;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-                padding-right: 8px;
-                flex: 1;
-                color: var(--lg-foreground);
-            }
-
-            /* Glisse Liquid Glass Switch Controls (Subtle & Drag-Responsive) */
-            .lg-switch {
-                box-shadow:
-                    inset 0 1px 2px rgba(0, 0, 0, 0.25),
-                    inset 0 0 0 0.5px var(--lg-edge),
-                    0 1px 2px rgba(0, 0, 0, 0.08);
-                transition: box-shadow 150ms ease, opacity 150ms ease;
-            }
-            .lg-switch:hover {
-                box-shadow:
-                    inset 0 1px 2px rgba(0, 0, 0, 0.35),
-                    inset 0 0 0 0.5px rgba(255, 255, 255, 0.25),
-                    0 2px 6px rgba(0, 0, 0, 0.12);
-            }
-            .lg-switch-thumb {
-                box-shadow:
-                    0 3px 8px rgba(0, 0, 0, 0.22),
-                    inset 0 1px 1px rgba(255, 255, 255, 0.8),
-                    inset 0 -1px 1px rgba(0, 0, 0, 0.1),
-                    inset 0 0 0 0.5px rgba(255, 255, 255, 0.4) !important;
-                background-image: var(--lg-rim, none) !important;
-                background-size: 100% 100% !important;
-                -webkit-backdrop-filter: blur(2px) saturate(1.3) !important;
-                backdrop-filter: blur(2px) saturate(1.3) !important;
-            }
-
-            /* Statistics Tiles Grid */
-            .stats-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-                gap: 10px;
-                padding: 4px 0 8px 0;
-            }
-            .stat-card {
-                background-color: var(--row-bg, rgba(255, 255, 255, 0.04));
-                border: 0.5px solid var(--lg-edge);
-                border-radius: 14px;
-                padding: 12px 14px;
-                display: flex;
-                flex-direction: column;
-                gap: 4px;
-                box-shadow: 0 1px 3px var(--lg-drop);
-                transition: transform 140ms ease, background-color 140ms ease, box-shadow 140ms ease;
-            }
-            .stat-card:hover {
-                background-color: var(--lg-highlight);
-                border-color: rgba(255, 255, 255, 0.22);
-                transform: translateY(-1px);
-                box-shadow: 0 4px 12px -2px var(--lg-drop);
-            }
-            .stat-card__label {
-                font-size: 10.5px;
-                font-weight: 600;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-                color: var(--lg-muted);
-            }
-            .stat-card__value {
-                font-size: 20px;
-                font-weight: 650;
-                letter-spacing: -0.02em;
-                font-variant-numeric: tabular-nums;
-                color: var(--lg-foreground);
-            }
-
-            /* Badges */
-            .badge {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                gap: 4px;
-                font-weight: 590;
-                border-radius: 9999px;
-                padding: 2.5px 9px;
-                font-size: 11.5px;
-                letter-spacing: 0.1px;
-                line-height: 1.25;
-            }
-            .badge--sm {
-                font-size: 10.5px;
-                padding: 2px 7px;
-            }
-            .badge--primary, .badge--accent {
-                background: var(--accent, var(--lg-fill));
-                color: #ffffff;
-            }
-            .badge--soft.badge--accent {
-                background: color-mix(in srgb, var(--accent, var(--lg-fill)) 16%, transparent);
-                color: var(--accent, var(--lg-fill));
-                box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--accent, var(--lg-fill)) 30%, transparent);
-            }
-            .badge--soft.badge--success {
-                background: rgba(52, 199, 89, 0.16);
-                color: #34c759;
-            }
-            .badge--soft.badge--warning {
-                background: rgba(255, 149, 0, 0.16);
-                color: #ff9500;
-            }
-            .badge--soft.badge--danger {
-                background: rgba(255, 59, 48, 0.16);
-                color: #ff3b30;
-            }
-            .badge--secondary {
-                background: var(--lg-highlight);
-                color: var(--lg-foreground);
-            }
-
-            /* Glisse Dynamic Island Status Pill (Subtle Refraction Lens) */
-            .heroui-pill {
-                position: fixed;
-                z-index: 2147483646;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                height: 38px;
-                padding: 0 8px 0 12px;
-                border-radius: 9999px;
-                background: none !important;
-                background-color: var(--lg-pill-tint, rgba(18, 18, 22, 0.72)) !important;
-                background-image: var(--lg-rim, none) !important;
-                background-size: 100% 100% !important;
-                --lg-blur: 1px !important;
-                --lg-bezel: 8px !important;
-                --lg-thickness: 16px !important;
-                --lg-zoom: 1.02 !important;
-                --lg-rim-saturation: 1.6 !important;
-                -webkit-backdrop-filter: blur(var(--lg-blur, 12px)) var(--lg-filter, saturate(1.4)) !important;
-                backdrop-filter: blur(var(--lg-blur, 12px)) var(--lg-filter, saturate(1.4)) !important;
-                color: var(--lg-foreground);
-                box-shadow:
-                    inset 0 1px 1px 0 rgba(255, 255, 255, 0.35),
-                    inset 0 0 0 0.5px var(--lg-edge),
-                    0 8px 32px -4px var(--lg-shadow);
-                transform: translateZ(0);
-                user-select: none;
-                font-size: 13px;
-                font-weight: 500;
-                line-height: 1.3;
-                pointer-events: auto;
-                cursor: pointer;
-                transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1),
-                            box-shadow 200ms ease,
-                            opacity 150ms ease,
-                            width 280ms cubic-bezier(0.16, 1, 0.3, 1),
-                            height 280ms cubic-bezier(0.16, 1, 0.3, 1),
-                            padding 280ms cubic-bezier(0.16, 1, 0.3, 1);
-            }
-
-            .heroui-pill:hover {
-                transform: translateY(-1.5px) scale(1.03);
-                box-shadow: 0 16px 42px -4px var(--lg-shadow), inset 0 1px 1px 0 rgba(255, 255, 255, 0.3);
-            }
-
-            .heroui-pill:active {
-                transform: scale(0.96);
-            }
-
-            .heroui-pill--minimal {
-                width: 44px !important;
-                height: 44px !important;
-                padding: 0 !important;
-                border-radius: 50% !important;
-                background-color: transparent !important;
-                background: none !important;
-                justify-content: center;
-                gap: 0;
-            }
-
-            .heroui-pill--minimal .heroui-pill__main {
-                display: none !important;
-            }
-
-            .heroui-pill--minimal .heroui-pill__gear {
-                width: 100%;
-                height: 100%;
-                border-radius: 50%;
-                background: transparent;
-                border: none;
-            }
-
-            .heroui-pill__main {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                cursor: pointer;
-            }
-
-            .heroui-pill__badge {
-                display: inline-flex;
-                align-items: center;
-                gap: 5px;
-                padding: 3px 9px;
-                border-radius: 9999px;
-                font-weight: 600;
-                font-size: 11px;
-                letter-spacing: 0.1px;
-            }
-
-            .heroui-pill__dot {
-                width: 6px;
-                height: 6px;
-                border-radius: 50%;
-                background: currentColor;
-                box-shadow: 0 0 8px currentColor;
-                animation: heroui-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-            }
-
-            @keyframes heroui-pulse {
-                0%, 100% { opacity: 1; transform: scale(1); }
-                50% { opacity: 0.35; transform: scale(0.8); }
-            }
-
-            .heroui-pill__stats {
-                font-size: 12px;
-                color: var(--lg-foreground);
-                font-weight: 550;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }
-
-            .heroui-pill__stat-item {
-                display: inline-flex;
-                align-items: center;
-                gap: 3px;
-                font-variant-numeric: tabular-nums;
-            }
-
-            .heroui-pill__gear {
-                position: relative;
-                background: transparent;
-                border: none;
-                color: var(--lg-muted);
-                cursor: pointer;
-                border-radius: 50%;
-                width: 28px;
-                height: 28px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                padding: 0;
-                transition: background-color 150ms, color 150ms, transform 240ms cubic-bezier(0.16, 1, 0.3, 1);
-            }
-
-            .heroui-pill__gear:hover {
-                background: var(--lg-highlight);
-                color: var(--lg-foreground);
-                transform: rotate(60deg);
-            }
-
-            .heroui-pill__gear:active {
-                transform: scale(0.92);
-            }
-
-            .heroui-pill__indicator-dot {
-                position: absolute;
-                top: 3px;
-                right: 3px;
-                width: 7px;
-                height: 7px;
-                border-radius: 50%;
-                background: var(--accent, var(--lg-on));
-                box-shadow: 0 0 6px var(--accent, var(--lg-on));
-                display: none;
-                animation: heroui-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-            }
-
-            /* Pop-up Options powered by Glisse.Menu */
-            .lg-menu-select {
-                display: inline-flex;
-                position: relative;
-            }
-            .lg-menu-select .lg-button {
-                width: auto !important;
-                min-width: 140px;
-                height: 34px !important;
-                padding: 0 12px 0 14px !important;
-                display: inline-flex !important;
-                align-items: center !important;
-                justify-content: space-between !important;
-                border-radius: 17px !important;
-                box-sizing: border-box !important;
-            }
-            .lg-menu-select .lg-button[data-icon="only"] {
-                width: auto !important;
-                padding: 0 12px 0 14px !important;
-            }
-            .lg-menu-select .lg-select-trigger-content {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                gap: 8px;
-                width: 100%;
-            }
-            .lg-menu-select .lg-select-current-label {
-                font-size: 13px;
-                font-weight: 500;
-                color: var(--lg-foreground);
-                white-space: nowrap;
-            }
-            .lg-menu-select .lg-select-chevron {
-                width: 12px;
-                height: 12px;
-                color: var(--lg-muted);
-                flex-shrink: 0;
-                transition: transform 180ms ease;
-            }
-            .lg-menu-select[data-menu-open="true"] .lg-select-chevron {
-                transform: rotate(180deg);
-            }
-            .lg-menu-select .lg-menu-glyph {
-                display: none !important;
-            }
-            .lg-menu-select .lg-menu-card {
-                min-width: 240px !important;
-                max-width: 340px !important;
-                width: max-content !important;
-                border-radius: 18px !important;
-                background: transparent !important;
-                box-shadow: none !important;
-                border: none !important;
-                outline: none !important;
-                z-index: 100000 !important;
-            }
-            .lg-menu-select .lg-menu-surface {
-                border-radius: inherit;
-                background: var(--lg-surface);
-                -webkit-backdrop-filter: blur(28px) saturate(2);
-                backdrop-filter: blur(28px) saturate(2);
-                box-shadow:
-                    inset 0 0 0 0.5px var(--lg-surface-edge),
-                    0 20px 60px var(--lg-shadow);
-                pointer-events: none;
-                z-index: -1;
-            }
-            .lg-menu-select .lg-menu-content {
-                padding: 6px !important;
-            }
-            .lg-menu-select .lg-menu-item {
-                padding: 8px 12px !important;
-                min-height: 38px !important;
-                border-radius: 12px !important;
-                width: 100% !important;
-                box-sizing: border-box !important;
-            }
-            .lg-select-item-inner {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                width: 100%;
-                gap: 12px;
-            }
-            .lg-select-item-text {
-                display: flex;
-                flex-direction: column;
-                gap: 1px;
-                text-align: left;
-            }
-            .lg-select-item-title {
-                font-size: 13px;
-                font-weight: 500;
-                color: var(--lg-foreground);
-            }
-            .lg-select-item-desc {
-                font-size: 11px;
-                color: var(--lg-muted);
-                font-weight: 400;
-                line-height: 1.3;
-            }
-            .lg-select-item-check {
-                color: var(--accent, var(--lg-fill));
-                flex-shrink: 0;
-            }
-            .lg-input input[type="number"] {
-                text-align: center;
-                font-weight: 600;
-                -moz-appearance: textfield;
-            }
-            .lg-input input[type="number"]::-webkit-outer-spin-button,
-            .lg-input input[type="number"]::-webkit-inner-spin-button {
-                -webkit-appearance: none;
-                margin: 0;
-            }
-        `);
-    }
-function getEffectiveTheme(thm) {
-        const t = thm || settings.theme;
-        if (t === 'auto') {
-            try { return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark'; }
-            catch { return 'dark'; }
         }
-        return t;
+
+        const scale = maximum * 2 * shape.level;
+        const zoomScale = magnify ? 2 * reach * (1 - 1 / shape.zoom) : 0;
+
+        return Promise.all([
+            field ? imageDataToUrlAsync(field, w, h, createdUrls) : Promise.resolve(null),
+            imageDataToUrlAsync(shine, w, h, createdUrls),
+            magnify ? imageDataToUrlAsync(magnify, w, h, createdUrls) : Promise.resolve(null),
+        ]).then(([displacement, highlight, zoomMap]) => ({
+            displacement,
+            highlight,
+            zoom: zoomMap ? { map: zoomMap, scale: zoomScale } : null,
+            scale,
+        }));
     }
 
-    let pillOpacityLogTimer = null;
+    function buildSvgFilterNode(width, height, selection, shape, mapsResult) {
+        const { displacement, highlight, zoom, scale } = mapsResult;
+        if (!displacement) return null;
+        const id = `glisse-${++lensIdCounter}`;
+        const box = { x: 0, y: 0, width, height };
+        const filter = createSvgEl('filter', {
+            id,
+            ...box,
+            filterUnits: 'userSpaceOnUse',
+            primitiveUnits: 'userSpaceOnUse',
+            'color-interpolation-filters': 'sRGB',
+        });
+        filter.appendChild(createSvgEl('feImage', {
+            href: displacement,
+            ...box,
+            preserveAspectRatio: 'none',
+            result: 'field',
+        }));
+
+        if (selection) {
+            // Single-pass optical displacement for TabBar droplet lens (keeps 60-120fps drag smoothness)
+            filter.appendChild(createSvgEl('feDisplacementMap', {
+                in: 'SourceGraphic',
+                in2: 'field',
+                scale,
+                xChannelSelector: 'R',
+                yChannelSelector: 'G',
+            }));
+        } else {
+            if (zoom) {
+                filter.appendChild(createSvgEl('feImage', {
+                    href: zoom.map,
+                    ...box,
+                    preserveAspectRatio: 'none',
+                    result: 'zoom',
+                }));
+                filter.appendChild(createSvgEl('feDisplacementMap', {
+                    in: 'SourceGraphic',
+                    in2: 'zoom',
+                    scale: zoom.scale,
+                    xChannelSelector: 'R',
+                    yChannelSelector: 'G',
+                    result: 'magnified',
+                }));
+            }
+            filter.appendChild(createSvgEl('feDisplacementMap', {
+                in: zoom ? 'magnified' : 'SourceGraphic',
+                in2: 'field',
+                scale,
+                xChannelSelector: 'R',
+                yChannelSelector: 'G',
+                result: 'bent',
+            }));
+            filter.appendChild(createSvgEl('feGaussianBlur', {
+                in: 'bent',
+                stdDeviation: 0.4,
+                result: 'displaced',
+            }));
+            filter.appendChild(createSvgEl('feColorMatrix', {
+                in: 'displaced',
+                type: 'saturate',
+                values: 1.5,
+                result: 'face',
+            }));
+            if (shape.saturation > 1 && highlight) {
+                const mask = createSvgEl('feComponentTransfer', { in: 'shine', result: 'mask' });
+                mask.appendChild(createSvgEl('feFuncA', { type: 'linear', slope: 1.8 }));
+                filter.appendChild(createSvgEl('feColorMatrix', {
+                    in: 'displaced',
+                    type: 'saturate',
+                    values: shape.saturation,
+                    result: 'vivid',
+                }));
+                filter.appendChild(createSvgEl('feImage', {
+                    href: highlight,
+                    ...box,
+                    preserveAspectRatio: 'none',
+                    result: 'shine',
+                }));
+                filter.appendChild(mask);
+                filter.appendChild(createSvgEl('feComposite', {
+                    in: 'vivid',
+                    in2: 'mask',
+                    operator: 'in',
+                    result: 'edge',
+                }));
+                filter.appendChild(createSvgEl('feBlend', {
+                    in: 'edge',
+                    in2: 'face',
+                    mode: 'normal',
+                }));
+            }
+        }
+
+        ensureRefractDefs().appendChild(filter);
+        return { id, node: filter };
+    }
+
+    let cachedRootShape = null;
+    function getRootShape() {
+        if (cachedRootShape) return cachedRootShape;
+        const rootEl = uiState.containerEl || uiState.hostEl || document.documentElement;
+        if (!rootEl) return { bezel: 8, thickness: 16, level: 1.05, zoom: 1.02, saturation: 1.6 };
+        try {
+            const style = getComputedStyle(rootEl);
+            const parseVal = (name, def) => {
+                const v = parseFloat(style.getPropertyValue(name));
+                return Number.isFinite(v) ? v : def;
+            };
+            cachedRootShape = {
+                bezel: parseVal('--lg-bezel', 8),
+                thickness: parseVal('--lg-thickness', 16),
+                level: parseVal('--lg-refraction', 1.05),
+                zoom: Math.max(1, parseVal('--lg-zoom', 1.02)),
+                saturation: Math.max(1, parseVal('--lg-rim-saturation', 1.6)),
+            };
+            return cachedRootShape;
+        } catch {
+            return { bezel: 8, thickness: 16, level: 1.05, zoom: 1.02, saturation: 1.6 };
+        }
+    }
+
+    function applyLensEntry(element, entry, filtered) {
+        const prevKey = elementLensKeys.get(element);
+        if (prevKey !== entry.key) {
+            if (prevKey) {
+                const prevEntry = lenses.get(prevKey);
+                if (prevEntry && prevEntry.refCount > 0) prevEntry.refCount--;
+            }
+            elementLensKeys.set(element, entry.key);
+            entry.refCount = (entry.refCount || 0) + 1;
+        }
+        if (filtered && entry.filter) {
+            element.style.setProperty('--lg-filter', entry.filter);
+        }
+        if (entry.rim) {
+            element.style.setProperty('--lg-rim', entry.rim);
+        }
+    }
+
+    function evictUnusedLensIfNeeded() {
+        if (lenses.size < 64) return;
+        for (const [k, entry] of lenses.entries()) {
+            if (!entry || (entry.refCount || 0) === 0) {
+                disposeLensEntry(k, entry);
+                break;
+            }
+        }
+    }
+
+    const refractResizeCallbacks = new WeakMap();
+    let sharedRefractResizeObserver = null;
+    function getSharedRefractResizeObserver() {
+        if (!sharedRefractResizeObserver && typeof ResizeObserver !== 'undefined') {
+            sharedRefractResizeObserver = new ResizeObserver((entries) => {
+                for (let i = 0; i < entries.length; i++) {
+                    const cb = refractResizeCallbacks.get(entries[i].target);
+                    if (cb) cb();
+                }
+            });
+        }
+        return sharedRefractResizeObserver;
+    }
+
+    function attachRefraction(element, selection = false) {
+        let rafId = 0;
+        const filtered = REFRACTS_BACKDROP;
+
+        const update = () => {
+            rafId = 0;
+            if (!element.isConnected) return;
+            const rawW = element.offsetWidth;
+            const rawH = element.offsetHeight;
+            if (!rawW || !rawH) return;
+
+            const width = Math.round(rawW / 4) * 4;
+            const height = Math.round(rawH / 4) * 4;
+            let compStyle = null;
+            try { compStyle = getComputedStyle(element); } catch {}
+            let corner = element.style.borderRadius;
+            if (!corner) {
+                if (element.classList.contains('heroui-pill')) corner = '9999px';
+                else corner = (compStyle && compStyle.borderTopLeftRadius) || '16px';
+            }
+            const radius = Math.min(
+                width / 2,
+                height / 2,
+                corner.endsWith('%') ? Math.min(width, height) * parseFloat(corner) / 100 : (parseFloat(corner) || 16)
+            );
+
+            const rootShape = getRootShape();
+            const readShapeVal = (prop, fallback) => {
+                const raw = (compStyle && compStyle.getPropertyValue(prop)) || element.style.getPropertyValue(prop);
+                const parsed = parseFloat(raw);
+                return Number.isFinite(parsed) ? parsed : fallback;
+            };
+            const shape = {
+                bezel: readShapeVal('--lg-bezel', rootShape.bezel),
+                thickness: readShapeVal('--lg-thickness', rootShape.thickness),
+                level: readShapeVal('--lg-refraction', rootShape.level),
+                zoom: Math.max(1, readShapeVal('--lg-zoom', rootShape.zoom)),
+                saturation: Math.max(1, readShapeVal('--lg-rim-saturation', rootShape.saturation)),
+            };
+
+            const key = `${width}-${height}-${radius}-${selection}-${filtered}-${shape.bezel}-${shape.thickness}-${shape.level}-${shape.zoom}-${shape.saturation}`;
+
+            let entry = lenses.get(key);
+            if (entry) {
+                lenses.delete(key);
+                lenses.set(key, entry);
+                if (!entry.ready) entry.subscribers.add(element);
+                applyLensEntry(element, entry, filtered);
+                return;
+            }
+
+            evictUnusedLensIfNeeded();
+            entry = { key, filter: null, rim: null, filterNode: null, objectUrls: null, ready: false, refCount: 0, subscribers: new Set([element]) };
+            lenses.set(key, entry);
+            applyLensEntry(element, entry, filtered);
+
+            const createdUrls = [];
+            computeGlisseMapsAsync(width, height, radius, selection, shape, filtered, createdUrls).then((mapsResult) => {
+                const currentEntry = lenses.get(key);
+                if (!currentEntry || currentEntry !== entry) {
+                    revokeObjectUrls(createdUrls);
+                    return;
+                }
+                currentEntry.ready = true;
+                currentEntry.objectUrls = createdUrls;
+                if (mapsResult.highlight) {
+                    currentEntry.rim = `url("${mapsResult.highlight}")`;
+                }
+                if (filtered && mapsResult.displacement) {
+                    const built = buildSvgFilterNode(width, height, selection, shape, mapsResult);
+                    if (built) {
+                        currentEntry.filter = `url("#${built.id}")`;
+                        currentEntry.filterNode = built.node;
+                    }
+                } else {
+                    currentEntry.filter = 'none';
+                }
+                for (const subEl of currentEntry.subscribers) {
+                    if (subEl.isConnected && elementLensKeys.get(subEl) === key) {
+                        if (filtered && currentEntry.filter) subEl.style.setProperty('--lg-filter', currentEntry.filter);
+                        if (currentEntry.rim) subEl.style.setProperty('--lg-rim', currentEntry.rim);
+                    }
+                }
+                currentEntry.subscribers.clear();
+            });
+        };
+
+        const scheduleUpdate = () => {
+            if (!rafId) rafId = requestAnimationFrame(update);
+        };
+
+        const observer = getSharedRefractResizeObserver();
+        if (observer) {
+            refractResizeCallbacks.set(element, scheduleUpdate);
+            observer.observe(element);
+        }
+        scheduleUpdate();
+
+        return () => {
+            if (rafId) cancelAnimationFrame(rafId);
+            if (observer) observer.unobserve(element);
+            refractResizeCallbacks.delete(element);
+            const appliedKey = elementLensKeys.get(element);
+            if (appliedKey) {
+                elementLensKeys.delete(element);
+                const entry = lenses.get(appliedKey);
+                if (entry) {
+                    entry.subscribers.delete(element);
+                    if (entry.refCount > 0) entry.refCount--;
+                }
+            }
+            element.style.removeProperty('--lg-filter');
+            element.style.removeProperty('--lg-rim');
+        };
+    }
+
+    // ------------------------------------------------------------
+    // Vanilla DOM Element & Glisse Component Builders
+    // ------------------------------------------------------------
+    function el(tag, attrs, children) {
+        const node = document.createElement(tag);
+        if (attrs) {
+            for (const k in attrs) {
+                const v = attrs[k];
+                if (v == null || v === false) continue;
+                if (k === 'className') node.className = v;
+                else if (k === 'style' && typeof v === 'object') {
+                    for (const sk in v) {
+                        const sv = v[sk];
+                        if (sv == null) continue;
+                        if (sk.startsWith('--')) node.style.setProperty(sk, String(sv));
+                        else node.style[sk] = sv;
+                    }
+                }
+                else if (k === 'dataset' && typeof v === 'object') {
+                    for (const dk in v) {
+                        if (v[dk] !== undefined && v[dk] !== null) node.dataset[dk] = v[dk];
+                    }
+                } else if (k.startsWith('on') && typeof v === 'function') {
+                    node.addEventListener(k.slice(2).toLowerCase(), v);
+                } else if (v === true) {
+                    node.setAttribute(k, '');
+                } else {
+                    node.setAttribute(k, String(v));
+                }
+            }
+        }
+        if (children != null) {
+            const append = (item) => {
+                if (item == null || item === false) return;
+                if (Array.isArray(item)) item.forEach(append);
+                else if (item instanceof Node) node.appendChild(item);
+                else node.appendChild(document.createTextNode(String(item)));
+            };
+            append(children);
+        }
+        return node;
+    }
+
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    function svgNode(tag, attrs, children) {
+        const node = document.createElementNS(SVG_NS, tag);
+        if (attrs) {
+            for (const k in attrs) {
+                if (attrs[k] != null) node.setAttribute(k, String(attrs[k]));
+            }
+        }
+        if (children) children.forEach((c) => c && node.appendChild(c));
+        return node;
+    }
+
+    function createChevronIcon() {
+        return svgNode('svg', {
+            class: 'lg-select-chevron', width: 12, height: 12, viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': 2.4,
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+        }, [svgNode('path', { d: 'm6 9 6 6 6-6' })]);
+    }
+
+    function createCheckIcon(className = 'lg-select-item-check', size = 14, strokeWidth = 2.5) {
+        return svgNode('svg', {
+            class: className, width: size, height: size, viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': strokeWidth,
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+        }, [svgNode('polyline', { points: '20 6 9 17 4 12' })]);
+    }
+
+    function createGearIcon(size = 20) {
+        return svgNode('svg', {
+            width: size, height: size, viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': 2.2,
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+        }, [
+            svgNode('circle', { cx: 12, cy: 12, r: 3 }),
+            svgNode('path', { d: 'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z' }),
+        ]);
+    }
+
+    function createCloseIcon() {
+        return svgNode('svg', {
+            width: 15, height: 15, viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': 2.4,
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+        }, [
+            svgNode('line', { x1: 18, y1: 6, x2: 6, y2: 18 }),
+            svgNode('line', { x1: 6, y1: 6, x2: 18, y2: 18 }),
+        ]);
+    }
+
+    function createInfoIcon() {
+        return svgNode('svg', {
+            width: 15, height: 15, viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': 2.2,
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+            style: 'flex-shrink:0',
+        }, [
+            svgNode('circle', { cx: 12, cy: 12, r: 10 }),
+            svgNode('line', { x1: 12, y1: 16, x2: 12, y2: 12 }),
+            svgNode('line', { x1: 12, y1: 8, x2: 12.01, y2: 8 }),
+        ]);
+    }
+
+    function createDragIcon() {
+        return svgNode('svg', {
+            width: 10, height: 10, viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': 2.5,
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+        }, [
+            svgNode('polyline', { points: '5 9 2 12 5 15' }),
+            svgNode('polyline', { points: '9 5 12 2 15 5' }),
+            svgNode('polyline', { points: '15 19 12 22 9 19' }),
+            svgNode('polyline', { points: '19 9 22 12 19 15' }),
+            svgNode('line', { x1: 2, y1: 12, x2: 22, y2: 12 }),
+            svgNode('line', { x1: 12, y1: 2, x2: 12, y2: 22 }),
+        ]);
+    }
+
+    function createResetIcon() {
+        return svgNode('svg', {
+            width: 13, height: 13, viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': 2.2,
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+            style: 'margin-right:5px',
+        }, [
+            svgNode('path', { d: 'M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8' }),
+            svgNode('path', { d: 'M21 3v5h-5' }),
+            svgNode('path', { d: 'M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16' }),
+            svgNode('path', { d: 'M3 21v-5h5' }),
+        ]);
+    }
+
+    function createMagnifierIcon() {
+        return svgNode('svg', {
+            viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor',
+            'stroke-width': 1.5, 'stroke-linecap': 'round', 'aria-hidden': 'true',
+        }, [
+            svgNode('circle', { cx: 7, cy: 7, r: 4.75 }),
+            svgNode('path', { d: 'm10.5 10.5 3.25 3.25' }),
+        ]);
+    }
+
+    function createGlisseButton({ icon, variant = 'glass', destructive = false, label = '', className = '', style = null, title = '', ariaLabel = '', onClick }) {
+        const btn = el('button', {
+            type: 'button',
+            className: `lg-glass lg-button ${className}`.trim(),
+            title: title || undefined,
+            'aria-label': ariaLabel || undefined,
+            style,
+        });
+        if (icon != null) btn.dataset.icon = label ? '' : 'only';
+        if (variant && variant !== 'glass') btn.dataset.variant = variant;
+        if (destructive) {
+            btn.dataset.destructive = '';
+            btn.style.setProperty('--lg-tint', 'var(--lg-destructive)');
+        }
+        let labelNode = null;
+        if (icon) btn.appendChild(icon);
+        if (label) {
+            labelNode = el('span', null, label);
+            btn.appendChild(labelNode);
+        }
+        if (onClick) btn.addEventListener('click', onClick);
+        const destroyPress = attachPressPhysics(btn);
+        return {
+            el: btn,
+            setLabel(next) {
+                if (labelNode) labelNode.textContent = next;
+                else btn.textContent = next;
+            },
+            setVariant(next) {
+                if (!next || next === 'glass') delete btn.dataset.variant;
+                else btn.dataset.variant = next;
+            },
+            destroy: destroyPress,
+        };
+    }
+
+    function createGlisseInput({ value = '', placeholder = '', type = 'text', icon = null, className = '', style = null, min, max, onInput, onBlur, onKeyDown }) {
+        const wrapper = el('div', {
+            className: `lg-glass lg-input ${className}`.trim(),
+            style,
+        });
+        if (icon) {
+            wrapper.appendChild(el('span', { className: 'lg-input-icon' }, icon));
+        }
+        const input = el('input', {
+            type,
+            placeholder: placeholder || undefined,
+            value: String(value),
+            min: min != null ? String(min) : undefined,
+            max: max != null ? String(max) : undefined,
+        });
+        wrapper.appendChild(input);
+
+        let clearBtn = null;
+        if (type === 'search') {
+            clearBtn = el('button', {
+                type: 'button',
+                className: 'lg-input-clear',
+                'aria-label': 'Clear',
+                style: { display: value ? 'grid' : 'none' },
+            }, svgNode('svg', {
+                viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor',
+                'stroke-width': 1.5, 'stroke-linecap': 'round',
+            }, [svgNode('path', { d: 'm4.5 4.5 7 7m0-7-7 7' })]));
+            clearBtn.addEventListener('pointerdown', (e) => e.preventDefault());
+            clearBtn.addEventListener('click', () => {
+                input.value = '';
+                clearBtn.style.display = 'none';
+                input.focus();
+                if (onInput) onInput('');
+            });
+            wrapper.appendChild(clearBtn);
+        }
+
+        wrapper.addEventListener('pointerdown', (e) => {
+            if (e.target !== input && e.target !== clearBtn) input.focus();
+        });
+        input.addEventListener('input', () => {
+            if (clearBtn) clearBtn.style.display = input.value ? 'grid' : 'none';
+            if (onInput) onInput(input.value);
+        });
+        if (onBlur) input.addEventListener('blur', () => onBlur(input.value));
+        if (onKeyDown) input.addEventListener('keydown', onKeyDown);
+
+        return {
+            el: wrapper,
+            input,
+            getValue: () => input.value,
+            setValue(next) {
+                input.value = String(next);
+                if (clearBtn) clearBtn.style.display = input.value ? 'grid' : 'none';
+            },
+        };
+    }
+
+    function createGlisseSearchField(opts) {
+        return createGlisseInput(Object.assign({ type: 'search', icon: createMagnifierIcon() }, opts));
+    }
+
+    // Imperative Glisse Switch with full spring physics & pointer drag
+    const SWITCH_TRAVEL = 21.7125;
+    const clamp01 = (v) => Math.min(1, Math.max(0, v));
+    const gestureHeld = (at, moved) => moved || performance.now() - at >= 150;
+
+    function createGlisseSwitch({ checked = false, disabled = false, onChange }) {
+        let isChecked = Boolean(checked);
+        let isDisabled = Boolean(disabled);
+
+        const fillEl = el('span', { className: 'lg-switch-fill', 'aria-hidden': 'true' });
+        const faceEl = el('span', { className: 'lg-thumb-face' });
+        const thumbEl = el('span', { className: 'lg-switch-thumb', 'aria-hidden': 'true' }, faceEl);
+        const btn = el('button', {
+            type: 'button',
+            role: 'switch',
+            'aria-checked': String(isChecked),
+            className: 'lg-switch',
+            disabled: isDisabled,
+        }, [fillEl, thumbEl]);
+
+        let x = 0;
+        let scale = 0.65;
+        const paint = () => {
+            thumbEl.style.transform = `translate(${x}px, -50%) scale(${scale})`;
+        };
+
+        const initial = isChecked ? 1 : 0;
+        const posSpring = createSpring(initial, 1000, 80, (val) => {
+            x = val * SWITCH_TRAVEL;
+            paint();
+        });
+        const colorSpring = createSpring(initial, 1000, 80, (val) => {
+            fillEl.style.opacity = String(clamp01(val));
+        });
+        const liftSpring = createSpring(0, 2000, 80, (val) => {
+            scale = 0.65 + 0.25 * val;
+            faceEl.style.opacity = String(1 - 0.85 * clamp01(val));
+            paint();
+        });
+        posSpring.paint();
+        colorSpring.paint();
+        liftSpring.paint();
+
+        const syncSprings = (instant = false) => {
+            btn.setAttribute('aria-checked', String(isChecked));
+            posSpring.set(isChecked ? 1 : 0, instant);
+            colorSpring.set(isChecked ? 1 : 0, instant);
+        };
+
+        let gesture = null;
+        let ignoreClick = false;
+
+        const settle = (next) => {
+            const old = gesture;
+            gesture = null;
+            liftSpring.set(0);
+            if (old && btn.hasPointerCapture(old.id)) btn.releasePointerCapture(old.id);
+            if (next === undefined || next === isChecked) return syncSprings();
+            isChecked = next;
+            syncSprings();
+            if (onChange) onChange(isChecked);
+        };
+
+        const onDown = (event) => {
+            if (!event.isPrimary || event.button !== 0 || isDisabled) return;
+            event.preventDefault();
+            ignoreClick = false;
+            gesture = {
+                id: event.pointerId,
+                x: event.clientX,
+                y: event.clientY,
+                from: isChecked ? 1 : 0,
+                moved: false,
+                at: performance.now(),
+                box: btn.getBoundingClientRect(),
+            };
+            btn.setPointerCapture(event.pointerId);
+            liftSpring.set(1);
+        };
+        const onMove = (event) => {
+            if (event.pointerId !== gesture?.id) return;
+            const dx = event.clientX - gesture.x;
+            const dy = Math.abs(event.clientY - gesture.y);
+            if (!gestureHeld(gesture.at, gesture.moved) && dy > 10 && dy > Math.abs(dx) + 4) {
+                ignoreClick = true;
+                return settle();
+            }
+            if (!gesture.moved && Math.abs(dx) < 4) return;
+            gesture.moved = true;
+            const val = gesture.from + dx / SWITCH_TRAVEL;
+            const overshoot = val < 0 ? val : val > 1 ? val - 1 : 0;
+            posSpring.set(clamp01(val) + overshoot / 22);
+            colorSpring.set(val > 0.5 ? 1 : 0);
+        };
+        const onUp = (event) => {
+            if (event.pointerId !== gesture?.id) return;
+            ignoreClick = true;
+            const { from, x: startX, moved, box } = gesture;
+            const val = from + (event.clientX - startX) / SWITCH_TRAVEL;
+            const near = event.clientY >= box.top - 24 && event.clientY <= box.bottom + 24;
+            settle(moved ? val > 0.5 : near ? !isChecked : undefined);
+        };
+        const onTouchMove = (event) => {
+            if (gesture && event.cancelable && gestureHeld(gesture.at, gesture.moved)) event.preventDefault();
+        };
+        const onCancel = () => {
+            if (!gesture) return;
+            ignoreClick = true;
+            settle();
+        };
+        const onClick = () => {
+            if (ignoreClick) ignoreClick = false;
+            else if (!isDisabled) {
+                isChecked = !isChecked;
+                syncSprings();
+                if (onChange) onChange(isChecked);
+            }
+        };
+
+        btn.addEventListener('pointerdown', onDown);
+        btn.addEventListener('pointermove', onMove);
+        btn.addEventListener('pointerup', onUp);
+        btn.addEventListener('pointercancel', onCancel);
+        btn.addEventListener('lostpointercapture', onCancel);
+        btn.addEventListener('touchmove', onTouchMove, { passive: false });
+        btn.addEventListener('click', onClick);
+
+        return {
+            el: btn,
+            setChecked(next) {
+                const boolNext = Boolean(next);
+                if (boolNext === isChecked) return;
+                isChecked = boolNext;
+                syncSprings();
+            },
+            setDisabled(next) {
+                isDisabled = Boolean(next);
+                btn.disabled = isDisabled;
+            },
+            destroy() {
+                posSpring.stop();
+                colorSpring.stop();
+                liftSpring.stop();
+            },
+        };
+    }
+
+    // Imperative Glisse Slider
+    function createGlisseSlider({ value = 1, min = 0.2, max = 1, step = 0.05, disabled = false, onChange }) {
+        let curVal = Number(value);
+        const calcProgress = (v) => (max > min ? Math.min(1, Math.max(0, (v - min) / (max - min))) : 0);
+
+        const fillEl = el('span', { className: 'lg-slider-fill' });
+        const trackEl = el('span', { className: 'lg-slider-track', 'aria-hidden': 'true' }, fillEl);
+        const faceEl = el('span', { className: 'lg-thumb-face' });
+        const thumbEl = el('span', { className: 'lg-slider-thumb', 'aria-hidden': 'true' }, faceEl);
+        const input = el('input', {
+            type: 'range',
+            min: String(min),
+            max: String(max),
+            step: String(step),
+            value: String(curVal),
+            disabled: Boolean(disabled),
+        });
+        const sliderEl = el('div', {
+            className: 'lg-slider',
+            style: { '--lg-progress': String(calcProgress(curVal)) },
+        }, [trackEl, thumbEl, input]);
+
+        const outputEl = el('span', { className: 'slider__output' }, `${Math.round(curVal * 100)}%`);
+        const wrapper = el('div', {
+            className: 'field-slider-wrapper',
+            dataset: disabled ? { disabled: 'true' } : undefined,
+        }, [sliderEl, outputEl]);
+
+        const liftSpring = createSpring(0, 2000, 80, (amount) => {
+            thumbEl.style.scale = String(0.6 + 0.4 * amount);
+            faceEl.style.opacity = String(1 - 0.85 * clamp01(amount));
+        });
+        let winUpAttached = false;
+        const release = () => {
+            if (winUpAttached) {
+                safeWinRem('pointerup', release);
+                winUpAttached = false;
+            }
+            liftSpring.set(0);
+        };
+        const hold = () => {
+            if (input.disabled) return;
+            liftSpring.set(1);
+            if (!winUpAttached) {
+                safeWinAdd('pointerup', release);
+                winUpAttached = true;
+            }
+        };
+
+        input.addEventListener('pointerdown', hold);
+        ['pointerup', 'pointercancel', 'lostpointercapture', 'blur'].forEach((t) => input.addEventListener(t, release));
+
+        input.addEventListener('input', () => {
+            curVal = input.valueAsNumber;
+            sliderEl.style.setProperty('--lg-progress', String(calcProgress(curVal)));
+            outputEl.textContent = `${Math.round(curVal * 100)}%`;
+            if (onChange) onChange(curVal);
+        });
+
+        return {
+            el: wrapper,
+            setValue(next) {
+                curVal = Number(next);
+                input.value = String(curVal);
+                sliderEl.style.setProperty('--lg-progress', String(calcProgress(curVal)));
+                outputEl.textContent = `${Math.round(curVal * 100)}%`;
+            },
+            setDisabled(next) {
+                input.disabled = Boolean(next);
+                if (next) wrapper.dataset.disabled = 'true';
+                else delete wrapper.dataset.disabled;
+            },
+            destroy() {
+                release();
+                liftSpring.stop();
+            },
+        };
+    }
+
+    // Imperative Glisse Select (Morphing Menu with spring physics & scrubbing)
+    const menuResistance = (value) => Math.sign(value) * 7 * (1 - Math.exp(-Math.abs(value) * 0.12 / 7));
+
+    function createGlisseSelect({ options, selectedKey, ariaLabel = 'Options', align = 'end', onChange }) {
+        let currentKey = selectedKey;
+        let phase = 'closed';
+        let activeMenuCleanup = null;
+
+        const findOption = (k) => (options && options.find((o) => o.id === k)) || (options && options[0]) || { id: '', label: '' };
+
+        const currentLabelEl = el('span', { className: 'lg-select-current-label' }, findOption(currentKey).label);
+        const triggerContent = el('span', { className: 'lg-select-trigger-content' }, [
+            currentLabelEl,
+            createChevronIcon(),
+        ]);
+
+        const triggerBtn = el('button', {
+            type: 'button',
+            className: 'lg-glass lg-button',
+            'aria-label': ariaLabel,
+            'aria-haspopup': 'menu',
+            'aria-expanded': 'false',
+            dataset: { icon: '' },
+        }, triggerContent);
+        const destroyTriggerPress = attachPressPhysics(triggerBtn);
+
+        const root = el('div', {
+            className: 'lg-menu lg-menu-select',
+            dataset: { phase: 'closed' },
+        }, triggerBtn);
+
+        let morphController = null;
+
+        const closeMenu = (restoreFocus = true) => {
+            if (phase === 'closed' || phase === 'leaving') return;
+            phase = 'leaving';
+            uiState.openMenuClosers.delete(closeMenu);
+            root.dataset.phase = 'leaving';
+            delete root.dataset.open;
+            triggerBtn.setAttribute('aria-expanded', 'false');
+            if (morphController) morphController.set(0);
+            if (restoreFocus) triggerBtn.focus({ preventScroll: true });
+        };
+
+        const openMenu = () => {
+            if (phase !== 'closed') return;
+            phase = 'open';
+            uiState.openMenuClosers.add(closeMenu);
+            uiState.openMenuCount += 1;
+            root.dataset.phase = 'open';
+            root.dataset.open = 'true';
+            root.classList.add('lg-menu--open', 'lg-menu--active');
+            triggerBtn.setAttribute('aria-expanded', 'true');
+
+            const surface = el('span', { className: 'lg-menu-surface', 'aria-hidden': 'true' });
+            const plate = el('span', { className: 'lg-menu-plate', 'aria-hidden': 'true' });
+            const content = el('div', { role: 'none', className: 'lg-menu-content' }, plate);
+
+            options.forEach((opt, index) => {
+                const isSelected = opt.id === currentKey;
+                const textWrap = el('span', { className: 'lg-select-item-text' }, [
+                    el('span', { className: 'lg-select-item-title' }, opt.label),
+                    opt.desc ? el('span', { className: 'lg-select-item-desc' }, opt.desc) : null,
+                ]);
+                const inner = el('span', { className: 'lg-select-item-inner' }, [
+                    textWrap,
+                    isSelected ? createCheckIcon() : null,
+                ]);
+                const itemBtn = el('button', {
+                    type: 'button',
+                    role: 'menuitem',
+                    className: 'lg-menu-item',
+                    dataset: { index: String(index) },
+                }, inner);
+                content.appendChild(itemBtn);
+            });
+
+            const card = el('div', {
+                role: 'menu',
+                'aria-label': ariaLabel,
+                className: 'lg-menu-card',
+                dataset: { phase: 'open', align },
+            }, [surface, content]);
+            root.appendChild(card);
+
+            const parentRow = root.closest('.field-row, .field-switch-row, .field-box, .switch');
+            const parentCard = root.closest('.card, .col-stack');
+            const modalEl = uiState.containerEl;
+            if (parentRow) parentRow.setAttribute('data-menu-open', 'true');
+            if (parentCard) parentCard.setAttribute('data-menu-open', 'true');
+            root.setAttribute('data-menu-open', 'true');
+            if (modalEl) modalEl.setAttribute('data-has-menu-open', 'true');
+
+            const from = { width: triggerBtn.offsetWidth, height: triggerBtn.offsetHeight };
+            const to = { width: card.offsetWidth, height: card.offsetHeight };
+            const radius = parseFloat(getComputedStyle(surface).borderTopLeftRadius) || 18;
+            const trailing = align !== 'start';
+            const origin = {
+                x: trailing ? to.width - from.width / 2 : from.width / 2,
+                y: from.height / 2,
+            };
+            content.style.transformOrigin = `${origin.x}px ${origin.y}px`;
+
+            let leaving = false;
+            const unmountCard = () => {
+                if (activeMenuCleanup) {
+                    activeMenuCleanup();
+                    activeMenuCleanup = null;
+                }
+                if (card.parentNode === root) root.removeChild(card);
+                phase = 'closed';
+                root.dataset.phase = 'closed';
+                root.classList.remove('lg-menu--open', 'lg-menu--active');
+            };
+
+            const shape = createSpring(0, 600, 46, (value) => {
+                const t = clamp01(value);
+                const settled = t === 1;
+                const w = from.width + (to.width - from.width) * t;
+                const h = from.height + (to.height - from.height) * t;
+                const s = 0.5 + 0.5 * t;
+                const local = (edge, centre) => centre + (edge - centre) / s;
+                const left = local(trailing ? to.width - w : 0, origin.x);
+                const right = local(trailing ? to.width : w, origin.x);
+                const bottom = local(h, origin.y);
+                const top = local(0, origin.y);
+
+                surface.style.width = settled ? '' : `${w}px`;
+                surface.style.height = settled ? '' : `${h}px`;
+                surface.style.opacity = String(clamp01(t / 0.2));
+                triggerBtn.style.opacity = t === 0 ? '' : String(1 - clamp01(t / 0.2));
+
+                content.style.opacity = String(leaving ? clamp01((t - 0.55) / 0.45) : clamp01((t - 0.15) / 0.6));
+                content.style.transform = settled ? '' : `scale(${s})`;
+                content.style.filter = settled ? '' : `blur(${6 * (1 - t)}px)`;
+                content.style.clipPath = settled ? '' : `inset(${top}px ${to.width - right}px ${to.height - bottom}px ${left}px round ${radius / s}px)`;
+
+                if (leaving && value === 0) unmountCard();
+            });
+
+            morphController = {
+                set(target) {
+                    leaving = target === 0;
+                    card.dataset.phase = leaving ? 'leaving' : 'open';
+                    if (leaving) shape.tune(900, 57);
+                    else shape.tune(600, 46);
+                    shape.set(target);
+                },
+            };
+            shape.paint();
+            morphController.set(1);
+
+            const rows = () => [...card.querySelectorAll('.lg-menu-item:not(:disabled)')];
+            rows()[0]?.focus({ preventScroll: true });
+
+            const offset = { scale: 1, x: 0, y: 0 };
+            const paintCard = () => {
+                card.style.scale = String(offset.scale);
+                card.style.translate = `${offset.x}px ${offset.y}px`;
+            };
+            const scaleSpring = createSpring(1, 650, 36, (v) => { offset.scale = v; paintCard(); });
+            const xSpring = createSpring(0, 600, 30, (v) => { offset.x = v; paintCard(); });
+            const ySpring = createSpring(0, 600, 30, (v) => { offset.y = v; paintCard(); });
+
+            let gesture = null;
+            let currentRow = null;
+            let selectHandled = false;
+
+            const highlight = (row) => {
+                if (currentRow === row) return;
+                const first = !currentRow;
+                currentRow = row;
+                if (!row) {
+                    delete card.dataset.scrubbing;
+                    plate.style.opacity = '0';
+                    return;
+                }
+                card.dataset.scrubbing = '';
+                plate.style.width = `${row.offsetWidth}px`;
+                plate.style.height = `${row.offsetHeight}px`;
+                if (first) plate.style.transition = 'none';
+                plate.style.transform = `translate(${row.offsetLeft}px, ${row.offsetTop}px)`;
+                plate.style.opacity = '1';
+                if (first) {
+                    void plate.offsetWidth;
+                    plate.style.transition = '';
+                }
+            };
+
+            const rowAt = (clientX, clientY) => {
+                const rootNode = card.getRootNode ? card.getRootNode() : document;
+                const hit = (rootNode && rootNode.elementFromPoint) ? rootNode.elementFromPoint(clientX, clientY) : document.elementFromPoint(clientX, clientY);
+                const row = hit?.closest('.lg-menu-item');
+                return row && !row.disabled && card.contains(row) ? row : null;
+            };
+
+            const selectIndex = (idx) => {
+                const opt = options[idx];
+                if (!opt) return;
+                currentKey = opt.id;
+                currentLabelEl.textContent = opt.label;
+                closeMenu();
+                if (onChange) onChange(opt.id);
+            };
+
+            const onDown = (event) => {
+                if (!event.isPrimary || event.button !== 0) return;
+                gesture = { id: event.pointerId, x: event.clientX, y: event.clientY };
+                card.setPointerCapture(event.pointerId);
+                card.dataset.pressed = '';
+                scaleSpring.set(1 + 5 / Math.max(card.offsetWidth, card.offsetHeight, 200));
+                highlight(rowAt(event.clientX, event.clientY));
+            };
+            const onMove = (event) => {
+                if (!gesture) {
+                    const row = event.pointerType === 'mouse' ? rowAt(event.clientX, event.clientY) : null;
+                    if (row) highlight(row);
+                    return;
+                }
+                if (event.pointerId !== gesture.id) return;
+                highlight(rowAt(event.clientX, event.clientY));
+                xSpring.set(menuResistance(event.clientX - gesture.x), true);
+                ySpring.set(menuResistance(event.clientY - gesture.y), true);
+            };
+            const onEnd = (event) => {
+                if (event.pointerId !== gesture?.id) return;
+                const chosen = event.type === 'pointerup' ? rowAt(event.clientX, event.clientY) : null;
+                highlight(null);
+                gesture = null;
+                delete card.dataset.pressed;
+                scaleSpring.set(1);
+                xSpring.set(0);
+                ySpring.set(0);
+                if (chosen) {
+                    selectHandled = true;
+                    selectIndex(Number(chosen.dataset.index));
+                }
+            };
+            const onLeave = (event) => {
+                if (!gesture && event.pointerType === 'mouse') highlight(null);
+            };
+            const onClick = (event) => {
+                if (selectHandled) {
+                    selectHandled = false;
+                    return;
+                }
+                const row = event.target.closest('.lg-menu-item');
+                if (row) selectIndex(Number(row.dataset.index));
+            };
+            const onKeyDown = (event) => {
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    closeMenu();
+                } else if (event.key === 'Tab') {
+                    closeMenu(false);
+                } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+                    event.preventDefault();
+                    if (!gesture) highlight(null);
+                    const list = rows();
+                    const activeEl = (card.getRootNode && card.getRootNode().activeElement) || document.activeElement;
+                    const idx = list.indexOf(activeEl);
+                    const nextIdx = event.key === 'Home' ? 0 : event.key === 'End' ? list.length - 1 : (idx + (event.key === 'ArrowDown' ? 1 : -1) + list.length) % list.length;
+                    list[nextIdx]?.focus();
+                }
+            };
+            const onOutside = (event) => {
+                const path = typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+                if (path.includes(card) || path.includes(triggerBtn)) return;
+                closeMenu(false);
+            };
+
+            card.addEventListener('pointerdown', onDown);
+            card.addEventListener('pointermove', onMove);
+            card.addEventListener('pointerleave', onLeave);
+            card.addEventListener('pointerup', onEnd);
+            card.addEventListener('pointercancel', onEnd);
+            card.addEventListener('lostpointercapture', onEnd);
+            card.addEventListener('click', onClick);
+            card.addEventListener('keydown', onKeyDown);
+            safeDocAdd('pointerdown', onOutside, true);
+
+            activeMenuCleanup = () => {
+                uiState.openMenuClosers.delete(closeMenu);
+                uiState.openMenuCount = Math.max(0, uiState.openMenuCount - 1);
+                if (parentRow) parentRow.removeAttribute('data-menu-open');
+                if (parentCard) parentCard.removeAttribute('data-menu-open');
+                root.removeAttribute('data-menu-open');
+                if (modalEl && uiState.openMenuCount === 0) modalEl.removeAttribute('data-has-menu-open');
+                [shape, scaleSpring, xSpring, ySpring].forEach((s) => s.stop());
+                morphController = null;
+                triggerBtn.style.opacity = '';
+                safeDocRem('pointerdown', onOutside, true);
+            };
+        };
+
+        triggerBtn.addEventListener('click', () => {
+            if (phase === 'open') closeMenu();
+            else if (phase === 'closed') openMenu();
+        });
+
+        return {
+            el: root,
+            setSelectedKey(nextKey) {
+                currentKey = nextKey;
+                currentLabelEl.textContent = findOption(nextKey).label;
+            },
+            destroy() {
+                if (activeMenuCleanup) {
+                    activeMenuCleanup();
+                    activeMenuCleanup = null;
+                }
+                destroyTriggerPress();
+            },
+        };
+    }
+
+    // Imperative Glisse TabBar (GPU-composited lens + spring physics + native listeners)
+    const TAB_REST = [1024, 58.9, 676, 47.8];
+    const TAB_DRAG = [2500, 94, 576, 44.2];
+    const TAB_KEYS = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
+    const clampRange = (v, min, max) => Math.min(max, Math.max(min, v));
+
+    function createGlisseTabBar({ items, value, onChange, style }) {
+        let selectedIdx = items.findIndex((i) => i.value === value);
+        const glassEl = el('span', { className: 'lg-glass lg-tab-bar-glass', 'aria-hidden': 'true' });
+        const lensEl = el('span', { className: 'lg-glass lg-tab-lens', 'aria-hidden': 'true' });
+        const rowEl = el('span', { className: 'lg-tab-row' }, items.map((item) =>
+            el('span', { className: 'lg-tab-copy' }, item.label)
+        ));
+        const tintEl = el('span', { className: 'lg-tab-tint', 'aria-hidden': 'true' }, rowEl);
+
+        const tabButtons = items.map((item, idx) => el('button', {
+            type: 'button',
+            role: 'tab',
+            className: 'lg-tab',
+            dataset: idx === selectedIdx ? { selected: '' } : undefined,
+            'aria-selected': String(idx === selectedIdx),
+            tabIndex: (idx === selectedIdx || (selectedIdx < 0 && idx === 0)) ? 0 : -1,
+        }, item.label));
+
+        const barEl = el('div', {
+            role: 'tablist',
+            className: 'lg-tab-bar',
+            style: Object.assign({}, style, {
+                '--lg-index': String(Math.max(selectedIdx, 0)),
+                '--lg-tabs': String(items.length),
+            }),
+        }, [glassEl, ...tabButtons, tintEl, lensEl]);
+
+        let slot = 0;
+        let height = 0;
+        let growX = 16;
+        let growY = 12;
+        let active = selectedIdx;
+        let shown = false;
+        let settleFrame = 0;
+        let gesture = null;
+        const state = { x: 0, lift: 0 };
+
+        const measure = () => {
+            const compStyle = getComputedStyle(barEl);
+            slot = (barEl.clientWidth - parseFloat(compStyle.paddingLeft) - parseFloat(compStyle.paddingRight)) / tabButtons.length;
+            height = lensEl.offsetHeight;
+            growX = parseFloat(compStyle.getPropertyValue('--lg-lens-grow-x')) || 0;
+            growY = parseFloat(compStyle.getPropertyValue('--lg-lens-grow-y')) || 0;
+        };
+
+        const paint = () => {
+            if (!slot || !height) return;
+            const { x, lift } = state;
+            const sx = 1 + growX / slot * lift;
+            const sy = 1 + growY / height * lift;
+            lensEl.style.transform = tintEl.style.transform = `translateX(${x}px) scale(${sx}, ${sy})`;
+            rowEl.style.transform = `scale(${1 / sx}, ${1 / sy}) translate(${-x + (sx - 1) * slot / 2}px, ${(sy - 1) * height / 2}px)`;
+            if (!gesture && lift < 0.01) delete barEl.dataset.refracting;
+        };
+
+        const xSpring = createSpring(0, TAB_REST[0], TAB_REST[1], (v) => { state.x = v; paint(); });
+        const liftSpring = createSpring(0, TAB_REST[2], TAB_REST[3], (v) => { state.lift = v; paint(); });
+
+        const move = (target, lifted, instant = false) => {
+            const [sK, sD, lK, lD] = gesture ? TAB_DRAG : TAB_REST;
+            xSpring.tune(sK, sD);
+            liftSpring.tune(lK, lD);
+            xSpring.set(target, instant);
+            liftSpring.set(lifted ? 1 : 0, instant);
+        };
+
+        const settle = (instant = false) => {
+            if (gesture) return;
+            const show = active >= 0;
+            if (show) delete barEl.dataset.hidden;
+            else barEl.dataset.hidden = '';
+            if (show) move(active * slot, false, instant || !shown);
+            shown = show;
+        };
+
+        const selectTabIndex = (idx) => {
+            if (idx < 0 || idx >= items.length) return;
+            cancelAnimationFrame(settleFrame);
+            settleFrame = 0;
+            selectedIdx = idx;
+            active = idx;
+            barEl.style.setProperty('--lg-index', String(idx));
+            tabButtons.forEach((b, i) => {
+                const sel = i === idx;
+                if (sel) b.dataset.selected = '';
+                else delete b.dataset.selected;
+                b.setAttribute('aria-selected', String(sel));
+                b.tabIndex = sel ? 0 : -1;
+            });
+            settle();
+            if (onChange) onChange(items[idx].value);
+        };
+
+        const position = (event) => clampRange(gesture.anchor + event.clientX - gesture.x, 0, slot * (tabButtons.length - 1));
+        const light = (event, box) => {
+            glassEl.style.setProperty('--lg-x', `${clampRange((event.clientX - box.left) / box.width * 100, 0, 100)}%`);
+            lensEl.style.setProperty('--lg-x', `${clampRange((event.clientX - box.left - 4 - state.x) / slot * 100, 0, 100)}%`);
+        };
+        const release = () => {
+            const old = gesture;
+            gesture = null;
+            delete barEl.dataset.lifted;
+            delete lensEl.dataset.pressed;
+            if (old && barEl.hasPointerCapture(old.id)) barEl.releasePointerCapture(old.id);
+            return old;
+        };
+
+        let suppressClick = false;
+        let globalPointerAttached = false;
+
+        const onPointerMove = (event) => {
+            if (event.pointerId !== gesture?.id) return;
+            if (!gesture.moved && Math.abs(event.clientX - gesture.x) > 6) {
+                gesture.moved = true;
+                barEl.setPointerCapture(event.pointerId);
+            }
+            if (gesture.moved) move(position(event), true);
+            light(event, gesture.box);
+        };
+
+        const onPointerEnd = (event) => {
+            if (event.pointerId !== gesture?.id) return;
+            if (event.type === 'lostpointercapture' && event.target !== barEl) return;
+            detachGlobalPointer();
+            const idx = Math.round(position(event) / slot);
+            const { moved, box } = release();
+            const near = event.clientY >= box.top - 24 && event.clientY <= box.bottom + 24;
+            if (event.type === 'pointerup' && (moved || near)) {
+                suppressClick = true;
+                settleFrame = requestAnimationFrame(() => {
+                    settleFrame = 0;
+                    settle();
+                });
+                tabButtons[idx]?.click();
+            } else {
+                suppressClick = moved;
+                settle();
+            }
+        };
+
+        const attachGlobalPointer = () => {
+            if (!globalPointerAttached) {
+                safeWinAdd('pointermove', onPointerMove);
+                safeWinAdd('pointerup', onPointerEnd);
+                safeWinAdd('pointercancel', onPointerEnd);
+                globalPointerAttached = true;
+            }
+        };
+
+        const detachGlobalPointer = () => {
+            if (globalPointerAttached) {
+                safeWinRem('pointermove', onPointerMove);
+                safeWinRem('pointerup', onPointerEnd);
+                safeWinRem('pointercancel', onPointerEnd);
+                globalPointerAttached = false;
+            }
+        };
+
+        const onPointerDown = (event) => {
+            const tab = event.target.closest('.lg-tab');
+            if (!event.isPrimary || event.button !== 0 || gesture || !tab) return;
+            if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+            cancelAnimationFrame(settleFrame);
+            settleFrame = 0;
+            measure();
+            const box = barEl.getBoundingClientRect();
+            gesture = {
+                id: event.pointerId,
+                x: event.clientX,
+                anchor: tabButtons.indexOf(tab) * slot,
+                moved: false,
+                box,
+                at: performance.now(),
+            };
+            suppressClick = false;
+            barEl.dataset.lifted = '';
+            barEl.dataset.refracting = '';
+            delete barEl.dataset.hidden;
+            lensEl.dataset.pressed = '';
+            light(event, box);
+            move(gesture.anchor, true, !shown);
+            shown = true;
+            attachGlobalPointer();
+        };
+
+        const onTouchMove = (event) => {
+            if (gesture && event.cancelable && gestureHeld(gesture.at, gesture.moved)) event.preventDefault();
+        };
+
+        const onClick = (event) => {
+            if (event.isTrusted && suppressClick && event.detail !== 0) {
+                suppressClick = false;
+                event.preventDefault();
+                return;
+            }
+            const tab = event.target.closest('.lg-tab');
+            if (!tab || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+            selectTabIndex(tabButtons.indexOf(tab));
+        };
+
+        const onKeyDown = (event) => {
+            const tab = event.target.closest('.lg-tab');
+            if (!tab || !TAB_KEYS.includes(event.key)) return;
+            event.preventDefault();
+            const current = tabButtons.indexOf(tab);
+            const idx = event.key === 'Home' ? 0 : event.key === 'End' ? tabButtons.length - 1 : (current + (event.key === 'ArrowRight' ? 1 : tabButtons.length - 1)) % tabButtons.length;
+            selectTabIndex(idx);
+            tabButtons[idx]?.focus();
+        };
+
+        const reset = () => {
+            cancelAnimationFrame(settleFrame);
+            settleFrame = 0;
+            detachGlobalPointer();
+            release();
+            settle(true);
+        };
+        const onVisChange = () => { if (isRealDocHidden()) reset(); };
+
+        const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => {
+            measure();
+            if (!gesture) settle(true);
+        }) : null;
+        if (observer) observer.observe(barEl);
+
+        const destroyGlassRefract = attachRefraction(glassEl, false);
+        const destroyLensRefract = attachRefraction(lensEl, true);
+
+        barEl.dataset.ready = '';
+        barEl.addEventListener('pointerdown', onPointerDown);
+        barEl.addEventListener('lostpointercapture', onPointerEnd);
+        barEl.addEventListener('touchmove', onTouchMove, { passive: false });
+        barEl.addEventListener('click', onClick, true);
+        barEl.addEventListener('keydown', onKeyDown);
+        const offVis = addInternalVisListener(onVisChange);
+        const offBlur = addInternalBlurListener(reset);
+
+        requestAnimationFrame(() => {
+            measure();
+            settle(true);
+        });
+
+        return {
+            el: barEl,
+            setValue(nextVal) {
+                const idx = items.findIndex((i) => i.value === nextVal);
+                if (idx !== -1) selectTabIndex(idx);
+            },
+            destroy() {
+                cancelAnimationFrame(settleFrame);
+                detachGlobalPointer();
+                xSpring.stop();
+                liftSpring.stop();
+                destroyGlassRefract();
+                destroyLensRefract();
+                if (observer) observer.disconnect();
+                for (const key of ['ready', 'hidden', 'lifted', 'refracting']) delete barEl.dataset[key];
+                barEl.removeEventListener('pointerdown', onPointerDown);
+                barEl.removeEventListener('lostpointercapture', onPointerEnd);
+                barEl.removeEventListener('touchmove', onTouchMove);
+                barEl.removeEventListener('click', onClick, true);
+                barEl.removeEventListener('keydown', onKeyDown);
+                offVis();
+                offBlur();
+            },
+        };
+    }
+
+    // ------------------------------------------------------------
+    // Pure Session Context Snapshot (Zero DOM side effects)
+    // ------------------------------------------------------------
+    function buildSessionContextSnapshot() {
+        if (sessionState.cachedContextSnapshot && sessionState.cachedContextRevision === sessionState.contextRevision) {
+            return sessionState.cachedContextSnapshot;
+        }
+        const session = sessionState.activeSession;
+        if (!session) {
+            const emptySnap = {
+                hasSession: false,
+                sessionType: '',
+                sessionId: '',
+                sessionTitle: '',
+                completed: false,
+                questionId: null,
+                questionLabel: '',
+                questionType: '',
+                questionRecommendedSeconds: 0,
+                questionSnippet: '',
+                predictedOp: null,
+                predictedTotalSeconds: 0,
+                contextRevision: sessionState.contextRevision,
+            };
+            sessionState.cachedContextSnapshot = emptySnap;
+            sessionState.cachedContextRevision = sessionState.contextRevision;
+            return emptySnap;
+        }
+
+        // Pure lookup without full-DOM query scanning on every stat bump
+        const q = !session.completed ? identifyCurrentQuestion(null, null, null, false) : null;
+        const pred = session.predictedFinalCall;
+        let questionLabel = '';
+        if (q) {
+            const totalQ = Array.isArray(session.questionIds) ? session.questionIds.length : 0;
+            const rawIdx = Array.isArray(session.questionIds) ? session.questionIds.indexOf(q.id) : -1;
+            const num = rawIdx !== -1 ? (rawIdx + 1) : ((session.currentQuestionIndex || 0) + 1);
+            questionLabel = totalQ > 0 ? `Q${num}/${totalQ}` : (q.id ? `Q#${q.id}` : '');
+        } else if (Array.isArray(session.questionIds) && session.questionIds.length > 0 && !session.completed) {
+            questionLabel = `0/${session.questionIds.length}`;
+        }
+
+        const snap = {
+            hasSession: true,
+            sessionType: session.sessionType || '',
+            sessionId: session.sessionId || '',
+            sessionTitle: session.title || '',
+            completed: !!session.completed,
+            questionId: q ? q.id : null,
+            questionLabel,
+            questionType: q ? (q.primaryType || 'Question') : '',
+            questionRecommendedSeconds: q ? (q.recommendedSeconds || 0) : 0,
+            questionSnippet: q ? (q.stemSnippet || '') : '',
+            predictedOp: pred ? pred.operationName : (session.predictedOp || null),
+            predictedTotalSeconds: pred ? (pred.predictedTotalSeconds || 0) : 0,
+            contextRevision: sessionState.contextRevision,
+        };
+        sessionState.cachedContextSnapshot = snap;
+        sessionState.cachedContextRevision = sessionState.contextRevision;
+        return snap;
+    }
+
+    // ------------------------------------------------------------
+    // Shadow DOM Host & Reactive Status Pill
+    // ------------------------------------------------------------
+    function syncRootThemeAndAccent() {
+        try {
+            if (document.documentElement && document.documentElement.style.getPropertyValue('--ul-accent') !== settings.accentColor) {
+                document.documentElement.style.setProperty('--ul-accent', settings.accentColor);
+            }
+        } catch {}
+        if (!uiState.containerEl) return;
+        const effectiveTheme = getEffectiveTheme(settings.theme);
+        if (uiState.containerEl.getAttribute('data-theme') !== effectiveTheme) {
+            uiState.containerEl.setAttribute('data-theme', effectiveTheme);
+        }
+        if (uiState.containerEl.style.getPropertyValue('--accent') !== settings.accentColor) {
+            uiState.containerEl.style.setProperty('--accent', settings.accentColor);
+        }
+    }
+
+    function ensureUIHost() {
+        if (uiState.shadowRoot && document.getElementById('__ul-heroui-host')) {
+            return uiState.shadowRoot;
+        }
+
+        let host = document.getElementById('__ul-heroui-host');
+        if (!host) {
+            host = document.createElement('div');
+            host.id = '__ul-heroui-host';
+            host.setAttribute('data-glisse-backdrop', '');
+            host.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483647;';
+            (document.body || document.documentElement).appendChild(host);
+        }
+        uiState.hostEl = host;
+
+        if (!host.shadowRoot) {
+            uiState.shadowRoot = host.attachShadow({ mode: 'open' });
+        } else {
+            uiState.shadowRoot = host.shadowRoot;
+        }
+
+        let styleEl = uiState.shadowRoot.getElementById('__ul-heroui-styles');
+        if (!styleEl) {
+            styleEl = document.createElement('style');
+            styleEl.id = '__ul-heroui-styles';
+            styleEl.textContent = getHeroUIStyles();
+            uiState.shadowRoot.appendChild(styleEl);
+        }
+
+        let container = uiState.shadowRoot.getElementById('__ul-root');
+        if (!container) {
+            container = document.createElement('div');
+            container.id = '__ul-root';
+            container.className = 'heroui-root';
+            container.setAttribute('data-glisse-backdrop', '');
+            uiState.shadowRoot.appendChild(container);
+        }
+        uiState.containerEl = container;
+        syncRootThemeAndAccent();
+        renderStatusPill();
+        return uiState.shadowRoot;
+    }
+
+    function removeStatusPill() {
+        if (uiState.pillStatsUnsub) {
+            uiState.pillStatsUnsub();
+            uiState.pillStatsUnsub = null;
+        }
+        if (uiState.pillCleanup) {
+            uiState.pillCleanup();
+            uiState.pillCleanup = null;
+        }
+        if (uiState.pillEl) {
+            uiState.pillEl.remove();
+            uiState.pillEl = null;
+            uiState.pillRefs = null;
+        }
+    }
+
+    function renderStatusPill() {
+        const shouldShow = settings.pillVisible && settings.keybindAction !== 'open-modal';
+        if (!shouldShow) {
+            removeStatusPill();
+            return;
+        }
+        if (!uiState.containerEl) return;
+        syncRootThemeAndAccent();
+
+        if (!uiState.pillEl) {
+            const dotSpan = el('span', { className: 'heroui-pill__dot' });
+            const labelSpan = el('span', { className: 'heroui-pill__label' });
+            const badgeEl = el('span', { className: 'heroui-pill__badge badge badge--sm' }, [dotSpan, labelSpan]);
+
+            const blockedStatEl = el('span', { className: 'heroui-pill__stat-item' });
+            const boostedStatEl = el('span', { className: 'heroui-pill__stat-item' });
+            const statsWrapEl = el('span', { className: 'heroui-pill__stats' }, [blockedStatEl, boostedStatEl]);
+
+            const mainEl = el('div', { className: 'heroui-pill__main' }, [badgeEl, statsWrapEl]);
+
+            const gearIcon = createGearIcon(20);
+            const indicatorDot = el('span', { className: 'heroui-pill__indicator-dot' });
+            const gearBtn = el('button', {
+                type: 'button',
+                className: 'heroui-pill__gear',
+                title: 'Open UpLearn Settings (Ctrl+Shift+U)',
+            }, [gearIcon, indicatorDot]);
+
+            const pill = el('div', {
+                id: '__ul-pill',
+                className: 'lg-glass heroui-pill',
+            }, [mainEl, gearBtn]);
+
+            pill.addEventListener('click', (e) => {
+                if ((settings.pillMode || 'minimal') === 'minimal') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (uiState.modalIsOpen) closeSettingsModal();
+                    else openSettingsModal();
+                }
+            });
+
+            mainEl.addEventListener('click', (e) => {
+                if ((settings.pillMode || 'minimal') !== 'minimal') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    applySettingChange('timeBoostEnabled', !settings.timeBoostEnabled);
+                }
+            });
+
+            gearBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (uiState.modalIsOpen) closeSettingsModal();
+                else openSettingsModal();
+            });
+
+            uiState.pillEl = pill;
+            uiState.pillRefs = { badgeEl, labelSpan, blockedStatEl, boostedStatEl, gearIcon, indicatorDot };
+            uiState.containerEl.appendChild(pill);
+        }
+
+        updateStatusPill();
+    }
+
+    function updateStatusPill() {
+        const pill = uiState.pillEl;
+        const refs = uiState.pillRefs;
+        if (!pill || !refs) return;
+
+        const mode = settings.pillMode || 'minimal';
+        const isMinimal = mode === 'minimal';
+        const isCompact = mode === 'compact';
+        const isFull    = mode === 'full';
+        const enabled   = settings.timeBoostEnabled;
+
+        pill.className = `lg-glass heroui-pill ${isMinimal ? 'heroui-pill--minimal' : ''}`.trim();
+        pill.dataset.mode = mode;
+
+        const pos = POSITION_STYLES[settings.pillPosition] || POSITION_STYLES['bottom-right'];
+        pill.style.left = pos.left || '';
+        pill.style.right = pos.right || '';
+        pill.style.top = pos.top || '';
+        pill.style.bottom = pos.bottom || '';
+        pill.style.opacity = String(settings.pillOpacity);
+
+        if (isMinimal && !uiState.pillCleanup) {
+            uiState.pillCleanup = attachRefraction(pill, false);
+        } else if (!isMinimal && uiState.pillCleanup) {
+            uiState.pillCleanup();
+            uiState.pillCleanup = null;
+        }
+
+        const rangeLabel = settings.extraSecondsMin === settings.extraSecondsMax
+            ? `+${settings.extraSecondsMin}s`
+            : `+${settings.extraSecondsMin}–${settings.extraSecondsMax}s`;
+
+        const kbText = formatKeybind(settings.uiToggleKeybind);
+        const actionDesc = settings.keybindAction === 'open-modal' ? 'open/close settings' : 'hide/show';
+        pill.title = isMinimal
+            ? `UpLearn Control Panel (${kbText}) | Boost: ${enabled ? 'ON' : 'OFF'}`
+            : `Click badge: toggle time boost | Click gear: Control Panel | ${kbText}: ${actionDesc}`;
+
+        refs.badgeEl.className = `heroui-pill__badge badge badge--sm ${enabled ? 'badge--primary badge--accent' : 'badge--secondary'}`;
+        refs.labelSpan.textContent = `${rangeLabel} ${enabled ? 'Active' : 'Paused'}`;
+
+        const iconSize = isMinimal ? '20' : '18';
+        refs.gearIcon.setAttribute('width', iconSize);
+        refs.gearIcon.setAttribute('height', iconSize);
+        refs.indicatorDot.style.display = enabled ? 'block' : 'none';
+
+        refs.blockedStatEl.style.display = (isCompact || isFull) ? 'inline-flex' : 'none';
+        refs.boostedStatEl.style.display = isFull ? 'inline-flex' : 'none';
+
+        if (isCompact || isFull) {
+            refs.blockedStatEl.textContent = `🛡 ${stats.blocked}`;
+        }
+        if (isFull) {
+            const acc = sessionState.accumulatedExtraSeconds;
+            refs.boostedStatEl.textContent = `⚡ ${stats.boosted}${acc > 0 ? ` (+${acc}s)` : ''}`;
+        }
+
+        // Subscribe to stats ONLY when pill is in compact or full mode
+        if ((isCompact || isFull) && !uiState.pillStatsUnsub) {
+            uiState.pillStatsUnsub = subscribeStats(() => {
+                if (!uiState.pillRefs) return;
+                const m = settings.pillMode || 'minimal';
+                if (m === 'compact' || m === 'full') {
+                    uiState.pillRefs.blockedStatEl.textContent = `🛡 ${stats.blocked}`;
+                }
+                if (m === 'full') {
+                    const acc = sessionState.accumulatedExtraSeconds;
+                    uiState.pillRefs.boostedStatEl.textContent = `⚡ ${stats.boosted}${acc > 0 ? ` (+${acc}s)` : ''}`;
+                }
+            });
+        } else if (!isCompact && !isFull && uiState.pillStatsUnsub) {
+            uiState.pillStatsUnsub();
+            uiState.pillStatsUnsub = null;
+        }
+    }
+
+    // ------------------------------------------------------------
+    // Lazy Modal & Reactive Control Panel Tabs (Zero React)
+    // ------------------------------------------------------------
+    function registerBinding(key, updater) {
+        if (!uiState.bindings[key]) uiState.bindings[key] = [];
+        uiState.bindings[key].push(updater);
+    }
+
+    function runBindings(key, value) {
+        const list = uiState.bindings[key];
+        if (!list) return;
+        for (let i = 0; i < list.length; i++) {
+            try { list[i](value); } catch {}
+        }
+    }
+
+    function createCard(titleText, badgeText, badgeColor, descriptionText, headerRightEl = null) {
+        const titleLeft = el('span', null, titleText);
+        const badgeEl = badgeText ? el('span', { className: `badge badge--sm badge--soft badge--${badgeColor || 'accent'}` }, badgeText) : null;
+        const titleEl = el('div', { className: 'card__title' }, [titleLeft, badgeEl]);
+        const descEl = descriptionText ? el('div', { className: 'card__description' }, descriptionText) : null;
+
+        let headerEl;
+        if (headerRightEl) {
+            headerEl = el('div', { className: 'card__header' },
+                el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' } }, [
+                    el('div', null, [titleEl, descEl]),
+                    headerRightEl,
+                ])
+            );
+        } else {
+            headerEl = el('div', { className: 'card__header' }, [titleEl, descEl]);
+        }
+
+        const contentEl = el('div', { className: 'card__content' });
+        const cardEl = el('div', { className: 'card card--secondary' }, [headerEl, contentEl]);
+        return { cardEl, contentEl, badgeEl };
+    }
+
+    function createSwitchRow({ label, description, checked, disabled = false, settingKey, onChange }) {
+        const sw = createGlisseSwitch({
+            checked,
+            disabled,
+            onChange: (next) => {
+                row.dataset.selected = next ? 'true' : 'false';
+                if (onChange) onChange(next);
+                else if (settingKey) applySettingChange(settingKey, next);
+            },
+        });
+        uiState.modalCleanupFns.push(sw.destroy);
+
+        const row = el('div', {
+            className: 'field-switch-row',
+            dataset: Object.assign({ selected: checked ? 'true' : 'false' }, disabled ? { disabled: 'true' } : null),
+        }, [
+            el('div', { className: 'field-switch-content' }, [
+                el('div', { dataset: { slot: 'label' } }, label),
+                description ? el('div', { dataset: { slot: 'description' } }, description) : null,
+            ]),
+            el('div', { style: { display: 'inline-flex', flexShrink: '0' }, onClick: (e) => e.stopPropagation() }, sw.el),
+        ]);
+
+        row.addEventListener('click', () => {
+            if (row.dataset.disabled === 'true') return;
+            const next = row.dataset.selected !== 'true';
+            sw.setChecked(next);
+            row.dataset.selected = next ? 'true' : 'false';
+            if (onChange) onChange(next);
+            else if (settingKey) applySettingChange(settingKey, next);
+        });
+
+        const api = {
+            row,
+            setChecked(next) {
+                const boolNext = Boolean(next);
+                row.dataset.selected = boolNext ? 'true' : 'false';
+                sw.setChecked(boolNext);
+            },
+            setDisabled(next) {
+                if (next) row.dataset.disabled = 'true';
+                else delete row.dataset.disabled;
+                sw.setDisabled(next);
+            },
+        };
+
+        if (settingKey) {
+            registerBinding(settingKey, (val) => api.setChecked(val));
+        }
+        return api;
+    }
+
+    function createFieldRow(labelText, subText, rightEl, extraClass = '', extraStyle = null) {
+        const labelEl = el('label', null, [
+            labelText,
+            subText ? el('small', null, subText) : null,
+        ]);
+        const row = el('div', {
+            className: `field-row ${extraClass}`.trim(),
+            style: extraStyle,
+        }, [labelEl, rightEl]);
+        return { row, labelEl, smallEl: labelEl.querySelector('small') };
+    }
+
+    // --- TAB 1: TELEMETRY ---
+    function buildTelemetryTab() {
+        const panel = el('div', { className: 'tabs__panel', dataset: { tab: 'telemetry' } });
+        const grid = el('div', { className: 'grid-2col' });
+        const leftCol = el('div', { className: 'col-stack' });
+        const rightCol = el('div', { className: 'col-stack' });
+        grid.append(leftCol, rightCol);
+        panel.appendChild(grid);
+
+        // Left Column: Core Telemetry Intercepts
+        const coreCard = createCard(
+            'Core Telemetry Intercepts',
+            'Protection Active',
+            'accent',
+            'Configure network intercepts, telemetry blocking presets, and client-side privacy cloaks.'
+        );
+        leftCol.appendChild(coreCard.cardEl);
+
+        const presetSelect = createGlisseSelect({
+            options: PRESET_OPTIONS,
+            selectedKey: settings.telemetryPreset,
+            ariaLabel: 'Active Preset',
+            onChange: (val) => applySettingChange('telemetryPreset', val),
+        });
+        uiState.modalCleanupFns.push(presetSelect.destroy);
+        registerBinding('telemetryPreset', (val) => presetSelect.setSelectedKey(val));
+        coreCard.contentEl.appendChild(createFieldRow(
+            'Active Preset',
+            'Off · Simple (LogImproperUse only) · Harsh (Block all) · Custom',
+            presetSelect.el
+        ).row);
+
+        const coreSwitches = [
+            { key: 'blockLogImproperUse', label: 'Block LogImproperUse requests', desc: 'Silently drops UpLearn improper-use telemetry sent to API' },
+            { key: 'blockLogEvent', label: 'Mock LogEvent mutations', desc: 'Resolves UI interaction logging locally to prevent client telemetry', val: settings.blockLogEvent !== false },
+            { key: 'privateSearchMode', label: 'Private Search Mode', desc: 'Resolves LogLessonSearch mutations locally so search queries remain private', val: settings.privateSearchMode !== false },
+            { key: 'suppressJitsu', label: 'Suppress Jitsu telemetry', desc: 'Checked: blocks jitsu.uplearn.co.uk. Unchecked: logs inspected packets.' },
+            { key: 'blockWebSockets', label: 'Block telemetry WebSockets', desc: 'Terminates analytics & Intercom WebSocket connections' },
+            { key: 'blockSendBeacon', label: 'Block telemetry sendBeacon', desc: 'Drops background beacon-style telemetry packets' },
+            { key: 'blockDomElements', label: 'Block DOM telemetry injection', desc: 'Hooks script/iframe src and purges blocked tracker nodes' },
+            { key: 'spoofVisibility', label: 'Spoof visibility & focus', desc: 'Ensures page always believes it is focused & visible' },
+            { key: 'suppressConsoleNoise', label: "Suppress site's console noise", desc: 'Mutes [J-ERROR], Jitsu send errors, and blocked-host spam' },
+        ];
+
+        coreSwitches.forEach((swCfg) => {
+            const swRow = createSwitchRow({
+                label: swCfg.label,
+                description: swCfg.desc,
+                checked: swCfg.val !== undefined ? swCfg.val : Boolean(settings[swCfg.key]),
+                settingKey: swCfg.key,
+            });
+            coreCard.contentEl.appendChild(swRow.row);
+        });
+
+        // Right Column: Third-Party Telemetry Services
+        const svcKeys = Object.keys(TELEMETRY_SERVICES);
+        const countActiveServices = () => {
+            let active = 0;
+            for (let i = 0; i < svcKeys.length; i++) {
+                if (isServiceEnabledIn(settings, svcKeys[i])) active++;
+            }
+            return active;
+        };
+
+        const svcCard = createCard(
+            'Third-Party Telemetry Services',
+            `${countActiveServices()}/${svcKeys.length} Active`,
+            'accent',
+            'Toggle individual analytics trackers. Changes auto-switch preset to Custom.'
+        );
+        rightCol.appendChild(svcCard.cardEl);
+
+        const updateSvcBadge = () => {
+            if (svcCard.badgeEl) svcCard.badgeEl.textContent = `${countActiveServices()}/${svcKeys.length} Active`;
+        };
+        registerBinding('__telemetryServicesUI', updateSvcBadge);
+
+        const servicesGrid = el('div', { className: 'services-grid' });
+        const serviceTiles = [];
+
+        const toggleSingleService = (key) => {
+            const current = settings.telemetryServices || {};
+            const next = !isServiceEnabledIn(settings, key);
+            const updated = Object.assign({}, current, { [key]: next });
+            LOG(`service "${TELEMETRY_SERVICES[key].label}" ${next ? 'ENABLED' : 'DISABLED'}`);
+            applySettingChange('telemetryServices', updated);
+        };
+
+        svcKeys.forEach((key) => {
+            const svc = TELEMETRY_SERVICES[key];
+            const isChecked = isServiceEnabledIn(settings, key);
+            const sw = createGlisseSwitch({
+                checked: isChecked,
+                onChange: () => toggleSingleService(key),
+            });
+            uiState.modalCleanupFns.push(sw.destroy);
+
+            const tile = el('div', {
+                className: 'service-tile',
+                dataset: { checked: isChecked ? 'true' : 'false' },
+            }, [
+                el('span', { className: 'service-tile__label', title: svc.label }, svc.label),
+                el('div', { style: { display: 'inline-flex', flexShrink: '0' }, onClick: (e) => e.stopPropagation() }, sw.el),
+            ]);
+            tile.addEventListener('click', () => toggleSingleService(key));
+            servicesGrid.appendChild(tile);
+            serviceTiles.push({ key, svc, tile, sw });
+        });
+
+        const syncAllServiceTiles = () => {
+            for (let i = 0; i < serviceTiles.length; i++) {
+                const item = serviceTiles[i];
+                const chk = isServiceEnabledIn(settings, item.key);
+                item.tile.dataset.checked = chk ? 'true' : 'false';
+                item.sw.setChecked(chk);
+            }
+        };
+        registerBinding('__telemetryServicesUI', syncAllServiceTiles);
+
+        const searchField = createGlisseSearchField({
+            placeholder: 'Search services…',
+            className: 'services-search-field',
+            onInput: (query) => {
+                const q = query.toLowerCase().trim();
+                for (let i = 0; i < serviceTiles.length; i++) {
+                    const item = serviceTiles[i];
+                    const match = !q || item.svc.label.toLowerCase().includes(q) || item.svc.hosts.some((h) => h.includes(q));
+                    item.tile.style.display = match ? 'flex' : 'none';
+                }
+            },
+        });
+
+        const enableAllBtn = createGlisseButton({
+            variant: 'glass',
+            label: 'Enable All',
+            className: 'services-action-btn',
+            onClick: () => {
+                const updated = {};
+                for (const k in TELEMETRY_SERVICES) updated[k] = true;
+                applySettingChange('telemetryServices', updated);
+            },
+        });
+        const disableAllBtn = createGlisseButton({
+            variant: 'glass',
+            label: 'Disable All',
+            className: 'services-action-btn',
+            onClick: () => {
+                const updated = {};
+                for (const k in TELEMETRY_SERVICES) updated[k] = false;
+                applySettingChange('telemetryServices', updated);
+            },
+        });
+        uiState.modalCleanupFns.push(enableAllBtn.destroy, disableAllBtn.destroy);
+
+        const toolbar = el('div', { className: 'services-toolbar' }, [
+            searchField.el,
+            el('div', { className: 'services-actions' }, [enableAllBtn.el, disableAllBtn.el]),
+        ]);
+
+        svcCard.contentEl.append(toolbar, servicesGrid);
+        return panel;
+    }
+
+    // --- TAB 2: TIME BOOST ---
+    function buildTimeBoostTab() {
+        const panel = el('div', { className: 'tabs__panel', dataset: { tab: 'timeboost' } });
+        const grid = el('div', { className: 'grid-2col' });
+        const leftCol = el('div', { className: 'col-stack' });
+        const rightCol = el('div', { className: 'col-stack' });
+        grid.append(leftCol, rightCol);
+        panel.appendChild(grid);
+
+        // Left Column: Question Time Boost
+        const boostCard = createCard(
+            'Question Time Boost',
+            settings.timeBoostEnabled ? 'Active' : 'Paused',
+            settings.timeBoostEnabled ? 'success' : 'default',
+            'Automatically injects extra time spent into question submissions and quiz completions.'
+        );
+        leftCol.appendChild(boostCard.cardEl);
+
+        const dynamicTimeRow = createSwitchRow({
+            label: 'Dynamic question time calculation',
+            description: 'Adapts time per question based on type, word count, math/blanks, marks, and retries',
+            checked: settings.dynamicTimeEnabled !== false,
+            disabled: !settings.timeBoostEnabled,
+            settingKey: 'dynamicTimeEnabled',
+        });
+
+        const timeBoostRow = createSwitchRow({
+            label: 'Enable question time boost',
+            description: 'Injects calculated time bonuses into question answering and quiz completion API calls',
+            checked: settings.timeBoostEnabled,
+            settingKey: 'timeBoostEnabled',
+        });
+        registerBinding('timeBoostEnabled', (enabled) => {
+            dynamicTimeRow.setDisabled(!enabled);
+            if (boostCard.badgeEl) {
+                boostCard.badgeEl.textContent = enabled ? 'Active' : 'Paused';
+                boostCard.badgeEl.className = `badge badge--sm badge--soft badge--${enabled ? 'success' : 'default'}`;
+            }
+        });
+
+        const predictFinalRow = createSwitchRow({
+            label: 'Predict & sync final completion call',
+            description: 'Tracks active session and syncs final quiz, walkthrough, and video completion payloads',
+            checked: settings.predictFinalCallEnabled !== false,
+            settingKey: 'predictFinalCallEnabled',
+        });
+
+        boostCard.contentEl.append(timeBoostRow.row, dynamicTimeRow.row, predictFinalRow.row);
+
+        // Extra Seconds Range
+        const getRangeHint = () => (settings.extraSecondsMin === settings.extraSecondsMax)
+            ? `Every question receives +${settings.extraSecondsMin}s bonus.`
+            : `Each question rolls a random +${settings.extraSecondsMin}–${settings.extraSecondsMax}s bonus.`;
+
+        const minInput = createGlisseInput({
+            type: 'number',
+            value: settings.extraSecondsMin,
+            min: 1,
+            max: 3600,
+            style: { width: '88px', height: '34px' },
+            onBlur: (val) => {
+                const n = parseInt(val, 10);
+                if (!isNaN(n) && n >= 1) applySettingChange('extraSecondsRange', { min: n, max: settings.extraSecondsMax });
+                else minInput.setValue(settings.extraSecondsMin);
+            },
+            onKeyDown: (e) => { if (e.key === 'Enter') minInput.input.blur(); },
+        });
+        const maxInput = createGlisseInput({
+            type: 'number',
+            value: settings.extraSecondsMax,
+            min: 1,
+            max: 3600,
+            style: { width: '88px', height: '34px' },
+            onBlur: (val) => {
+                const n = parseInt(val, 10);
+                if (!isNaN(n) && n >= 1) applySettingChange('extraSecondsRange', { min: settings.extraSecondsMin, max: n });
+                else maxInput.setValue(settings.extraSecondsMax);
+            },
+            onKeyDown: (e) => { if (e.key === 'Enter') maxInput.input.blur(); },
+        });
+
+        const rangeRow = createFieldRow(
+            'Extra Seconds Range',
+            getRangeHint(),
+            el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
+                minInput.el,
+                el('span', { style: { color: 'var(--lg-muted)', fontWeight: '600' } }, 'to'),
+                maxInput.el,
+                el('span', { style: { color: 'var(--lg-muted)', fontWeight: '600' } }, 's'),
+            ])
+        );
+        boostCard.contentEl.appendChild(rangeRow.row);
+
+        // Quick Range Presets
+        const presetButtons = QUICK_RANGE_PRESETS.map((p) => {
+            const isSelected = p.min === settings.extraSecondsMin && p.max === settings.extraSecondsMax;
+            const btn = createGlisseButton({
+                variant: isSelected ? 'filled' : 'glass',
+                label: p.label,
+                style: { height: '30px', padding: '0 13px', fontSize: '12px', borderRadius: '9999px', fontWeight: isSelected ? '600' : '500' },
+                onClick: () => applySettingChange('extraSecondsRange', { min: p.min, max: p.max }),
+            });
+            uiState.modalCleanupFns.push(btn.destroy);
+            return { preset: p, btn };
+        });
+
+        const syncRangeUI = () => {
+            minInput.setValue(settings.extraSecondsMin);
+            maxInput.setValue(settings.extraSecondsMax);
+            if (rangeRow.smallEl) rangeRow.smallEl.textContent = getRangeHint();
+            presetButtons.forEach(({ preset, btn }) => {
+                const sel = preset.min === settings.extraSecondsMin && preset.max === settings.extraSecondsMax;
+                btn.setVariant(sel ? 'filled' : 'glass');
+                btn.el.style.fontWeight = sel ? '600' : '500';
+            });
+        };
+        registerBinding('extraSecondsRange', syncRangeUI);
+        registerBinding('extraSecondsMin', syncRangeUI);
+        registerBinding('extraSecondsMax', syncRangeUI);
+
+        const presetsBox = el('div', {
+            className: 'field-box',
+            style: { padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: '10px' },
+        }, [
+            el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' } }, [
+                el('span', { style: { fontSize: '13px', fontWeight: '590', color: 'var(--lg-foreground)' } }, 'Quick Range Presets'),
+                el('span', { style: { fontSize: '11px', color: 'var(--lg-muted)' } }, 'Tap to apply duration'),
+            ]),
+            el('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px', width: '100%' } }, presetButtons.map((x) => x.btn.el)),
+        ]);
+        boostCard.contentEl.appendChild(presetsBox);
+
+        // Left Bottom Card: Interactive Quiz Page Button
+        const quizBtnCard = createCard(
+            'Interactive Quiz Page Button',
+            'Quiz Button',
+            settings.manualTimeButtonEnabled ? 'accent' : 'default',
+            "Injects an interactive \"+Add time\" button right next to UpLearn's submit button."
+        );
+        leftCol.appendChild(quizBtnCard.cardEl);
+
+        const manualStackRow = createSwitchRow({
+            label: 'Manual time stacks with auto-boost',
+            description: 'Checked: manual extra adds on top of auto-boost. Unchecked: manual extra replaces auto-boost for that submission.',
+            checked: settings.manualTimeStacksWithAuto,
+            disabled: !settings.manualTimeButtonEnabled,
+            settingKey: 'manualTimeStacksWithAuto',
+        });
+
+        const manualBtnRow = createSwitchRow({
+            label: 'Enable question page "+Add time" button',
+            description: 'Displays button next to Submit on question pages. Click to enter custom seconds (e.g. 120 or 2m).',
+            checked: settings.manualTimeButtonEnabled,
+            settingKey: 'manualTimeButtonEnabled',
+        });
+        registerBinding('manualTimeButtonEnabled', (enabled) => {
+            manualStackRow.setDisabled(!enabled);
+            if (quizBtnCard.badgeEl) {
+                quizBtnCard.badgeEl.className = `badge badge--sm badge--soft badge--${enabled ? 'accent' : 'default'}`;
+            }
+        });
+        quizBtnCard.contentEl.append(manualBtnRow.row, manualStackRow.row);
+
+        // Right Column: Video Lesson Automation
+        const isVideoAutoActive = () => settings.fullVideoWatchedEnabled || settings.autoSkipVideoEnabled || settings.addVideoDurationToTimeSpent;
+        const videoCard = createCard(
+            'Video Lesson Automation',
+            'Video Auto',
+            isVideoAutoActive() ? 'success' : 'default',
+            'Automate video lesson playback, skip straight to completion, and credit full duration.'
+        );
+        rightCol.appendChild(videoCard.cardEl);
+
+        const syncVideoBadge = () => {
+            if (videoCard.badgeEl) {
+                videoCard.badgeEl.className = `badge badge--sm badge--soft badge--${isVideoAutoActive() ? 'success' : 'default'}`;
+            }
+        };
+        registerBinding('fullVideoWatchedEnabled', syncVideoBadge);
+        registerBinding('autoSkipVideoEnabled', syncVideoBadge);
+        registerBinding('addVideoDurationToTimeSpent', syncVideoBadge);
+
+        videoCard.contentEl.append(
+            createSwitchRow({
+                label: 'Always mark videos as fully watched (100%)',
+                description: 'Sets percentWatched to 1 on CompleteVideoLesson mutations so every video registers as fully completed',
+                checked: settings.fullVideoWatchedEnabled,
+                settingKey: 'fullVideoWatchedEnabled',
+            }).row,
+            createSwitchRow({
+                label: 'Auto-skip video (skips to 1s before end)',
+                description: 'Automatically seeks straight to 1 second before the end so it completes immediately',
+                checked: settings.autoSkipVideoEnabled,
+                settingKey: 'autoSkipVideoEnabled',
+            }).row,
+            createSwitchRow({
+                label: 'Add video duration to timeSpent',
+                description: 'In CompleteVideoLesson payload, rewrites timeSpent to equal full duration (e.g. 17m33s = PT1053S)',
+                checked: settings.addVideoDurationToTimeSpent,
+                settingKey: 'addVideoDurationToTimeSpent',
+            }).row
+        );
+
+        // Right Bottom Card: Live Session Bonus Activity
+        const sessionCard = createCard(
+            'Live Session Bonus Activity',
+            sessionState.accumulatedExtraSeconds > 0 ? `+${sessionState.accumulatedExtraSeconds}s Active` : '0s Pending',
+            sessionState.accumulatedExtraSeconds > 0 ? 'accent' : 'default',
+            'Real-time quiz bonus accumulated in this session to inject into UpLearn summaries.'
+        );
+        rightCol.appendChild(sessionCard.cardEl);
+
+        const qBadge = el('span', { className: 'badge badge--sm badge--soft badge--default' }, 'None');
+        const qRow = createFieldRow('Active Question Context', 'Open a quiz, video, summary, or exam lesson to detect active questions', qBadge);
+
+        const predBadge = el('span', { className: 'badge badge--sm badge--soft badge--default' }, 'None');
+        const predRow = createFieldRow(
+            'Predicted Final API Call',
+            'Waiting for an active quiz, lesson, or exam session',
+            el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexShrink: '0' } }, predBadge)
+        );
+
+        const accValueEl = el('span', {
+            style: { fontSize: '15px', fontWeight: '700', color: 'var(--accent, var(--lg-fill))', fontVariantNumeric: 'tabular-nums' },
+        }, `+${sessionState.accumulatedExtraSeconds}s`);
+        const accRow = createFieldRow(
+            'Accumulated Time Bonus',
+            'Currently queued bonus to be credited on submission',
+            el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, accValueEl)
+        );
+
+        const updateLiveSessionCard = () => {
+            const acc = sessionState.accumulatedExtraSeconds;
+            if (sessionCard.badgeEl) {
+                sessionCard.badgeEl.textContent = acc > 0 ? `+${acc}s Active` : '0s Pending';
+                sessionCard.badgeEl.className = `badge badge--sm badge--soft badge--${acc > 0 ? 'accent' : 'default'}`;
+            }
+            accValueEl.textContent = `+${acc}s`;
+
+            const ctx = buildSessionContextSnapshot();
+            if (qRow.smallEl) {
+                qRow.smallEl.textContent = ctx.hasSession
+                    ? `${ctx.sessionTitle || ctx.sessionType}${ctx.questionLabel ? ` · ${ctx.questionLabel}` : ''}${ctx.questionSnippet ? ` — "${ctx.questionSnippet}"` : ''}`
+                    : 'Open a quiz, video, summary, or exam lesson to detect active questions';
+            }
+            qBadge.textContent = ctx.questionType
+                ? `${ctx.questionType}${ctx.questionRecommendedSeconds ? ` · ~${ctx.questionRecommendedSeconds}s` : ''}`
+                : (ctx.hasSession ? (ctx.completed ? 'Completed' : 'Standby') : 'None');
+            qBadge.className = `badge badge--sm badge--soft badge--${ctx.questionType ? 'accent' : 'default'}`;
+
+            if (predRow.smallEl) {
+                predRow.smallEl.textContent = ctx.predictedOp
+                    ? `Intercepts and syncs ${ctx.predictedOp} when this ${ctx.sessionType || 'activity'} finishes`
+                    : 'Waiting for an active quiz, lesson, or exam session';
+            }
+            predBadge.textContent = ctx.predictedOp
+                ? `${ctx.predictedOp}${ctx.predictedTotalSeconds > 0 ? ` (~${formatSeconds(ctx.predictedTotalSeconds)})` : ''}`
+                : 'None';
+            predBadge.className = `badge badge--sm badge--soft badge--${ctx.predictedOp ? 'success' : 'default'}`;
+        };
+
+        const addBonus = (sec) => {
+            sessionState.accumulatedExtraSeconds += sec;
+            if (sessionState.activeSession) updatePredictedFinalCall(sessionState.activeSession);
+            bumpContextRevision();
+            bumpStat('manualBoosted');
+            updateLiveSessionCard();
+            LOG('manual bonus added: +' + sec + 's (total ' + sessionState.accumulatedExtraSeconds + 's)');
+        };
+
+        const btn30 = createGlisseButton({ variant: 'glass', label: '+30s', onClick: () => addBonus(30) });
+        const btn60 = createGlisseButton({ variant: 'glass', label: '+60s', onClick: () => addBonus(60) });
+        const btnClear = createGlisseButton({
+            variant: 'glass',
+            destructive: true,
+            label: 'Clear',
+            title: 'Clear accumulated bonus',
+            onClick: () => {
+                sessionState.accumulatedExtraSeconds = 0;
+                sessionState.accumulatedQuestionCount = 0;
+                if (sessionState.activeSession) updatePredictedFinalCall(sessionState.activeSession);
+                bumpContextRevision();
+                updateLiveSessionCard();
+                LOG('manual bonus cleared');
+            },
+        });
+        uiState.modalCleanupFns.push(btn30.destroy, btn60.destroy, btnClear.destroy);
+
+        const manualBoostRow = createFieldRow(
+            'Manual Session Boost',
+            'Quickly queue additional bonus seconds or clear pending bonus',
+            el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexShrink: '0' } }, [btn30.el, btn60.el, btnClear.el])
+        );
+
+        sessionCard.contentEl.append(qRow.row, predRow.row, accRow.row, manualBoostRow.row);
+        updateLiveSessionCard();
+        registerBinding('__liveSessionSync', updateLiveSessionCard);
+        return panel;
+    }
+
+    // --- TAB 3: PREFERENCES ---
+    function buildPreferencesTab() {
+        const panel = el('div', { className: 'tabs__panel', dataset: { tab: 'preferences' } });
+        const grid = el('div', { className: 'grid-2col' });
+        const leftCol = el('div', { className: 'col-stack' });
+        const rightCol = el('div', { className: 'col-stack' });
+        grid.append(leftCol, rightCol);
+        panel.appendChild(grid);
+
+        // Left Column: Control Panel Window & Theme
+        const themeCard = createCard(
+            'Control Panel Window & Theme',
+            'Visuals',
+            'accent',
+            'Configure floating window mode, color theme, and liquid glass refraction.'
+        );
+        leftCol.appendChild(themeCard.cardEl);
+
+        themeCard.contentEl.appendChild(createSwitchRow({
+            label: 'Draggable Glass Window',
+            description: 'Float the Control Panel as a movable window with liquid glass refraction over the page',
+            checked: settings.draggableUI,
+            settingKey: 'draggableUI',
+        }).row);
+
+        const themeSelect = createGlisseSelect({
+            options: THEME_OPTIONS,
+            selectedKey: settings.theme,
+            ariaLabel: 'Control Panel Theme',
+            onChange: (val) => applySettingChange('theme', val),
+        });
+        uiState.modalCleanupFns.push(themeSelect.destroy);
+        registerBinding('theme', (val) => themeSelect.setSelectedKey(val));
+        themeCard.contentEl.appendChild(createFieldRow(
+            'Control Panel Theme',
+            'Translucent dark, frosted light, or system matching',
+            themeSelect.el
+        ).row);
+
+        // Accent Swatches + Custom Color Picker
+        const swatchNodes = QUICK_COLOR_SWATCHES.map((c) => {
+            const isSelected = c.hex.toLowerCase() === settings.accentColor.toLowerCase();
+            const swEl = el('div', {
+                className: 'color-swatch',
+                dataset: { active: isSelected ? 'true' : 'false' },
+                style: { backgroundColor: c.hex },
+                title: c.name,
+                onClick: () => applySettingChange('accentColor', c.hex),
+            }, isSelected ? createCheckIcon('', 14, 3) : null);
+            return { hex: c.hex.toLowerCase(), el: swEl };
+        });
+
+        const colorPickerInput = el('input', {
+            type: 'color',
+            value: settings.accentColor,
+            style: { opacity: '0', position: 'absolute', inset: '0', width: '100%', height: '100%', cursor: 'pointer' },
+            onInput: (e) => applySettingChange('accentColor', e.target.value),
+        });
+        const colorWheelLabel = el('label', {
+            title: 'Custom hex color',
+            style: {
+                width: '26px', height: '26px', borderRadius: '50%',
+                background: 'conic-gradient(from 180deg at 50% 50%, #FF0000 0deg, #FFA500 60deg, #FFFF00 120deg, #008000 180deg, #0000FF 240deg, #EE82EE 300deg, #FF0000 360deg)',
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                cursor: 'pointer', boxShadow: '0 2px 6px rgba(0, 0, 0, 0.2)',
+                position: 'relative', overflow: 'hidden', flexShrink: '0',
+            },
+        }, colorPickerInput);
+
+        registerBinding('accentColor', (hex) => {
+            const lower = String(hex).toLowerCase();
+            colorPickerInput.value = hex;
+            swatchNodes.forEach((s) => {
+                const active = s.hex === lower;
+                s.el.dataset.active = active ? 'true' : 'false';
+                if (active && !s.el.firstChild) s.el.appendChild(createCheckIcon('', 14, 3));
+                else if (!active && s.el.firstChild) s.el.textContent = '';
+            });
+        });
+
+        themeCard.contentEl.appendChild(createFieldRow(
+            'Theme Accent Color',
+            'Primary tint for switches, badges, and controls',
+            el('div', { style: { display: 'flex', alignItems: 'center', gap: '12px' } }, [
+                el('div', { className: 'color-swatches' }, swatchNodes.map((s) => s.el)),
+                colorWheelLabel,
+            ])
+        ).row);
+
+        // Left Bottom Card: UpLearn Webpage Tweaks
+        const tweaksCard = createCard(
+            'UpLearn Webpage Tweaks',
+            'Page Tweaks',
+            'accent',
+            'Enhance your UpLearn browsing experience with soft dark mode and screen controls.'
+        );
+        leftCol.appendChild(tweaksCard.cardEl);
+        tweaksCard.contentEl.append(
+            createSwitchRow({
+                label: 'UpLearn Soft Dark Mode',
+                description: 'Soft high-contrast dark theme across all lesson and quiz pages',
+                checked: settings.darkMode,
+                settingKey: 'darkMode',
+            }).row,
+            createSwitchRow({
+                label: 'Prevent auto fullscreen',
+                description: 'Blocks the website from silently forcing fullscreen mode',
+                checked: settings.disableAutoFullscreen,
+                settingKey: 'disableAutoFullscreen',
+            }).row
+        );
+
+        // Right Column: Hotkeys & Floating Status Button
+        const hotkeyCard = createCard(
+            'Hotkeys & Floating Status Button',
+            'Shortcuts',
+            'accent',
+            'Configure keyboard triggers and floating island button behavior.'
+        );
+        rightCol.appendChild(hotkeyCard.cardEl);
+
+        const kbActionSelect = createGlisseSelect({
+            options: KEYBIND_ACTION_OPTIONS,
+            selectedKey: settings.keybindAction || 'toggle-pill',
+            ariaLabel: 'Keybind Action',
+            onChange: (val) => applySettingChange('keybindAction', val),
+        });
+        uiState.modalCleanupFns.push(kbActionSelect.destroy);
+        registerBinding('keybindAction', (val) => kbActionSelect.setSelectedKey(val));
+        hotkeyCard.contentEl.appendChild(createFieldRow(
+            'Keybind Action',
+            'Behavior when pressing your global keyboard shortcut',
+            kbActionSelect.el
+        ).row);
+
+        const recordBtn = createGlisseButton({
+            variant: 'glass',
+            className: 'keybind-btn',
+            label: formatKeybind(settings.uiToggleKeybind),
+            title: 'Click to record new keybind',
+            onClick: () => {
+                uiState.capturingKeybind = !uiState.capturingKeybind;
+                syncKeybindButtonUI();
+                LOG('keybind capture ' + (uiState.capturingKeybind ? 'started' : 'cancelled'));
+            },
+        });
+        const clearKbBtn = createGlisseButton({
+            variant: 'glass',
+            label: '✕',
+            title: 'Clear keybind',
+            ariaLabel: 'Clear keybind',
+            onClick: () => {
+                if (uiState.capturingKeybind) {
+                    uiState.capturingKeybind = false;
+                    syncKeybindButtonUI();
+                    return;
+                }
+                applySettingChange('uiToggleKeybind', { code: null, ctrl: false, shift: false, alt: false, meta: false });
+                LOG('keybind cleared');
+            },
+        });
+        clearKbBtn.el.dataset.icon = 'only';
+        uiState.modalCleanupFns.push(recordBtn.destroy, clearKbBtn.destroy);
+
+        const syncKeybindButtonUI = () => {
+            if (uiState.capturingKeybind) {
+                recordBtn.el.classList.add('keybind-btn--capturing');
+                recordBtn.setLabel('Press any key…');
+            } else {
+                recordBtn.el.classList.remove('keybind-btn--capturing');
+                recordBtn.setLabel(formatKeybind(settings.uiToggleKeybind));
+            }
+        };
+        registerBinding('__capturingKeybind', syncKeybindButtonUI);
+        registerBinding('uiToggleKeybind', syncKeybindButtonUI);
+
+        const kbRow = createFieldRow(
+            'Global Shortcut Keybind',
+            settings.keybindAction === 'open-modal'
+                ? 'Keyboard shortcut to directly open or close the Control Panel'
+                : 'Keyboard shortcut to show or hide the floating status pill',
+            el('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexShrink: '0' } }, [recordBtn.el, clearKbBtn.el])
+        );
+        hotkeyCard.contentEl.appendChild(kbRow.row);
+
+        const openModalCallout = el('div', {
+            className: 'field-callout',
+            style: { margin: '4px 0', display: settings.keybindAction === 'open-modal' ? 'flex' : 'none' },
+        }, [
+            createInfoIcon(),
+            el('span', null, 'Floating button is hidden because Keybind Action is set to "Open Settings Directly". Press your shortcut to toggle settings.'),
+        ]);
+
+        const pillModeSelect = createGlisseSelect({
+            options: PILL_MODE_OPTIONS,
+            selectedKey: settings.pillMode,
+            ariaLabel: 'Pill Information Display',
+            onChange: (val) => applySettingChange('pillMode', val),
+        });
+        const pillPosSelect = createGlisseSelect({
+            options: PILL_POS_OPTIONS,
+            selectedKey: settings.pillPosition,
+            ariaLabel: 'Pill Dock Position',
+            onChange: (val) => applySettingChange('pillPosition', val),
+        });
+        const pillOpacitySlider = createGlisseSlider({
+            value: settings.pillOpacity,
+            min: 0.2,
+            max: 1,
+            step: 0.05,
+            onChange: (val) => applySettingChange('pillOpacity', val),
+        });
+        uiState.modalCleanupFns.push(pillModeSelect.destroy, pillPosSelect.destroy, pillOpacitySlider.destroy);
+        registerBinding('pillMode', (v) => pillModeSelect.setSelectedKey(v));
+        registerBinding('pillPosition', (v) => pillPosSelect.setSelectedKey(v));
+        registerBinding('pillOpacity', (v) => pillOpacitySlider.setValue(v));
+
+        const pillModeRow = createFieldRow('Pill Information Display', 'Select how much info is displayed on the floating pill', pillModeSelect.el).row;
+        const pillPosRow = createFieldRow('Pill Dock Position', 'Corner of the screen where the status pill floats', pillPosSelect.el).row;
+        const pillOpacityRow = createFieldRow('Pill Opacity', 'Adjust background transparency', pillOpacitySlider.el).row;
+
+        const syncKeybindActionRows = () => {
+            const isOpenModal = settings.keybindAction === 'open-modal';
+            if (kbRow.smallEl) {
+                kbRow.smallEl.textContent = isOpenModal
+                    ? 'Keyboard shortcut to directly open or close the Control Panel'
+                    : 'Keyboard shortcut to show or hide the floating status pill';
+            }
+            openModalCallout.style.display = isOpenModal ? 'flex' : 'none';
+            pillModeRow.style.display = isOpenModal ? 'none' : 'flex';
+            pillPosRow.style.display = isOpenModal ? 'none' : 'flex';
+            pillOpacityRow.style.display = isOpenModal ? 'none' : 'flex';
+        };
+        syncKeybindActionRows();
+        registerBinding('keybindAction', syncKeybindActionRows);
+
+        hotkeyCard.contentEl.append(openModalCallout, pillModeRow, pillPosRow, pillOpacityRow);
+
+        // Right Bottom Card: Diagnostics & Maintenance
+        const diagCard = createCard(
+            'Diagnostics & Maintenance',
+            'System',
+            'accent',
+            'Developer console diagnostics and factory settings reset.'
+        );
+        rightCol.appendChild(diagCard.cardEl);
+
+        const logSelect = createGlisseSelect({
+            options: LOG_LEVEL_OPTIONS,
+            selectedKey: settings.logLevel,
+            ariaLabel: 'Console Logging Level',
+            onChange: (val) => applySettingChange('logLevel', val),
+        });
+        uiState.modalCleanupFns.push(logSelect.destroy);
+        registerBinding('logLevel', (v) => logSelect.setSelectedKey(v));
+        diagCard.contentEl.appendChild(createFieldRow(
+            'Console Logging Level',
+            'Verbose inspects bodies and prints grouped block reports',
+            logSelect.el
+        ).row);
+
+        // Non-blocking two-step reset confirmation (zero window.confirm calls)
+        let resetConfirmArmed = false;
+        let resetConfirmTimer = null;
+        let resetDoneTimer = null;
+        const resetAllBtn = createGlisseButton({
+            variant: 'glass',
+            destructive: true,
+            label: 'Reset All Settings',
+            onClick: () => {
+                if (!resetConfirmArmed) {
+                    resetConfirmArmed = true;
+                    resetAllBtn.setLabel('Click again to confirm');
+                    if (resetConfirmTimer) clearTimeout(resetConfirmTimer);
+                    resetConfirmTimer = setTimeout(() => {
+                        resetConfirmArmed = false;
+                        resetConfirmTimer = null;
+                        resetAllBtn.setLabel('Reset All Settings');
+                    }, 3500);
+                    return;
+                }
+                if (resetConfirmTimer) {
+                    clearTimeout(resetConfirmTimer);
+                    resetConfirmTimer = null;
+                }
+                resetConfirmArmed = false;
+                resetAllSettings();
+                resetAllBtn.setLabel('✓ Reset');
+                if (resetDoneTimer) clearTimeout(resetDoneTimer);
+                resetDoneTimer = setTimeout(() => {
+                    resetDoneTimer = null;
+                    resetAllBtn.setLabel('Reset All Settings');
+                }, 1400);
+            },
+        });
+        uiState.modalCleanupFns.push(() => {
+            if (resetConfirmTimer) clearTimeout(resetConfirmTimer);
+            if (resetDoneTimer) clearTimeout(resetDoneTimer);
+            resetAllBtn.destroy();
+        });
+
+        const dangerRow = el('div', {
+            className: 'field-row field-row--danger',
+            style: { marginTop: '2px' },
+        }, [
+            el('div', null, [
+                el('div', { style: { fontSize: '13px', fontWeight: '600', color: 'var(--lg-foreground)' } }, 'Reset All Preferences'),
+                el('div', { style: { fontSize: '11.5px', color: 'var(--lg-muted)', marginTop: '2px' } }, 'Restore all settings & services to factory defaults'),
+            ]),
+            resetAllBtn.el,
+        ]);
+        diagCard.contentEl.appendChild(dangerRow);
+
+        return panel;
+    }
+
+    // --- TAB 4: STATISTICS ---
+    function buildStatsTab() {
+        const panel = el('div', { className: 'tabs__panel', dataset: { tab: 'stats' } });
+
+        const clearStatsBtn = createGlisseButton({
+            variant: 'glass',
+            icon: createResetIcon(),
+            label: 'Clear Session Metrics',
+            onClick: () => {
+                resetAllStats();
+                LOG('stats reset');
+            },
+        });
+        uiState.modalCleanupFns.push(clearStatsBtn.destroy);
+
+        const statsCard = createCard(
+            'Session Activity & Shields',
+            'Real-Time',
+            'accent',
+            'Live metric counters accumulated in this browser session.',
+            clearStatsBtn.el
+        );
+        panel.appendChild(statsCard.cardEl);
+
+        const createStatTile = (labelText, getter) => {
+            const valEl = el('span', { className: 'stat-card__value' }, getter());
+            const tileEl = el('div', { className: 'stat-card' }, [
+                el('span', { className: 'stat-card__label' }, labelText),
+                valEl,
+            ]);
+            return { tileEl, valEl, getter };
+        };
+
+        const statTiles = [
+            // Privacy & Telemetry Shields
+            createStatTile('Trackers Blocked', () => String(stats.blocked)),
+            createStatTile('Improper Use', () => String(stats.logImproperUseBlocked)),
+            createStatTile('Jitsu Packets', () => String(stats.jitsuPackets)),
+            createStatTile('FS Blocked', () => String(stats.fullscreenBlocked)),
+            createStatTile('Console Muted', () => String(stats.consoleSuppressed)),
+            createStatTile('API Posts', () => String(stats.apiPosts)),
+            // Time Boost & Video Automation
+            createStatTile('Boosted Qs', () => String(stats.boosted)),
+            createStatTile('Pending Bonus', () => `${sessionState.accumulatedExtraSeconds}s`),
+            createStatTile('Group Bonus', () => `${stats.groupExtra}s`),
+            createStatTile('Manual Boosts', () => String(stats.manualBoosted || 0)),
+            createStatTile('Videos 100%', () => String(stats.videosMaxed || 0)),
+            createStatTile('Videos Skipped', () => String(stats.videosSkipped || 0)),
+            createStatTile('Video Time Added', () => `+${formatSeconds(stats.videoTimeAdded || 0)}`),
+            createStatTile('Qs Identified', () => String(stats.questionsIdentified || 0)),
+            createStatTile('Final Calls Synced', () => String(stats.finalCallsModified || 0)),
+        ];
+
+        const privacyGrid = el('div', { className: 'stats-grid' }, statTiles.slice(0, 6).map((t) => t.tileEl));
+        const boostGrid = el('div', { className: 'stats-grid' }, statTiles.slice(6).map((t) => t.tileEl));
+
+        const sectionsWrap = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '14px' } }, [
+            el('div', null, [
+                el('div', {
+                    style: { fontSize: '12px', fontWeight: '600', color: 'var(--lg-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' },
+                }, '🛡 Privacy & Telemetry Shields'),
+                privacyGrid,
+            ]),
+            el('div', null, [
+                el('div', {
+                    style: { fontSize: '12px', fontWeight: '600', color: 'var(--lg-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' },
+                }, '⚡ Time Boost & Video Automation'),
+                boostGrid,
+            ]),
+        ]);
+        statsCard.contentEl.appendChild(sectionsWrap);
+
+        const refreshStatTiles = () => {
+            for (let i = 0; i < statTiles.length; i++) {
+                const next = statTiles[i].getter();
+                if (statTiles[i].valEl.textContent !== next) {
+                    statTiles[i].valEl.textContent = next;
+                }
+            }
+        };
+        registerBinding('__statsSync', refreshStatTiles);
+        return panel;
+    }
+
+    // Modal Window Geometry Helpers
+    const getDefaultModalDims = () => ({
+        w: Math.min(920, window.innerWidth * 0.92),
+        h: Math.min(680, window.innerHeight * 0.86),
+    });
+    const clampModalCoord = (val, size, viewport) =>
+        Math.min(Math.max(10, Math.round(val)), Math.max(10, viewport - size - 10));
+
+    function loadSavedModalPos() {
+        const { w, h } = getDefaultModalDims();
+        try {
+            const saved = localStorage.getItem(WINDOW_POS_KEY);
+            if (saved) {
+                const p = JSON.parse(saved);
+                if (typeof p.x === 'number' && typeof p.y === 'number') {
+                    return {
+                        x: clampModalCoord(p.x, w, window.innerWidth),
+                        y: clampModalCoord(p.y, h, window.innerHeight),
+                    };
+                }
+            }
+        } catch {}
+        return {
+            x: Math.max(10, Math.round((window.innerWidth - w) / 2)),
+            y: Math.max(10, Math.round((window.innerHeight - h) / 2)),
+        };
+    }
+
+    function openSettingsModal() {
+        ensureUIHost();
+        if (uiState.modalCloseTimer) {
+            clearTimeout(uiState.modalCloseTimer);
+            uiState.modalCloseTimer = null;
+        }
+        if (uiState.modalIsOpen && !uiState.modalIsClosing) return;
+
+        // If reopening mid-close animation, tear down previous DOM first
+        if (uiState.modalBackdropEl) {
+            unmountModalImmediate();
+        }
+
+        uiState.modalIsOpen = true;
+        uiState.modalIsClosing = false;
+        uiState.bindings = {};
+        uiState.tabPanels = {};
+        uiState.openMenuCount = 0;
+        uiState.openMenuClosers.clear();
+
+        let modalPos = loadSavedModalPos();
+        const isDraggable = Boolean(settings.draggableUI);
+
+        const backdrop = el('div', {
+            id: '__ul-settings-overlay',
+            className: `modal__backdrop ${isDraggable ? 'modal__backdrop--draggable' : ''}`.trim(),
+            dataset: { glisseBackdrop: '' },
+        });
+        backdrop.addEventListener('click', (e) => {
+            if (!settings.draggableUI && e.target && e.target.id === '__ul-settings-overlay') {
+                closeSettingsModal();
+            }
+        });
+
+        const container = el('div', {
+            className: `modal__container ${isDraggable ? 'modal__container--draggable' : ''}`.trim(),
+        });
+
+        const dialog = el('div', {
+            className: `modal__dialog ${isDraggable ? 'modal__dialog--draggable' : ''}`.trim(),
+            role: 'dialog',
+            'aria-modal': isDraggable ? 'false' : 'true',
+            style: isDraggable ? { left: `${modalPos.x}px`, top: `${modalPos.y}px` } : null,
+        });
+        dialog.addEventListener('click', (e) => e.stopPropagation());
+
+        const dragHintRow = el('div', {
+            style: {
+                fontSize: '10.5px', color: 'var(--lg-muted)',
+                display: isDraggable ? 'flex' : 'none',
+                alignItems: 'center', gap: '4px', marginTop: '1px',
+            },
+        }, [createDragIcon(), el('span', null, 'Draggable Liquid Glass')]);
+
+        const brand = el('div', { className: 'modal__brand' }, [
+            el('div', { className: 'modal__icon' }, createGearIcon(20)),
+            el('div', null, [
+                el('div', { className: 'modal__title-box' }, el('h2', { className: 'modal__heading' }, 'UpLearn Control Panel')),
+                dragHintRow,
+            ]),
+        ]);
+
+        const bodyEl = el('div', { className: 'modal__body' });
+
+        const ensureTabBuilt = (tabId) => {
+            if (uiState.tabPanels[tabId]) return uiState.tabPanels[tabId];
+            let panel;
+            if (tabId === 'telemetry') panel = buildTelemetryTab();
+            else if (tabId === 'timeboost') panel = buildTimeBoostTab();
+            else if (tabId === 'preferences') panel = buildPreferencesTab();
+            else panel = buildStatsTab();
+            uiState.tabPanels[tabId] = panel;
+            bodyEl.appendChild(panel);
+            return panel;
+        };
+
+        const activateTab = (tabId) => {
+            uiState.activeTab = tabId;
+            ensureTabBuilt(tabId);
+            for (const key in uiState.tabPanels) {
+                const p = uiState.tabPanels[key];
+                const active = key === tabId;
+                if (active) p.dataset.active = 'true';
+                else delete p.dataset.active;
+                p.style.display = active ? 'flex' : 'none';
+            }
+            if (tabId === 'stats') runBindings('__statsSync');
+            if (tabId === 'timeboost') runBindings('__liveSessionSync');
+        };
+
+        const tabBar = createGlisseTabBar({
+            items: SETTINGS_TAB_ITEMS,
+            value: uiState.activeTab,
+            style: { '--lg-tab-width': '124px', '--lg-tab-height': '34px' },
+            onChange: activateTab,
+        });
+        uiState.tabBarApi = tabBar;
+        uiState.modalCleanupFns.push(tabBar.destroy);
+
+        const closeBtn = createGlisseButton({
+            variant: 'glass',
+            icon: createCloseIcon(),
+            title: 'Close (Esc)',
+            ariaLabel: 'Close modal',
+            style: { width: '36px', height: '36px', padding: '0' },
+            onClick: closeSettingsModal,
+        });
+        uiState.modalCleanupFns.push(closeBtn.destroy);
+
+        const header = el('header', {
+            className: `modal__header ${isDraggable ? 'modal__header--draggable' : ''}`.trim(),
+        }, [
+            brand,
+            el('div', { className: 'modal__header-nav' }, tabBar.el),
+            closeBtn.el,
+        ]);
+
+        // Draggable window pointer handling
+        let dragState = null;
+        const onDragMove = (moveEvt) => {
+            if (!dragState) return;
+            const dx = moveEvt.clientX - dragState.startX;
+            const dy = moveEvt.clientY - dragState.startY;
+            const nextX = clampModalCoord(dragState.initX + dx, dragState.dialogW, window.innerWidth);
+            const nextY = clampModalCoord(dragState.initY + dy, dragState.dialogH, window.innerHeight);
+            if (nextX === modalPos.x && nextY === modalPos.y) return;
+            modalPos = { x: nextX, y: nextY };
+            dialog.style.left = `${nextX}px`;
+            dialog.style.top = `${nextY}px`;
+        };
+        const onDragEnd = () => {
+            if (!dragState) return;
+            dragState = null;
+            header.classList.remove('modal__header--dragging');
+            safeWinRem('pointermove', onDragMove);
+            safeWinRem('pointerup', onDragEnd);
+            safeWinRem('pointercancel', onDragEnd);
+            try { localStorage.setItem(WINDOW_POS_KEY, JSON.stringify(modalPos)); } catch {}
+        };
+        header.addEventListener('pointerdown', (e) => {
+            if (!settings.draggableUI || e.button !== 0) return;
+            const t = e.target;
+            if (t && t.closest && t.closest('button, a, input, select, textarea, .lg-tab, .lg-tab-bar, .lg-button')) return;
+            e.preventDefault();
+            const rect = dialog.getBoundingClientRect();
+            dragState = {
+                startX: e.clientX,
+                startY: e.clientY,
+                initX: modalPos.x,
+                initY: modalPos.y,
+                dialogW: rect.width,
+                dialogH: rect.height,
+            };
+            header.classList.add('modal__header--dragging');
+            safeWinAdd('pointermove', onDragMove, { passive: true });
+            safeWinAdd('pointerup', onDragEnd);
+            safeWinAdd('pointercancel', onDragEnd);
+        });
+
+        const onViewportResize = () => {
+            if (!settings.draggableUI) return;
+            const { w, h } = getDefaultModalDims();
+            const nextX = clampModalCoord(modalPos.x, w, window.innerWidth);
+            const nextY = clampModalCoord(modalPos.y, h, window.innerHeight);
+            if (nextX !== modalPos.x || nextY !== modalPos.y) {
+                modalPos = { x: nextX, y: nextY };
+                dialog.style.left = `${nextX}px`;
+                dialog.style.top = `${nextY}px`;
+            }
+        };
+        safeWinAdd('resize', onViewportResize);
+
+        registerBinding('draggableUI', (enabled) => {
+            backdrop.classList.toggle('modal__backdrop--draggable', !!enabled);
+            container.classList.toggle('modal__container--draggable', !!enabled);
+            dialog.classList.toggle('modal__dialog--draggable', !!enabled);
+            header.classList.toggle('modal__header--draggable', !!enabled);
+            dialog.setAttribute('aria-modal', enabled ? 'false' : 'true');
+            dragHintRow.style.display = enabled ? 'flex' : 'none';
+            if (enabled) {
+                modalPos = loadSavedModalPos();
+                dialog.style.left = `${modalPos.x}px`;
+                dialog.style.top = `${modalPos.y}px`;
+            } else {
+                dialog.style.left = '';
+                dialog.style.top = '';
+            }
+        });
+
+        uiState.modalCleanupFns.push(() => {
+            onDragEnd();
+            safeWinRem('resize', onViewportResize);
+        });
+
+        dialog.append(header, bodyEl);
+        container.appendChild(dialog);
+        backdrop.appendChild(container);
+        uiState.modalBackdropEl = backdrop;
+        uiState.containerEl.appendChild(backdrop);
+
+        activateTab(uiState.activeTab);
+
+        // Subscribe to reactive stats updates while modal is open
+        uiState.statsUnsub = subscribeStats(() => {
+            if (uiState.activeTab === 'stats') runBindings('__statsSync');
+            if (uiState.activeTab === 'timeboost') runBindings('__liveSessionSync');
+        });
+    }
+
+    function unmountModalImmediate() {
+        if (uiState.statsUnsub) {
+            uiState.statsUnsub();
+            uiState.statsUnsub = null;
+        }
+        for (let i = 0; i < uiState.modalCleanupFns.length; i++) {
+            try { uiState.modalCleanupFns[i](); } catch {}
+        }
+        uiState.modalCleanupFns = [];
+        uiState.bindings = {};
+        uiState.tabPanels = {};
+        uiState.tabBarApi = null;
+        uiState.openMenuCount = 0;
+        uiState.openMenuClosers.clear();
+        if (uiState.containerEl) uiState.containerEl.removeAttribute('data-has-menu-open');
+        if (uiState.modalBackdropEl) {
+            uiState.modalBackdropEl.remove();
+            uiState.modalBackdropEl = null;
+        }
+        pruneUnusedLenses();
+        uiState.modalIsOpen = false;
+        uiState.modalIsClosing = false;
+    }
+
+    function closeSettingsModal() {
+        if (uiState.capturingKeybind) {
+            uiState.capturingKeybind = false;
+            runBindings('__capturingKeybind');
+        }
+        if (!uiState.modalIsOpen || uiState.modalIsClosing) return;
+
+        uiState.modalIsOpen = false;
+        uiState.modalIsClosing = true;
+        if (uiState.modalBackdropEl) {
+            uiState.modalBackdropEl.classList.add('modal__backdrop--closing');
+        }
+        if (uiState.modalCloseTimer) clearTimeout(uiState.modalCloseTimer);
+        uiState.modalCloseTimer = setTimeout(() => {
+            uiState.modalCloseTimer = null;
+            unmountModalImmediate();
+        }, 190);
+    }
+
+    function resetAllStats() {
+        for (const k in stats) stats[k] = 0;
+        sessionState.accumulatedExtraSeconds = 0;
+        sessionState.accumulatedQuestionCount = 0;
+        if (sessionState.activeSession) updatePredictedFinalCall(sessionState.activeSession);
+        bumpContextRevision();
+        updateStatusPill();
+        runBindings('__statsSync');
+        runBindings('__liveSessionSync');
+    }
+
+    function resetAllSettings() {
+        Object.assign(settings, DEFAULT_SETTINGS);
+        settings.telemetryServices = buildDefaultTelemetryServices();
+        settings.uiToggleKeybind = Object.assign({}, DEFAULT_KEYBIND);
+        normalizeRange(settings);
+        saveSettings(true);
+        syncDomObserver();
+        if (settings.logLevel !== 'verbose') {
+            sessionState.latestExamPaperData = null;
+            sessionState.latestUserProfile = null;
+            sessionState.latestFeatureFlags = null;
+            sessionState.latestGlobalFeatureFlags = null;
+            sessionState.latestQuizFeedback = null;
+        }
+        applyDarkMode();
+        ensureButton();
+        patchVisibilityProps();
+        installHasFocusPatch();
+        initVideoAutoSkipController();
+        syncRootThemeAndAccent();
+        renderStatusPill();
+        for (const key in settings) {
+            runBindings(key, settings[key]);
+        }
+        runBindings('__telemetryServicesUI');
+        LOG('settings reset to defaults');
+    }
+
+    // ------------------------------------------------------------
+    // Central Setting Mutator (Consolidated SETTING_EFFECTS Map)
+    // ------------------------------------------------------------
+    const syncLiveSessionEffect = () => {
+        if (sessionState.activeSession) updatePredictedFinalCall(sessionState.activeSession);
+        bumpContextRevision();
+        runBindings('__liveSessionSync');
+    };
+
+    const SETTING_EFFECTS = {
+        blockDomElements: () => { syncDomObserver(); },
+        dynamicTimeEnabled: (v) => {
+            LOG('dynamic question time calculation ' + (v ? 'ENABLED' : 'DISABLED'));
+            updateLabel();
+        },
+        predictFinalCallEnabled: (v) => {
+            LOG('final API call prediction & sync ' + (v ? 'ENABLED' : 'DISABLED'));
+            syncLiveSessionEffect();
+            updateLabel();
+        },
+        manualTimeButtonEnabled: (v) => {
+            syncDomObserver();
+            LOG('manual "Add time" button ' + (v ? 'ENABLED' : 'DISABLED'));
+            if (!v) clearManualButtonState();
+            else ensureButton();
+        },
+        manualTimeStacksWithAuto: (v) => {
+            LOG('manual time stacking with auto-boost ' + (v ? 'ENABLED' : 'DISABLED'));
+        },
+        fullVideoWatchedEnabled: (v) => {
+            LOG('full video watch toggle (percentWatched=1) ' + (v ? 'ENABLED' : 'DISABLED'));
+            syncLiveSessionEffect();
+        },
+        autoSkipVideoEnabled: (v) => {
+            if (v) initVideoAutoSkipController();
+            LOG('auto-skip video to questions / completion ' + (v ? 'ENABLED' : 'DISABLED'));
+        },
+        addVideoDurationToTimeSpent: (v) => {
+            LOG('add full video duration to timeSpent ' + (v ? 'ENABLED' : 'DISABLED'));
+            syncLiveSessionEffect();
+        },
+        suppressJitsu: (v) => {
+            LOG('Jitsu telemetry ' + (v ? 'SUPPRESSED (blocked + logged)' : 'ALLOWED (passed through + logged)'));
+            runBindings('__telemetryServicesUI');
+        },
+        blockLogEvent: (v) => {
+            LOG('LogEvent local mocking ' + (v ? 'ENABLED' : 'DISABLED'));
+        },
+        privateSearchMode: (v) => {
+            LOG('Private search mode ' + (v ? 'ENABLED' : 'DISABLED'));
+        },
+        disableAutoFullscreen: (v) => {
+            LOG('auto-fullscreen blocking ' + (v ? 'ENABLED' : 'DISABLED'));
+        },
+        spoofVisibility: (v) => {
+            patchVisibilityProps();
+            installHasFocusPatch();
+            LOG('visibility spoofing ' + (v ? 'ENABLED' : 'DISABLED'));
+        },
+        darkMode: () => {
+            applyDarkMode();
+        },
+        logLevel: (v) => {
+            if (v !== 'verbose') {
+                sessionState.latestExamPaperData = null;
+                sessionState.latestUserProfile = null;
+                sessionState.latestFeatureFlags = null;
+                sessionState.latestGlobalFeatureFlags = null;
+                sessionState.latestQuizFeedback = null;
+            }
+            if (publicApi) {
+                if (v === 'verbose') window.__ul = publicApi;
+                else try { delete window.__ul; } catch {}
+            }
+            LOG('log level set to:', v);
+        },
+        keybindAction: (v) => {
+            if (v === 'open-modal') settings.pillVisible = false;
+            else if (v === 'toggle-pill') settings.pillVisible = true;
+            LOG('keybind action set to:', v, '| pillVisible:', settings.pillVisible);
+        },
+        theme: () => { syncRootThemeAndAccent(); },
+        accentColor: () => { syncRootThemeAndAccent(); },
+    };
 
     function applySettingChange(key, value) {
         if (key === 'telemetryPreset') {
@@ -7054,9 +10525,14 @@ function getEffectiveTheme(thm) {
             } else {
                 settings.telemetryPreset = 'custom';
             }
+            syncDomObserver();
             saveSettings();
             LOG('telemetry preset:', value);
-            if (reactSetSettings) reactSetSettings(cloneSettings(settings));
+            for (let i = 0; i < PRESET_SYNC_KEYS.length; i++) {
+                const k = PRESET_SYNC_KEYS[i];
+                runBindings(k, settings[k]);
+            }
+            runBindings('__telemetryServicesUI');
             return;
         }
 
@@ -7065,19 +10541,26 @@ function getEffectiveTheme(thm) {
             settings.extraSecondsMax = value && value.max;
             normalizeRange(settings);
             saveSettings();
+            updateStatusPill();
             LOG('range set to:', settings.extraSecondsMin, '–', settings.extraSecondsMax);
-            if (reactSetSettings) reactSetSettings(cloneSettings(settings));
+            runBindings('extraSecondsRange');
             return;
         }
 
         if (key === 'telemetryServices') {
+            const prevJitsu = settings.suppressJitsu;
             settings.telemetryServices = Object.assign({}, value);
             if (typeof settings.telemetryServices.jitsu === 'boolean') {
                 settings.suppressJitsu = settings.telemetryServices.jitsu;
             }
             settings.telemetryPreset = 'custom';
             saveSettings();
-            if (reactSetSettings) reactSetSettings(cloneSettings(settings));
+            if (settings.suppressJitsu !== prevJitsu) {
+                LOG('Jitsu telemetry ' + (settings.suppressJitsu ? 'SUPPRESSED (blocked + logged)' : 'ALLOWED (passed through + logged)'));
+                runBindings('suppressJitsu', settings.suppressJitsu);
+            }
+            runBindings('__telemetryServicesUI');
+            runBindings('telemetryPreset', settings.telemetryPreset);
             return;
         }
 
@@ -7097,3812 +10580,92 @@ function getEffectiveTheme(thm) {
             settings.telemetryPreset = 'custom';
         }
 
-        saveSettings();
         if (key === 'pillOpacity') {
-            if (pillOpacityLogTimer) clearTimeout(pillOpacityLogTimer);
-            pillOpacityLogTimer = setTimeout(() => {
-                pillOpacityLogTimer = null;
+            if (uiState.pillOpacityLogTimer) clearTimeout(uiState.pillOpacityLogTimer);
+            uiState.pillOpacityLogTimer = setTimeout(() => {
+                uiState.pillOpacityLogTimer = null;
                 LOG('setting changed: pillOpacity =', settings.pillOpacity);
             }, 300);
         } else {
             LOG('setting changed:', key, '=', value);
         }
 
-        switch (key) {
-            case 'dynamicTimeEnabled':
-                LOG('dynamic question time calculation ' + (value ? 'ENABLED' : 'DISABLED'));
-                updateLabel();
-                break;
-            case 'predictFinalCallEnabled':
-                LOG('final API call prediction & sync ' + (value ? 'ENABLED' : 'DISABLED'));
-                if (activeSession) updatePredictedFinalCall(activeSession);
-                bumpContextRevision();
-                updateLabel();
-                break;
-            case 'manualTimeButtonEnabled':
-                LOG('manual "Add time" button ' + (value ? 'ENABLED' : 'DISABLED'));
-                if (!value) removeButton();
-                else ensureButton();
-                break;
-            case 'manualTimeStacksWithAuto':
-                LOG('manual time stacking with auto-boost ' + (value ? 'ENABLED' : 'DISABLED'));
-                break;
-            case 'fullVideoWatchedEnabled':
-                LOG('full video watch toggle (percentWatched=1) ' + (value ? 'ENABLED' : 'DISABLED'));
-                break;
-            case 'autoSkipVideoEnabled':
-                if (value) initVideoAutoSkipController();
-                LOG('auto-skip video to questions / completion ' + (value ? 'ENABLED' : 'DISABLED'));
-                break;
-            case 'addVideoDurationToTimeSpent':
-                LOG('add full video duration to timeSpent ' + (value ? 'ENABLED' : 'DISABLED'));
-                break;
-            case 'suppressJitsu':
-                LOG('Jitsu telemetry ' + (value ? 'SUPPRESSED (blocked + logged)' : 'ALLOWED (passed through + logged)'));
-                break;
-            case 'blockLogEvent':
-                LOG('LogEvent local mocking ' + (value ? 'ENABLED' : 'DISABLED'));
-                break;
-            case 'privateSearchMode':
-                LOG('Private search mode ' + (value ? 'ENABLED' : 'DISABLED'));
-                break;
-            case 'disableAutoFullscreen':
-                LOG('auto-fullscreen blocking ' + (value ? 'ENABLED' : 'DISABLED'));
-                break;
-            case 'spoofVisibility':
-                patchVisibilityProps();
-                installHasFocusPatch();
-                LOG('visibility spoofing ' + (value ? 'ENABLED' : 'DISABLED'));
-                break;
-            case 'darkMode':
-                ensureDarkModeStyles();
-                applyDarkMode();
-                break;
-            case 'logLevel':
-                if (publicApi) {
-                    if (value === 'verbose') window.__ul = publicApi;
-                    else try { delete window.__ul; } catch {}
-                }
-                LOG('log level set to:', value);
-                break;
-            case 'keybindAction':
-                if (value === 'open-modal') {
-                    settings.pillVisible = false;
-                } else if (value === 'toggle-pill') {
-                    settings.pillVisible = true;
-                }
-                LOG('keybind action set to:', value, '| pillVisible:', settings.pillVisible);
-                break;
-        }
+        const effect = SETTING_EFFECTS[key];
+        if (effect) effect(value);
 
-        if (reactSetSettings) reactSetSettings(cloneSettings(settings));
-    }
+        // Persist AFTER all side-effect mutations complete
+        saveSettings();
 
-    function openSettingsModal() {
-        if (reactSetModalOpen) {
-            reactSetModalOpen(true);
-        } else {
-            ensureUIHost();
-            setTimeout(() => { if (reactSetModalOpen) reactSetModalOpen(true); }, 50);
+        // Sync floating pill & bound modal controls
+        renderStatusPill();
+        runBindings(key, settings[key]);
+        if (settings.telemetryPreset === 'custom' && INDIVIDUAL_TELEMETRY_SETTINGS.has(key)) {
+            runBindings('telemetryPreset', 'custom');
         }
     }
 
-    function closeSettingsModal() {
-        if (reactSetModalOpen) reactSetModalOpen(false);
-    }
-
-    function syncModalIfOpen() {
-        if (reactSetSettings) reactSetSettings(cloneSettings(settings));
-    }
-
-    
-    // ============================================================
-    // OFFICIAL KELVIN ZHANG GLISSE ENGINE (https://glisse.kelvinzhang.com/)
-    // Directly bundled from official npm package glisse@0.4.3
-    // Exports: Button, Glass, Input, Menu, SearchField, Slider, Switch, TabBar
-    // ============================================================
-var Glisse = (() => {
-  // React primitives destructuring & simplified jsx
-  const { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, createElement } = React;
-
-  function jsx(type, props, key) {
-    return key !== void 0 ? createElement(type, { ...props, key }) : createElement(type, props);
-  }
-  const jsxs = jsx;
-
-  function cx(a, b, c, d) {
-    let out = a || "";
-    if (b) out = out ? out + " " + b : b;
-    if (c) out = out ? out + " " + c : c;
-    if (d) out = out ? out + " " + d : d;
-    return out;
-  }
-  const isRealDocHidden = () => (ORIG_HIDDEN ? ORIG_HIDDEN.call(document) : document.hidden);
-  var moving = /* @__PURE__ */ new Set();
-  var frame = 0;
-  var last = 0;
-  function advance(s, dt) {
-    const x = s.value - s.target;
-    const v = s.velocity;
-    const half = s.damping / 2;
-    const discriminant = half * half - s.stiffness;
-    if (Math.abs(discriminant) < 1e-4) {
-      const decay = Math.exp(-half * dt);
-      const b = v + half * x;
-      s.value = s.target + decay * (x + b * dt);
-      s.velocity = decay * (v - half * b * dt);
-    } else if (discriminant > 0) {
-      const root = Math.sqrt(discriminant);
-      const r1 = -half + root;
-      const r2 = -half - root;
-      const a = (v - r2 * x) / (r1 - r2);
-      const b = x - a;
-      s.value = s.target + a * Math.exp(r1 * dt) + b * Math.exp(r2 * dt);
-      s.velocity = a * r1 * Math.exp(r1 * dt) + b * r2 * Math.exp(r2 * dt);
-    } else {
-      const omega = Math.sqrt(-discriminant);
-      const decay = Math.exp(-half * dt);
-      const cos = Math.cos(omega * dt);
-      const sin = Math.sin(omega * dt);
-      s.value = s.target + decay * (x * cos + (v + half * x) / omega * sin);
-      s.velocity = decay * (v * cos - (half * v + s.stiffness * x) / omega * sin);
-    }
-  }
-  function tick(time) {
-    frame = 0;
-    const dt = Math.min(0.1, Math.max(0, (time - last) / 1e3));
-    last = time;
-    for (const s of moving) {
-      advance(s, dt);
-      if (Math.abs(s.value - s.target) < 1e-4 && Math.abs(s.velocity) < 1e-3) {
-        s.value = s.target;
-        s.velocity = 0;
-        moving.delete(s);
-      }
-      s.paint(s.value);
-    }
-    if (moving.size) frame = requestAnimationFrame(tick);
-  }
-  function prefersReducedMotion() {
-    return matchMedia("(prefers-reduced-motion: reduce)").matches;
-  }
-  function createSpring(value, stiffness, damping, paint) {
-    const s = {
-      value,
-      target: value,
-      velocity: 0,
-      stiffness,
-      damping,
-      paint
-    };
-    return {
-      paint: () => paint(s.value),
-      set(target, instant = false) {
-        s.target = target;
-        if (instant || isRealDocHidden() || prefersReducedMotion()) {
-          s.value = target;
-          s.velocity = 0;
-          moving.delete(s);
-          paint(target);
-          return;
-        }
-        if (s.value === target && s.velocity === 0 && !moving.has(s)) return;
-        moving.add(s);
-        if (!frame) {
-          last = Number(document.timeline?.currentTime ?? performance.now());
-          frame = requestAnimationFrame(tick);
-        }
-      },
-      tune(nextStiffness, nextDamping) {
-        s.stiffness = nextStiffness;
-        s.damping = nextDamping;
-      },
-      stop: () => {
-        moving.delete(s);
-      }
-    };
-  }
-  var POINTER = {
-    grow: 6,
-    press: [417.6, 29.2],
-    release: [230, 23.7]
-  };
-  var TOUCH = {
-    grow: 15,
-    press: [515, 27.3],
-    release: [250, 11.8]
-  };
-  function usePress(ref) {
-    useEffect(() => {
-      const el = ref.current;
-      if (!el) return;
-      const value = [
-        1,
-        1,
-        0,
-        0
-      ];
-      const paint = () => {
-        el.style.scale = `${value[0]} ${value[1]}`;
-        el.style.translate = `${value[2]}px ${value[3]}px`;
-      };
-      const springs = value.map((initial, i) => createSpring(initial, ...POINTER.release, (next) => {
-        value[i] = next;
-        paint();
-      }));
-      let pointer = null;
-      const target = (next, [stiffness, damping]) => {
-        springs.forEach((spring, i) => {
-          spring.tune(stiffness, damping);
-          spring.set(next[i] ?? 0);
-        });
-      };
-      const track = (event) => {
-        if (!pointer) return;
-        const { box, feel } = pointer;
-        el.style.setProperty("--lg-x", `${(event.clientX - box.left) / box.width * 100}%`);
-        el.style.setProperty("--lg-y", `${(event.clientY - box.top) / box.height * 100}%`);
-        const { width, height } = box;
-        const base = 1 + feel.grow / Math.max(width, height);
-        const aspect = width / height;
-        const dx = (event.clientX - pointer.x) / aspect;
-        const dy = event.clientY - pointer.y;
-        const length = Math.hypot(dx, dy);
-        if (!length) return target([
-          base,
-          base,
-          0,
-          0
-        ], feel.press);
-        const nx = dx / length;
-        const ny = dy / length;
-        const rubber = 1 - 1 / (1 + length / height / (5 * aspect));
-        const stretch = 1 + 6 / height * rubber * Math.abs(Math.abs(nx) - Math.abs(ny));
-        const horizontal = Math.abs(nx) > Math.abs(ny);
-        target([
-          base * (horizontal ? stretch : 1 / stretch),
-          base * (horizontal ? 1 / stretch : stretch),
-          nx * 8 * rubber,
-          ny * 8 * rubber
-        ], feel.press);
-      };
-      const move = (event) => {
-        if (event.pointerId === pointer?.id) track(event);
-      };
-      const end = (event) => {
-        if (event && event.pointerId !== pointer?.id) return;
-        const feel = pointer?.feel ?? POINTER;
-        pointer = null;
-        delete el.dataset.pressed;
-        window.removeEventListener("pointermove", move);
-        window.removeEventListener("pointerup", end);
-        window.removeEventListener("pointercancel", end);
-        target([
-          1,
-          1,
-          0,
-          0
-        ], feel.release);
-      };
-      const down = (event) => {
-        if (!event.isPrimary || event.button !== 0 || pointer || el.matches(":disabled")) return;
-        pointer = {
-          id: event.pointerId,
-          x: event.clientX,
-          y: event.clientY,
-          box: el.getBoundingClientRect(),
-          feel: event.pointerType === "mouse" ? POINTER : TOUCH
-        };
-        el.dataset.pressed = "";
-        window.addEventListener("pointermove", move);
-        window.addEventListener("pointerup", end);
-        window.addEventListener("pointercancel", end);
-        track(event);
-      };
-      const reset = () => end();
-      el.addEventListener("pointerdown", down);
-      window.addEventListener("blur", reset);
-      return () => {
-        end();
-        springs.forEach((spring) => spring.stop());
-        el.removeEventListener("pointerdown", down);
-        window.removeEventListener("blur", reset);
-        el.style.removeProperty("scale");
-        el.style.removeProperty("translate");
-      };
-    }, [ref]);
-  }
-  var SVG = "http://www.w3.org/2000/svg";
-  var lenses = /* @__PURE__ */ new Map();
-  var defs;
-  var clamp$2 = (value, min, max) => Math.min(max, Math.max(min, value));
-  function svg(name, attributes) {
-    const element = document.createElementNS(SVG, name);
-    for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
-    return element;
-  }
-  function container() {
-    if (defs?.isConnected) return defs;
-    const root = svg("svg", {
-      width: 0,
-      height: 0,
-      "aria-hidden": "true"
-    });
-    root.style.cssText = "position:absolute;pointer-events:none;width:0;height:0;";
-    defs = svg("defs", {});
-    root.append(defs);
-    const target = (typeof uiShadowRoot !== "undefined" && uiShadowRoot) || document.body || document.documentElement;
-    if (target) target.append(root);
-    return defs;
-  }
-  const profileCache = new Map();
-  function profile(bezel, thickness) {
-    const key = `${bezel}-${thickness}`;
-    const cached = profileCache.get(key);
-    if (cached) return cached;
-    const samples = /* @__PURE__ */ new Float32Array(128);
-    let maximum = 0;
-    for (let i = 0; i < samples.length; i++) {
-      const t = Math.max(1e-3, i / (samples.length - 1));
-      const surface = (1 - (1 - t) ** 4) ** 0.25;
-      const incident = Math.atan((1 - t) ** 3 / surface ** 3);
-      const refracted = Math.asin(Math.sin(incident) / 1.5);
-      samples[i] = Math.tan(incident - refracted) * (thickness + surface * bezel);
-      maximum = Math.max(maximum, samples[i]);
-    }
-    const result = {
-      samples,
-      maximum
-    };
-    profileCache.set(key, result);
-    return result;
-  }
-  let sharedCanvas = null;
-  let sharedCtx = null;
-  let lensIdCounter = 0;
-
-  function maps(width, height, radius, selection, shape, needDisplacement = true) {
-    const bezel = shape.bezel ?? clamp$2(Math.min(width, height) * 0.12, 4, 10);
-    const { samples, maximum } = profile(bezel, shape.thickness ?? clamp$2(Math.min(width, height) * 0.2, 8, 24));
-    const w = Math.ceil(width);
-    const h = Math.ceil(height);
-
-    if (!sharedCanvas) {
-      sharedCanvas = document.createElement("canvas");
-      sharedCtx = sharedCanvas.getContext("2d");
-    }
-    if (sharedCanvas.width !== w) sharedCanvas.width = w;
-    if (sharedCanvas.height !== h) sharedCanvas.height = h;
-
-    const field = needDisplacement ? sharedCtx.createImageData(w, h) : null;
-    const fieldData = field ? field.data : null;
-    const fieldU32 = fieldData ? new Uint32Array(fieldData.buffer) : null;
-    if (fieldU32) fieldU32.fill(0xFF808080);
-
-    const shine = sharedCtx.createImageData(w, h);
-    const shineData = shine.data;
-    const shineU32 = new Uint32Array(shineData.buffer);
-    const useMagnify = needDisplacement && !selection && shape.zoom > 1;
-    const magnify = useMagnify ? sharedCtx.createImageData(w, h) : null;
-    const magnifyU32 = magnify ? new Uint32Array(magnify.data.buffer) : null;
-    const halfW = width / 2;
-    const halfH = height / 2;
-    const innerW = halfW - radius;
-    const innerH = halfH - radius;
-    const maxSampleIdx = samples.length - 1;
-    const reach = Math.max(width, height) / 2;
-    const direction = selection ? 1 : -1;
-    const bloomDenom = bezel * 0.22;
-    const radiusSqLimit = radius * radius + 1e-9;
-    const sqrt1_2 = Math.SQRT1_2;
-
-    if (magnifyU32) {
-      const magX = new Uint8Array(w);
-      for (let x = 0; x < w; x++) magX[x] = Math.round(127.5 - ((x + 0.5) - halfW) / reach * 127.5);
-      for (let y = 0; y < h; y++) {
-        const magYBits = 0xFF800000 | (Math.round(127.5 - ((y + 0.5) - halfH) / reach * 127.5) << 8);
-        const off = y * w;
-        for (let x = 0; x < w; x++) magnifyU32[off + x] = magYBits | magX[x];
-      }
-    }
-
-    let outShine = 0;
-    let outField = 0xFF808080;
-    function evalPixel(distance, nx, ny) {
-      outField = 0xFF808080;
-      if (distance < bezel && fieldU32) {
-        const sample = distance / bezel * maxSampleIdx;
-        const lower = Math.floor(sample);
-        const a = samples[lower];
-        const shift = a + (samples[Math.min(lower + 1, maxSampleIdx)] - a) * (sample - lower);
-        const rF = Math.round(127.5 + direction * nx * shift / maximum * 127.5);
-        const gF = Math.round(127.5 + direction * ny * shift / maximum * 127.5);
-        const rc = rF < 0 ? 0 : rF > 255 ? 255 : rF;
-        const gc = gF < 0 ? 0 : gF > 255 ? 255 : gF;
-        outField = (0xFF800000 | (gc << 8) | rc) >>> 0;
-      }
-
-      const light = -(nx + ny) * sqrt1_2;
-      const glint = light > 0 ? light ** 3 : 0;
-      const reflected = light < 0 ? (-light) ** 3 : 0;
-      let r = 255, g = 255, b = 255, alpha = 0;
-
-      if (selection) {
-        const d0 = (distance - 0.18) / 0.22;
-        const d1 = (distance - 0.42) / 0.22;
-        const d2 = (distance - 0.66) / 0.22;
-        const b0 = Math.exp(-(d0 * d0));
-        const b1 = Math.exp(-(d1 * d1));
-        const b2 = Math.exp(-(d2 * d2));
-        const peak = Math.max(b0, b1, b2);
-        alpha = peak * (0.06 + 0.8 * glint + 0.35 * reflected) * 0.85;
-        const invPeak = peak ? 0.35 / peak : 0;
-        r = Math.round(255 * (0.65 + b0 * invPeak));
-        g = Math.round(255 * (0.65 + b1 * invPeak));
-        b = Math.round(255 * (0.65 + b2 * invPeak));
-        r = r >= 255 ? 255 : r > 0 ? r : 0;
-        g = g >= 255 ? 255 : g > 0 ? g : 0;
-        b = b >= 255 ? 255 : b > 0 ? b : 0;
-      } else {
-        const rim = Math.exp(-(((distance - 0.4) / 0.38) ** 2));
-        const bloom = Math.exp(-((distance / bloomDenom) ** 2));
-        alpha = rim * (0.045 + 0.52 * glint + 0.2 * reflected) + bloom * 0.02 * glint;
-      }
-
-      const aByte = Math.round((alpha < 0 ? 0 : alpha > 1 ? 1 : alpha) * 255);
-      outShine = ((aByte << 24) | (b << 16) | (g << 8) | r) >>> 0;
-    }
-
-    let templateBezelRowOffset = -1;
-    for (let y = 0; y < h; y++) {
-      const py = (y + 0.5) - halfH;
-      const qy = Math.abs(py) - innerH;
-      const signPy = py > 0 ? 1 : py < 0 ? -1 : 0;
-      const rowPixelOffset = y * w;
-      const qyNegBezel = qy < -bezel;
-
-      // Flat horizontal middle span has constant distance/normal across x (or sits inside interior)
-      const spanLimit = qyNegBezel ? (innerW - bezel - 1e-9) : (innerW + (qy < 0 ? qy : 0) - 1e-9);
-      let flatStart = 0;
-      let flatEnd = 0;
-      if (spanLimit >= 0) {
-        flatStart = Math.max(0, Math.ceil(halfW - spanLimit - 0.5));
-        flatEnd = Math.min(w, Math.floor(halfW + spanLimit - 0.5) + 1);
-        if (flatEnd > flatStart) {
-          if (!qyNegBezel) {
-            const flatDist = radius - qy;
-            if (flatDist < 0) {
-              shineU32.fill(0x00FFFFFF, rowPixelOffset + flatStart, rowPixelOffset + flatEnd);
-            } else {
-              evalPixel(flatDist, 0, signPy);
-              shineU32.fill(outShine, rowPixelOffset + flatStart, rowPixelOffset + flatEnd);
-              if (fieldU32 && outField !== 0xFF808080) {
-                fieldU32.fill(outField, rowPixelOffset + flatStart, rowPixelOffset + flatEnd);
-              }
-            }
-          }
-        } else {
-          flatStart = 0;
-          flatEnd = 0;
-        }
-      }
-
-      if (qyNegBezel && templateBezelRowOffset !== -1) {
-        if (flatStart > 0) {
-          shineU32.copyWithin(rowPixelOffset, templateBezelRowOffset, templateBezelRowOffset + flatStart);
-          if (fieldU32) fieldU32.copyWithin(rowPixelOffset, templateBezelRowOffset, templateBezelRowOffset + flatStart);
-        }
-        if (flatEnd < w) {
-          shineU32.copyWithin(rowPixelOffset + flatEnd, templateBezelRowOffset + flatEnd, templateBezelRowOffset + w);
-          if (fieldU32) fieldU32.copyWithin(rowPixelOffset + flatEnd, templateBezelRowOffset + flatEnd, templateBezelRowOffset + w);
-        }
-        continue;
-      }
-
-      // Left [0, flatStart) and right [flatEnd, w) edge/corner segments
-      for (let seg = 0; seg < 2; seg++) {
-        const xStart = seg === 0 ? 0 : flatEnd;
-        const xEnd = seg === 0 ? flatStart : w;
-        for (let x = xStart; x < xEnd; x++) {
-          const px = (x + 0.5) - halfW;
-          const absPx = px < 0 ? -px : px;
-          const qx = absPx - innerW;
-          if (qx < -bezel && qyNegBezel) continue;
-
-          let distance, nx, ny;
-          if (qx <= 0) {
-            distance = radius - (qy < 0 ? qx : qy);
-            nx = qx > qy ? (px > 0 ? 1 : px < 0 ? -1 : 0) : 0;
-            ny = qx > qy ? 0 : signPy;
-          } else if (qy <= 0) {
-            distance = radius - qx;
-            nx = px > 0 ? 1 : px < 0 ? -1 : 0;
-            ny = 0;
-          } else {
-            if (qx * qx + qy * qy > radiusSqLimit) {
-              shineU32[rowPixelOffset + x] = 0x00FFFFFF;
-              continue;
-            }
-            const length = Math.hypot(qx, qy);
-            distance = radius - length;
-            nx = qx / length * (px > 0 ? 1 : px < 0 ? -1 : 0);
-            ny = qy / length * signPy;
-          }
-
-          const pixelIdx = rowPixelOffset + x;
-          if (distance < 0) {
-            shineU32[pixelIdx] = 0x00FFFFFF;
-            continue;
-          }
-          evalPixel(distance, nx, ny);
-          shineU32[pixelIdx] = outShine;
-          if (fieldU32 && outField !== 0xFF808080) fieldU32[pixelIdx] = outField;
-        }
-      }
-      if (qyNegBezel && templateBezelRowOffset === -1) {
-        templateBezelRowOffset = rowPixelOffset;
-      }
-    }
-
-    let displacement = null;
-    if (field) {
-      sharedCtx.putImageData(field, 0, 0);
-      displacement = sharedCanvas.toDataURL();
-    }
-
-    sharedCtx.putImageData(shine, 0, 0);
-    const highlight = sharedCanvas.toDataURL();
-
-    let zoom = null;
-    if (magnify) {
-      sharedCtx.putImageData(magnify, 0, 0);
-      zoom = {
-        map: sharedCanvas.toDataURL(),
-        scale: 2 * reach * (1 - 1 / shape.zoom)
-      };
-    }
-
-    return {
-      displacement,
-      highlight,
-      zoom,
-      scale: maximum * 2 * shape.level
-    };
-  }
-
-  function cacheLens(key, result) {
-    if (lenses.size >= 64) {
-      const oldestKey = lenses.keys().next().value;
-      const oldest = lenses.get(oldestKey);
-      if (oldest && oldest.filterNode && oldest.filterNode.parentNode) {
-        oldest.filterNode.remove();
-      }
-      lenses.delete(oldestKey);
-    }
-    lenses.set(key, result);
-    return result;
-  }
-
-  function lens(width, height, radius, selection, shape, filtered = true) {
-    const key = `${width}-${height}-${radius}-${selection}-${filtered}-${shape.bezel}-${shape.thickness}-${shape.level}-${shape.zoom}-${shape.saturation}`;
-    const cached = lenses.get(key);
-    if (cached) return cached;
-
-    const { displacement, highlight, zoom, scale } = maps(width, height, radius, selection, shape, filtered);
-
-    if (!filtered || !displacement) {
-      return cacheLens(key, {
-        filter: "none",
-        rim: `url("${highlight}")`,
-        filterNode: null
-      });
-    }
-
-    const id2 = `glisse-${++lensIdCounter}`;
-    const box = {
-      x: 0,
-      y: 0,
-      width,
-      height
-    };
-    const filter = svg("filter", {
-      id: id2,
-      ...box,
-      filterUnits: "userSpaceOnUse",
-      primitiveUnits: "userSpaceOnUse",
-      "color-interpolation-filters": "sRGB"
-    });
-    filter.append(svg("feImage", {
-      href: displacement,
-      ...box,
-      preserveAspectRatio: "none",
-      result: "field"
-    }));
-
-    if (selection) {
-      for (const [name, factor, values] of [
-        ["r", 1.035, "1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0"],
-        ["g", 1, "0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 1 0"],
-        ["b", 0.965, "0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 1 0"]
-      ]) filter.append(svg("feDisplacementMap", {
-        in: "SourceGraphic",
-        in2: "field",
-        scale: scale * factor,
-        xChannelSelector: "R",
-        yChannelSelector: "G",
-        result: `${name}-ray`
-      }), svg("feColorMatrix", {
-        in: `${name}-ray`,
-        type: "matrix",
-        values,
-        result: name
-      }));
-      filter.append(svg("feComposite", {
-        in: "r",
-        in2: "g",
-        operator: "arithmetic",
-        k2: 1,
-        k3: 1,
-        result: "rg"
-      }), svg("feComposite", {
-        in: "rg",
-        in2: "b",
-        operator: "arithmetic",
-        k2: 1,
-        k3: 1
-      }));
-    } else {
-      if (zoom) filter.append(svg("feImage", {
-        href: zoom.map,
-        ...box,
-        preserveAspectRatio: "none",
-        result: "zoom"
-      }), svg("feDisplacementMap", {
-        in: "SourceGraphic",
-        in2: "zoom",
-        scale: zoom.scale,
-        xChannelSelector: "R",
-        yChannelSelector: "G",
-        result: "magnified"
-      }));
-      filter.append(svg("feDisplacementMap", {
-        in: zoom ? "magnified" : "SourceGraphic",
-        in2: "field",
-        scale,
-        xChannelSelector: "R",
-        yChannelSelector: "G",
-        result: "bent"
-      }), svg("feGaussianBlur", {
-        in: "bent",
-        stdDeviation: 0.4,
-        result: "displaced"
-      }), svg("feColorMatrix", {
-        in: "displaced",
-        type: "saturate",
-        values: 1.5,
-        result: "face"
-      }));
-      if (shape.saturation > 1) {
-        const mask = svg("feComponentTransfer", {
-          in: "shine",
-          result: "mask"
-        });
-        mask.append(svg("feFuncA", {
-          type: "linear",
-          slope: 1.8
-        }));
-        filter.append(svg("feColorMatrix", {
-          in: "displaced",
-          type: "saturate",
-          values: shape.saturation,
-          result: "vivid"
-        }), svg("feImage", {
-          href: highlight,
-          ...box,
-          preserveAspectRatio: "none",
-          result: "shine"
-        }), mask, svg("feComposite", {
-          in: "vivid",
-          in2: "mask",
-          operator: "in",
-          result: "edge"
-        }), svg("feBlend", {
-          in: "edge",
-          in2: "face",
-          mode: "normal"
-        }));
-      }
-    }
-
-    container().append(filter);
-    return cacheLens(key, {
-      filter: `url("#${id2}")`,
-      rim: `url("${highlight}")`,
-      filterNode: filter
-    });
-  }
-  let cachedRootShape = null;
-  function getRootShape() {
-    if (cachedRootShape) return cachedRootShape;
-    const rootEl = (typeof uiContainerEl !== "undefined" && uiContainerEl) ||
-                   (typeof uiShadowRoot !== "undefined" && uiShadowRoot && uiShadowRoot.host) ||
-                   document.documentElement;
-    if (!rootEl) return { bezel: 8, thickness: 16, level: 1.05, zoom: 1.02, saturation: 1.6 };
+    // Listen to OS color-scheme changes when theme === 'auto'
     try {
-      const style = getComputedStyle(rootEl);
-      const parseVal = (name, def) => {
-        const v = parseFloat(style.getPropertyValue(name));
-        return Number.isFinite(v) ? v : def;
-      };
-      cachedRootShape = {
-        bezel: parseVal("--lg-bezel", 8),
-        thickness: parseVal("--lg-thickness", 16),
-        level: parseVal("--lg-refraction", 1.05),
-        zoom: Math.max(1, parseVal("--lg-zoom", 1.02)),
-        saturation: Math.max(1, parseVal("--lg-rim-saturation", 1.6))
-      };
-      return cachedRootShape;
-    } catch {
-      return { bezel: 8, thickness: 16, level: 1.05, zoom: 1.02, saturation: 1.6 };
-    }
-  }
-
-  const REFRACTS_BACKDROP = typeof navigator !== "undefined" && /Chrom(?:e|ium)\//.test(navigator.userAgent);
-  const dirtyRefractElements = new Map();
-  let flushScheduled = false;
-
-  function scheduleRefract(element, selection, filtered) {
-    dirtyRefractElements.set(element, { selection, filtered });
-    if (!flushScheduled) {
-      flushScheduled = true;
-      whenIdle(flushRefractBatch);
-    }
-  }
-
-  function flushRefractBatch() {
-    flushScheduled = false;
-    if (dirtyRefractElements.size === 0) return;
-
-    const entries = Array.from(dirtyRefractElements.entries());
-    dirtyRefractElements.clear();
-    const rootShape = getRootShape();
-
-    // Pass 1: READ layout & dimensions in batch
-    const batch = [];
-    for (let i = 0; i < entries.length; i++) {
-      const [element, { selection, filtered }] = entries[i];
-      if (!element.isConnected) continue;
-      const rawWidth = element.offsetWidth;
-      const rawHeight = element.offsetHeight;
-      if (!rawWidth || !rawHeight) continue;
-
-      const width = Math.round(rawWidth / 4) * 4;
-      const height = Math.round(rawHeight / 4) * 4;
-      const inlineRadius = element.style.borderRadius;
-      let corner = inlineRadius;
-      if (!corner) {
-        if (element.classList.contains("lg-button")) corner = "17px";
-        else if (element.classList.contains("lg-input")) corner = "14px";
-        else if (element.classList.contains("lg-switch") || element.classList.contains("heroui-pill")) corner = "9999px";
-        else {
-          try {
-            corner = getComputedStyle(element).borderTopLeftRadius || "12px";
-          } catch {
-            corner = "12px";
-          }
-        }
-      }
-      const radius = Math.min(width / 2, height / 2, corner.endsWith("%") ? Math.min(width, height) * parseFloat(corner) / 100 : parseFloat(corner));
-
-      const inlineStyle = element.style;
-      const inlineBezel = parseFloat(inlineStyle.getPropertyValue("--lg-bezel"));
-      const inlineThickness = parseFloat(inlineStyle.getPropertyValue("--lg-thickness"));
-      const inlineRefract = parseFloat(inlineStyle.getPropertyValue("--lg-refraction"));
-      const inlineZoom = parseFloat(inlineStyle.getPropertyValue("--lg-zoom"));
-      const inlineSat = parseFloat(inlineStyle.getPropertyValue("--lg-rim-saturation"));
-      const hasInlineShape = Number.isFinite(inlineBezel) || Number.isFinite(inlineThickness) ||
-                             Number.isFinite(inlineRefract) || Number.isFinite(inlineZoom) || Number.isFinite(inlineSat);
-
-      batch.push({
-        element,
-        width,
-        height,
-        radius,
-        selection,
-        filtered,
-        shape: hasInlineShape ? {
-          bezel: Number.isFinite(inlineBezel) ? inlineBezel : rootShape.bezel,
-          thickness: Number.isFinite(inlineThickness) ? inlineThickness : rootShape.thickness,
-          level: Number.isFinite(inlineRefract) ? inlineRefract : rootShape.level,
-          zoom: Math.max(1, Number.isFinite(inlineZoom) ? inlineZoom : rootShape.zoom),
-          saturation: Math.max(1, Number.isFinite(inlineSat) ? inlineSat : rootShape.saturation)
-        } : rootShape
-      });
-    }
-
-    // Pass 2: WRITE styles in batch
-    for (let i = 0; i < batch.length; i++) {
-      const item = batch[i];
-      const { filter, rim } = lens(item.width, item.height, item.radius, item.selection, item.shape, item.filtered);
-      if (item.filtered) item.element.style.setProperty("--lg-filter", filter);
-      item.element.style.setProperty("--lg-rim", rim);
-    }
-  }
-
-  function whenIdle(callback) {
-    if ("requestIdleCallback" in window) {
-      const handle2 = requestIdleCallback(callback, { timeout: 500 });
-      return () => cancelIdleCallback(handle2);
-    }
-    const handle = setTimeout(callback, 50);
-    return () => clearTimeout(handle);
-  }
-
-  const refractCallbacks = new WeakMap();
-  let sharedRefractObserver = null;
-  function getSharedRefractObserver() {
-    if (!sharedRefractObserver && typeof ResizeObserver !== "undefined") {
-      sharedRefractObserver = new ResizeObserver((entries) => {
-        for (let i = 0; i < entries.length; i++) {
-          const cb = refractCallbacks.get(entries[i].target);
-          if (cb) cb();
-        }
-      });
-    }
-    return sharedRefractObserver;
-  }
-
-  function refract(element, selection, filtered) {
-    const onResize = () => {
-      scheduleRefract(element, selection, filtered);
-    };
-    refractCallbacks.set(element, onResize);
-    const observer = getSharedRefractObserver();
-    if (observer) observer.observe(element);
-    scheduleRefract(element, selection, filtered);
-
-    return () => {
-      dirtyRefractElements.delete(element);
-      if (observer) observer.unobserve(element);
-      refractCallbacks.delete(element);
-      element.style.removeProperty("--lg-filter");
-      element.style.removeProperty("--lg-rim");
-    };
-  }
-  function useRefraction(ref, selection = false, enabled = true) {
-    useEffect(() => {
-      if (!enabled) return;
-      const element = ref.current;
-      if (!element) return;
-      return refract(element, selection, REFRACTS_BACKDROP);
-    }, [ref, selection, enabled]);
-  }
-  var Button = /* @__PURE__ */ forwardRef(function Button2({ icon, variant = "glass", destructive, tint, children, className, style, type = "button", ...props }, forwardedRef) {
-    const ref = useRef(null);
-    useImperativeHandle(forwardedRef, () => ref.current);
-    usePress(ref);
-    useRefraction(ref);
-    return /* @__PURE__ */ jsxs("button", {
-      ref,
-      type,
-      className: cx("lg-glass lg-button", className),
-      "data-icon": icon == null ? void 0 : children == null ? "only" : "",
-      "data-variant": variant === "glass" ? void 0 : variant,
-      "data-destructive": destructive ? "" : void 0,
-      "data-tint": tint ? "" : void 0,
-      style: tint ? {
-        ...style,
-        "--lg-tint": tint
-      } : style,
-      ...props,
-      children: [icon, children]
-    });
-  });
-  var Glass = /* @__PURE__ */ forwardRef(function Glass2({ className, refract = true, ...props }, forwardedRef) {
-    const ref = useRef(null);
-    useImperativeHandle(forwardedRef, () => ref.current);
-    useRefraction(ref, false, refract);
-    return /* @__PURE__ */ jsx("div", {
-      ref,
-      className: cx("lg-glass", className),
-      ...props
-    });
-  });
-  function useControllable(value, defaultValue, onChange) {
-    const [uncontrolled, setUncontrolled] = useState(defaultValue);
-    const controlled = value !== void 0;
-    const handler = useRef(onChange);
-    useEffect(() => {
-      handler.current = onChange;
-    });
-    const set = useCallback((next) => {
-      if (!controlled) setUncontrolled(next);
-      handler.current?.(next);
-    }, [controlled]);
-    return [controlled ? value : uncontrolled, set];
-  }
-  var Input = /* @__PURE__ */ forwardRef(function Input2({ value: valueProp, defaultValue = "", onValueChange, icon, className, style, ...props }, forwardedRef) {
-    const rootRef = useRef(null);
-    const inputRef = useRef(null);
-    const [value, setValue] = useControllable(valueProp, defaultValue, onValueChange);
-    useImperativeHandle(forwardedRef, () => inputRef.current);
-    useRefraction(rootRef);
-    return /* @__PURE__ */ jsxs("div", {
-      ref: rootRef,
-      className: cx("lg-glass lg-input", className),
-      style,
-      onPointerDown: (event) => {
-        if (event.target !== inputRef.current) inputRef.current?.focus();
-      },
-      children: [
-        icon == null ? null : /* @__PURE__ */ jsx("span", {
-          className: "lg-input-icon",
-          children: icon
-        }),
-        /* @__PURE__ */ jsx("input", {
-          ref: inputRef,
-          value,
-          onChange: (event) => setValue(event.currentTarget.value),
-          ...props
-        }),
-        props.type === "search" && value && !props.disabled ? /* @__PURE__ */ jsx("button", {
-          type: "button",
-          className: "lg-input-clear",
-          "aria-label": "Clear",
-          onPointerDown: (event) => event.preventDefault(),
-          onClick: () => {
-            setValue("");
-            inputRef.current?.focus();
-          },
-          children: /* @__PURE__ */ jsx("svg", {
-            viewBox: "0 0 16 16",
-            fill: "none",
-            stroke: "currentColor",
-            strokeWidth: 1.5,
-            strokeLinecap: "round",
-            "aria-hidden": true,
-            children: /* @__PURE__ */ jsx("path", { d: "m4.5 4.5 7 7m0-7-7 7" })
-          })
-        }) : null
-      ]
-    });
-  });
-  var clamp$1 = (value) => Math.min(1, Math.max(0, value));
-  var resistance = (value) => Math.sign(value) * 7 * (1 - Math.exp(-Math.abs(value) * 0.12 / 7));
-  var ellipsis = /* @__PURE__ */ jsxs("svg", {
-    viewBox: "0 0 16 16",
-    fill: "currentColor",
-    "aria-hidden": true,
-    children: [
-      /* @__PURE__ */ jsx("circle", {
-        cx: "3",
-        cy: "8",
-        r: "1.4"
-      }),
-      /* @__PURE__ */ jsx("circle", {
-        cx: "8",
-        cy: "8",
-        r: "1.4"
-      }),
-      /* @__PURE__ */ jsx("circle", {
-        cx: "13",
-        cy: "8",
-        r: "1.4"
-      })
-    ]
-  });
-  function Menu({ items, "aria-label": label, icon = ellipsis, align = "end", className, style }) {
-    const [phase, setPhase] = useState("closed");
-    const triggerRef = useRef(null);
-    const cardRef = useRef(null);
-    const surfaceRef = useRef(null);
-    const glyphRef = useRef(null);
-    const contentRef = useRef(null);
-    const plateRef = useRef(null);
-    const morphRef = useRef(null);
-    const latest = useRef(items);
-    const mounted = phase !== "closed";
-    useEffect(() => {
-      latest.current = items;
-    });
-    useEffect(() => {
-      if (phase === "open") morphRef.current?.set(1);
-      if (phase === "leaving") morphRef.current?.set(0);
-    }, [phase]);
-    useEffect(() => {
-      if (!mounted) return;
-      const trigger = triggerRef.current;
-      const card = cardRef.current;
-      const surface = surfaceRef.current;
-      const glyph = glyphRef.current;
-      const content = contentRef.current;
-      const plate = plateRef.current;
-
-      const parentRow = trigger ? trigger.closest(".field-row, .field-switch-row, .field-box, .switch") : null;
-      const parentCard = trigger ? trigger.closest(".card, .col-stack") : null;
-      const parentSelect = trigger ? trigger.closest(".lg-menu-select") : null;
-      const modalEl = trigger ? (trigger.closest(".modal, .tabs__panel, .modal__body") || (typeof uiContainerEl !== "undefined" ? uiContainerEl : null)) : null;
-
-      if (parentRow) parentRow.setAttribute("data-menu-open", "true");
-      if (parentCard) parentCard.setAttribute("data-menu-open", "true");
-      if (parentSelect) parentSelect.setAttribute("data-menu-open", "true");
-      if (modalEl) modalEl.setAttribute("data-has-menu-open", "true");
-      const from = {
-        width: trigger.offsetWidth,
-        height: trigger.offsetHeight
-      };
-      const to = {
-        width: card.offsetWidth,
-        height: card.offsetHeight
-      };
-      const radius = parseFloat(getComputedStyle(surface).borderTopLeftRadius);
-      const trailing = card.dataset.align !== "start";
-      const origin = {
-        x: trailing ? to.width - from.width / 2 : from.width / 2,
-        y: from.height / 2
-      };
-      content.style.transformOrigin = `${origin.x}px ${origin.y}px`;
-      glyph.style.width = `${from.width}px`;
-      glyph.style.height = `${from.height}px`;
-      let leaving = false;
-      const shape = createSpring(0, 600, 46, (value) => {
-        const t = clamp$1(value);
-        const settled = t === 1;
-        const width = from.width + (to.width - from.width) * t;
-        const height = from.height + (to.height - from.height) * t;
-        const scale2 = 0.5 + 0.5 * t;
-        const local = (edge, centre) => centre + (edge - centre) / scale2;
-        const left = local(trailing ? to.width - width : 0, origin.x);
-        const right = local(trailing ? to.width : width, origin.x);
-        const bottom = local(height, origin.y);
-        const top = local(0, origin.y);
-        surface.style.width = settled ? "" : `${width}px`;
-        surface.style.height = settled ? "" : `${height}px`;
-        surface.style.opacity = String(clamp$1(t / 0.2));
-        trigger.style.opacity = t === 0 ? "" : String(1 - clamp$1(t / 0.2));
-        const drift = 0.3 * t;
-        const dx = ((trailing ? to.width - width / 2 : width / 2) - origin.x) * drift;
-        const dy = (height / 2 - origin.y) * drift;
-        glyph.style.opacity = String(1 - clamp$1(t / 0.45));
-        glyph.style.transform = `translate(${dx}px, ${dy}px) scale(${1 + 0.6 * t})`;
-        glyph.style.filter = `blur(${8 * t}px)`;
-        content.style.opacity = String(leaving ? clamp$1((t - 0.55) / 0.45) : clamp$1((t - 0.15) / 0.6));
-        content.style.transform = settled ? "" : `scale(${scale2})`;
-        content.style.filter = settled ? "" : `blur(${6 * (1 - t)}px)`;
-        content.style.clipPath = settled ? "" : `inset(${top}px ${to.width - right}px ${to.height - bottom}px ${left}px round ${radius / scale2}px)`;
-        if (leaving && value === 0) setPhase("closed");
-      });
-      const morph = {
-        ...shape,
-        set(target, instant) {
-          leaving = target === 0;
-          if (leaving) shape.tune(900, 57);
-          else shape.tune(600, 46);
-          shape.set(target, instant);
-        }
-      };
-      morphRef.current = morph;
-      shape.paint();
-      morph.set(1);
-      const rows = () => [...card.querySelectorAll(".lg-menu-item:not(:disabled)")];
-      rows()[0]?.focus({ preventScroll: true });
-      const offset = {
-        scale: 1,
-        x: 0,
-        y: 0
-      };
-      const paint = () => {
-        card.style.scale = String(offset.scale);
-        card.style.translate = `${offset.x}px ${offset.y}px`;
-      };
-      const scale = createSpring(1, 650, 36, (value) => {
-        offset.scale = value;
-        paint();
-      });
-      const x = createSpring(0, 600, 30, (value) => {
-        offset.x = value;
-        paint();
-      });
-      const y = createSpring(0, 600, 30, (value) => {
-        offset.y = value;
-        paint();
-      });
-      let gesture = null;
-      let current = null;
-      const close = (restoreFocus = true) => {
-        setPhase("leaving");
-        if (restoreFocus) triggerRef.current?.focus({ preventScroll: true });
-      };
-      const highlight = (row) => {
-        if (current === row) return;
-        const first = !current;
-        current = row;
-        if (!row) {
-          delete card.dataset.scrubbing;
-          plate.style.opacity = "0";
-          return;
-        }
-        card.dataset.scrubbing = "";
-        plate.style.width = `${row.offsetWidth}px`;
-        plate.style.height = `${row.offsetHeight}px`;
-        if (first) plate.style.transition = "none";
-        plate.style.transform = `translate(${row.offsetLeft}px, ${row.offsetTop}px)`;
-        plate.style.opacity = "1";
-        if (first) {
-          plate.offsetWidth;
-          plate.style.transition = "";
-        }
-      };
-      let selectHandled = false;
-      const rowAt = (clientX, clientY) => {
-        const root = (card && card.getRootNode) ? card.getRootNode() : document;
-        const target = (root && root.elementFromPoint) ? root.elementFromPoint(clientX, clientY) : document.elementFromPoint(clientX, clientY);
-        const row = target?.closest(".lg-menu-item");
-        return row && !row.disabled && card.contains(row) ? row : null;
-      };
-      const down = (event) => {
-        if (!event.isPrimary || event.button !== 0) return;
-        gesture = {
-          id: event.pointerId,
-          x: event.clientX,
-          y: event.clientY
-        };
-        card.setPointerCapture(event.pointerId);
-        card.dataset.pressed = "";
-        scale.set(1 + 5 / Math.max(card.offsetWidth, card.offsetHeight, 200));
-        highlight(rowAt(event.clientX, event.clientY));
-      };
-      const move = (event) => {
-        if (!gesture) {
-          const row = event.pointerType === "mouse" ? rowAt(event.clientX, event.clientY) : null;
-          if (row) highlight(row);
-          return;
-        }
-        if (event.pointerId !== gesture.id) return;
-        highlight(rowAt(event.clientX, event.clientY));
-        x.set(resistance(event.clientX - gesture.x), true);
-        y.set(resistance(event.clientY - gesture.y), true);
-      };
-      const end = (event) => {
-        if (event.pointerId !== gesture?.id) return;
-        const chosen = event.type === "pointerup" ? rowAt(event.clientX, event.clientY) : null;
-        highlight(null);
-        gesture = null;
-        delete card.dataset.pressed;
-        scale.set(1);
-        x.set(0);
-        y.set(0);
-        if (chosen) {
-          selectHandled = true;
-          const item = latest.current[Number(chosen.dataset.index)];
-          if (item && item !== "separator") {
-            close();
-            item.onSelect?.();
-          }
-        }
-      };
-      const leave = (event) => {
-        if (!gesture && event.pointerType === "mouse") highlight(null);
-      };
-      const click = (event) => {
-        if (selectHandled) {
-          selectHandled = false;
-          return;
-        }
-        const row = event.target.closest(".lg-menu-item");
-        if (!row) return;
-        const item = latest.current[Number(row.dataset.index)];
-        if (!item || item === "separator") return;
-        close();
-        item.onSelect?.();
-      };
-      const key = (event) => {
-        if (event.key === "Escape") {
-          event.preventDefault();
-          close();
-        } else if (event.key === "Tab") close(false);
-        else if ([
-          "ArrowDown",
-          "ArrowUp",
-          "Home",
-          "End"
-        ].includes(event.key)) {
-          event.preventDefault();
-          if (!gesture) highlight(null);
-          const list = rows();
-          const index = list.indexOf(((card.getRootNode && card.getRootNode().activeElement) || document.activeElement));
-          list[event.key === "Home" ? 0 : event.key === "End" ? list.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + list.length) % list.length]?.focus();
-        }
-      };
-      const outside = (event) => {
-        const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
-        if (card && path.includes(card)) return;
-        if (triggerRef.current && path.includes(triggerRef.current)) return;
-        close(false);
-      };
-      card.addEventListener("pointerdown", down);
-      card.addEventListener("pointermove", move);
-      card.addEventListener("pointerleave", leave);
-      card.addEventListener("pointerup", end);
-      card.addEventListener("pointercancel", end);
-      card.addEventListener("lostpointercapture", end);
-      card.addEventListener("click", click);
-      card.addEventListener("keydown", key);
-      document.addEventListener("pointerdown", outside, true);
-      return () => {
-        if (parentRow) parentRow.removeAttribute("data-menu-open");
-        if (parentCard) parentCard.removeAttribute("data-menu-open");
-        if (parentSelect) parentSelect.removeAttribute("data-menu-open");
-        if (modalEl) modalEl.removeAttribute("data-has-menu-open");
-        [
-          shape,
-          scale,
-          x,
-          y
-        ].forEach((spring) => spring.stop());
-        morphRef.current = null;
-        trigger.style.opacity = "";
-        card.removeEventListener("pointerdown", down);
-        card.removeEventListener("pointermove", move);
-        card.removeEventListener("pointerleave", leave);
-        card.removeEventListener("pointerup", end);
-        card.removeEventListener("pointercancel", end);
-        card.removeEventListener("lostpointercapture", end);
-        card.removeEventListener("click", click);
-        card.removeEventListener("keydown", key);
-        document.removeEventListener("pointerdown", outside, true);
-      };
-    }, [mounted]);
-    const open = phase === "open";
-    return /* @__PURE__ */ jsxs("div", {
-      className: cx("lg-menu", className, open && "lg-menu--open", mounted && "lg-menu--active"),
-      "data-phase": phase,
-      "data-open": open ? "true" : undefined,
-      style,
-      children: [/* @__PURE__ */ jsx(Button, {
-        ref: triggerRef,
-        icon,
-        "aria-label": label,
-        "aria-haspopup": "menu",
-        "aria-expanded": open,
-        onClick: () => setPhase(open ? "leaving" : "open")
-      }), mounted ? /* @__PURE__ */ jsxs("div", {
-        ref: cardRef,
-        role: "menu",
-        "aria-label": label,
-        className: "lg-menu-card",
-        "data-phase": phase,
-        "data-align": align,
-        children: [
-          /* @__PURE__ */ jsx("span", {
-            ref: surfaceRef,
-            className: "lg-menu-surface",
-            "aria-hidden": true
-          }),
-          /* @__PURE__ */ jsx("span", {
-            ref: glyphRef,
-            className: "lg-menu-glyph",
-            "aria-hidden": true,
-            children: icon
-          }),
-          /* @__PURE__ */ jsxs("div", {
-            ref: contentRef,
-            role: "none",
-            className: "lg-menu-content",
-            children: [/* @__PURE__ */ jsx("span", {
-              ref: plateRef,
-              className: "lg-menu-plate",
-              "aria-hidden": true
-            }), items.map((item, index) => item === "separator" ? /* @__PURE__ */ jsx("div", {
-              role: "separator",
-              className: "lg-menu-separator"
-            }, index) : /* @__PURE__ */ jsxs("button", {
-              type: "button",
-              role: "menuitem",
-              className: "lg-menu-item",
-              "data-index": index,
-              "data-destructive": item.destructive ? "" : void 0,
-              disabled: item.disabled,
-              children: [item.icon, item.label]
-            }, index))]
-          })
-        ]
-      }) : null]
-    });
-  }
-  var magnifier = /* @__PURE__ */ jsxs("svg", {
-    viewBox: "0 0 16 16",
-    fill: "none",
-    stroke: "currentColor",
-    strokeWidth: 1.5,
-    strokeLinecap: "round",
-    "aria-hidden": true,
-    children: [/* @__PURE__ */ jsx("circle", {
-      cx: "7",
-      cy: "7",
-      r: "4.75"
-    }), /* @__PURE__ */ jsx("path", { d: "m10.5 10.5 3.25 3.25" })]
-  });
-  var SearchField = /* @__PURE__ */ forwardRef(function SearchField2({ icon = magnifier, placeholder = "Search", ...props }, ref) {
-    return /* @__PURE__ */ jsx(Input, {
-      ref,
-      type: "search",
-      icon,
-      placeholder,
-      ...props
-    });
-  });
-  var Slider = /* @__PURE__ */ forwardRef(function Slider2({ value: valueProp, defaultValue, onValueChange, min = 0, max = 100, step = 1, className, style, ...props }, forwardedRef) {
-    const inputRef = useRef(null);
-    const thumbRef = useRef(null);
-    const faceRef = useRef(null);
-    const [value, setValue] = useControllable(valueProp, defaultValue ?? min, onValueChange);
-    const progress = max > min ? Math.min(1, Math.max(0, (value - min) / (max - min))) : 0;
-    useImperativeHandle(forwardedRef, () => inputRef.current);
-    useEffect(() => {
-      const input = inputRef.current;
-      const thumb = thumbRef.current;
-      const face = faceRef.current;
-      const lift = createSpring(0, 2e3, 80, (amount) => {
-        thumb.style.scale = String(0.6 + 0.4 * amount);
-        face.style.opacity = String(1 - 0.85 * Math.min(1, Math.max(0, amount)));
-      });
-      const hold = () => {
-        if (!input.disabled) lift.set(1);
-      };
-      const release = () => lift.set(0);
-      const ends = [
-        "pointerup",
-        "pointercancel",
-        "lostpointercapture",
-        "blur"
-      ];
-      input.addEventListener("pointerdown", hold);
-      ends.forEach((type) => input.addEventListener(type, release));
-      window.addEventListener("pointerup", release);
-      return () => {
-        lift.stop();
-        input.removeEventListener("pointerdown", hold);
-        ends.forEach((type) => input.removeEventListener(type, release));
-        window.removeEventListener("pointerup", release);
-      };
-    }, []);
-    return /* @__PURE__ */ jsxs("div", {
-      className: cx("lg-slider", className),
-      style: {
-        ...style,
-        "--lg-progress": progress
-      },
-      children: [
-        /* @__PURE__ */ jsx("span", {
-          className: "lg-slider-track",
-          "aria-hidden": true,
-          children: /* @__PURE__ */ jsx("span", { className: "lg-slider-fill" })
-        }),
-        /* @__PURE__ */ jsx("span", {
-          ref: thumbRef,
-          className: "lg-slider-thumb",
-          "aria-hidden": true,
-          children: /* @__PURE__ */ jsx("span", {
-            ref: faceRef,
-            className: "lg-thumb-face"
-          })
-        }),
-        /* @__PURE__ */ jsx("input", {
-          ref: inputRef,
-          type: "range",
-          min,
-          max,
-          step,
-          value,
-          onChange: (event) => setValue(event.currentTarget.valueAsNumber),
-          ...props
-        })
-      ]
-    });
-  });
-  var held = (at, moved) => moved || performance.now() - at >= 150;
-  var TRAVEL = 21.7125;
-  var unit = (value) => Math.min(1, Math.max(0, value));
-  var Switch = /* @__PURE__ */ forwardRef(function Switch2({ checked: checkedProp, defaultChecked = false, onCheckedChange, className, ...props }, forwardedRef) {
-    const ref = useRef(null);
-    const fillRef = useRef(null);
-    const thumbRef = useRef(null);
-    const faceRef = useRef(null);
-    const [checked, setChecked] = useControllable(checkedProp, defaultChecked, onCheckedChange);
-    const travel = TRAVEL;
-    const latest = useRef({
-      checked,
-      setChecked,
-      travel
-    });
-    const springs = useRef(null);
-    useImperativeHandle(forwardedRef, () => ref.current);
-    useEffect(() => {
-      latest.current.checked = checked;
-      latest.current.setChecked = setChecked;
-      springs.current?.position.set(checked ? 1 : 0);
-      springs.current?.color.set(checked ? 1 : 0);
-    }, [
-      checked,
-      setChecked
-    ]);
-    useEffect(() => {
-      const el = ref.current;
-      const fill = fillRef.current;
-      const thumb = thumbRef.current;
-      const face = faceRef.current;
-      let x = 0;
-      let scale = 0.65;
-      const paint = () => {
-        thumb.style.transform = `translate(${x}px, -50%) scale(${scale})`;
-      };
-      const initial = latest.current.checked ? 1 : 0;
-      const position = createSpring(initial, 1e3, 80, (value) => {
-        x = value * latest.current.travel;
-        paint();
-      });
-      const color = createSpring(initial, 1e3, 80, (value) => {
-        fill.style.opacity = String(unit(value));
-      });
-      const lift = createSpring(0, 2e3, 80, (value) => {
-        scale = 0.65 + 0.25 * value;
-        face.style.opacity = String(1 - 0.85 * unit(value));
-        paint();
-      });
-      springs.current = {
-        position,
-        color
-      };
-      position.paint();
-      color.paint();
-      lift.paint();
-      let gesture = null;
-      let ignoreClick = false;
-      const sync = () => {
-        position.set(latest.current.checked ? 1 : 0);
-        color.set(latest.current.checked ? 1 : 0);
-      };
-      const settle = (next) => {
-        const old = gesture;
-        gesture = null;
-        lift.set(0);
-        if (old && el.hasPointerCapture(old.id)) el.releasePointerCapture(old.id);
-        if (next === void 0 || next === latest.current.checked) return sync();
-        latest.current.setChecked(next);
-        requestAnimationFrame(sync);
-      };
-      const down = (event) => {
-        if (!event.isPrimary || event.button !== 0 || el.disabled) return;
-        event.preventDefault();
-        ignoreClick = false;
-        gesture = {
-          id: event.pointerId,
-          x: event.clientX,
-          y: event.clientY,
-          from: latest.current.checked ? 1 : 0,
-          moved: false,
-          at: performance.now(),
-          box: el.getBoundingClientRect()
-        };
-        el.setPointerCapture(event.pointerId);
-        lift.set(1);
-      };
-      const move = (event) => {
-        if (event.pointerId !== gesture?.id) return;
-        const dx = event.clientX - gesture.x;
-        const dy = Math.abs(event.clientY - gesture.y);
-        if (!held(gesture.at, gesture.moved) && dy > 10 && dy > Math.abs(dx) + 4) {
-          ignoreClick = true;
-          return settle();
-        }
-        if (!gesture.moved && Math.abs(dx) < 4) return;
-        gesture.moved = true;
-        const value = gesture.from + dx / latest.current.travel;
-        const overshoot = value < 0 ? value : value > 1 ? value - 1 : 0;
-        position.set(unit(value) + overshoot / 22);
-        color.set(value > 0.5 ? 1 : 0);
-      };
-      const up = (event) => {
-        if (event.pointerId !== gesture?.id) return;
-        ignoreClick = true;
-        const { from, x: x2, moved, box } = gesture;
-        const value = from + (event.clientX - x2) / latest.current.travel;
-        const near = event.clientY >= box.top - 24 && event.clientY <= box.bottom + 24;
-        settle(moved ? value > 0.5 : near ? !latest.current.checked : void 0);
-      };
-      const keep = (event) => {
-        if (gesture && event.cancelable && held(gesture.at, gesture.moved)) event.preventDefault();
-      };
-      const cancel = () => {
-        if (!gesture) return;
-        ignoreClick = true;
-        settle();
-      };
-      const click = () => {
-        if (ignoreClick) ignoreClick = false;
-        else if (!el.disabled) latest.current.setChecked(!latest.current.checked);
-      };
-      el.addEventListener("pointerdown", down);
-      el.addEventListener("pointermove", move);
-      el.addEventListener("pointerup", up);
-      el.addEventListener("pointercancel", cancel);
-      el.addEventListener("lostpointercapture", cancel);
-      el.addEventListener("touchmove", keep, { passive: false });
-      el.addEventListener("click", click);
-      return () => {
-        springs.current = null;
-        [
-          position,
-          color,
-          lift
-        ].forEach((spring) => spring.stop());
-        el.removeEventListener("pointerdown", down);
-        el.removeEventListener("pointermove", move);
-        el.removeEventListener("pointerup", up);
-        el.removeEventListener("pointercancel", cancel);
-        el.removeEventListener("lostpointercapture", cancel);
-        el.removeEventListener("touchmove", keep);
-        el.removeEventListener("click", click);
-      };
-    }, []);
-    return /* @__PURE__ */ jsxs("button", {
-      ref,
-      type: "button",
-      role: "switch",
-      "aria-checked": checked,
-      className: cx("lg-switch", className),
-      ...props,
-      children: [/* @__PURE__ */ jsx("span", {
-        ref: fillRef,
-        className: "lg-switch-fill",
-        "aria-hidden": true
-      }), /* @__PURE__ */ jsx("span", {
-        ref: thumbRef,
-        className: "lg-switch-thumb",
-        "aria-hidden": true,
-        children: /* @__PURE__ */ jsx("span", {
-          ref: faceRef,
-          className: "lg-thumb-face"
-        })
-      })]
-    });
-  });
-  var clamp = (value, min, max) => Math.min(max, Math.max(min, value));
-  var keys = [
-    "ArrowLeft",
-    "ArrowRight",
-    "Home",
-    "End"
-  ];
-  var REST = [
-    1024,
-    58.9,
-    676,
-    47.8
-  ];
-  var DRAG = [
-    2500,
-    94,
-    576,
-    44.2
-  ];
-  function attach({ bar, glass, lens: lens2, tint, row }, select) {
-    const tabs = [...bar.querySelectorAll(".lg-tab")];
-    let slot = 0;
-    let height = 0;
-    let growX = 16;
-    let growY = 12;
-    let active = -1;
-    let shown = false;
-    let settleFrame = 0;
-    let gesture = null;
-    const state = {
-      x: 0,
-      lift: 0
-    };
-    const measure = () => {
-      const style = getComputedStyle(bar);
-      slot = (bar.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)) / tabs.length;
-      height = lens2.offsetHeight;
-      growX = parseFloat(style.getPropertyValue("--lg-lens-grow-x")) || 0;
-      growY = parseFloat(style.getPropertyValue("--lg-lens-grow-y")) || 0;
-    };
-    const paint = () => {
-      const { x: x2, lift: lift2 } = state;
-      const sx = 1 + growX / slot * lift2;
-      const sy = 1 + growY / height * lift2;
-      lens2.style.transform = tint.style.transform = `translateX(${x2}px) scale(${sx}, ${sy})`;
-      row.style.transform = `scale(${1 / sx}, ${1 / sy}) translate(${-x2 + (sx - 1) * slot / 2}px, ${(sy - 1) * height / 2}px)`;
-      if (!gesture && lift2 < 0.01) delete bar.dataset.refracting;
-    };
-    const x = createSpring(0, REST[0], REST[1], (value) => {
-      state.x = value;
-      paint();
-    });
-    const lift = createSpring(0, REST[2], REST[3], (value) => {
-      state.lift = value;
-      paint();
-    });
-    const move = (target, lifted, instant = false) => {
-      const [slideStiffness, slideDamping, liftStiffness, liftDamping] = gesture ? DRAG : REST;
-      x.tune(slideStiffness, slideDamping);
-      lift.tune(liftStiffness, liftDamping);
-      x.set(target, instant);
-      lift.set(lifted ? 1 : 0, instant);
-    };
-    const settle = (instant = false) => {
-      if (gesture) return;
-      const show = active >= 0;
-      if (show) delete bar.dataset.hidden;
-      else bar.dataset.hidden = "";
-      if (show) move(active * slot, false, instant || !shown);
-      shown = show;
-    };
-    const position = (event) => clamp(gesture.anchor + event.clientX - gesture.x, 0, slot * (tabs.length - 1));
-    const light = (event, box) => {
-      glass.style.setProperty("--lg-x", `${clamp((event.clientX - box.left) / box.width * 100, 0, 100)}%`);
-      lens2.style.setProperty("--lg-x", `${clamp((event.clientX - box.left - 4 - state.x) / slot * 100, 0, 100)}%`);
-    };
-    const release = () => {
-      const old = gesture;
-      gesture = null;
-      delete bar.dataset.lifted;
-      delete lens2.dataset.pressed;
-      if (old && bar.hasPointerCapture(old.id)) bar.releasePointerCapture(old.id);
-      return old;
-    };
-    let suppressClick = false;
-    const onPointerDown = (event) => {
-      const tab = event.target.closest(".lg-tab");
-      if (!event.isPrimary || event.button !== 0 || gesture || !tab) return;
-      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-      cancelAnimationFrame(settleFrame);
-      settleFrame = 0;
-      measure();
-      const box = bar.getBoundingClientRect();
-      gesture = {
-        id: event.pointerId,
-        x: event.clientX,
-        anchor: tabs.indexOf(tab) * slot,
-        moved: false,
-        box,
-        at: performance.now()
-      };
-      suppressClick = false;
-      bar.dataset.lifted = "";
-      bar.dataset.refracting = "";
-      delete bar.dataset.hidden;
-      lens2.dataset.pressed = "";
-      light(event, box);
-      move(gesture.anchor, true, !shown);
-      shown = true;
-    };
-    const onPointerMove = (event) => {
-      if (event.pointerId !== gesture?.id) return;
-      if (!gesture.moved && Math.abs(event.clientX - gesture.x) > 6) {
-        gesture.moved = true;
-        bar.setPointerCapture(event.pointerId);
-      }
-      if (gesture.moved) move(position(event), true);
-      light(event, gesture.box);
-    };
-    const onPointerEnd = (event) => {
-      if (event.pointerId !== gesture?.id) return;
-      if (event.type === "lostpointercapture" && event.target !== bar) return;
-      const index = Math.round(position(event) / slot);
-      const { moved, box } = release();
-      const near = event.clientY >= box.top - 24 && event.clientY <= box.bottom + 24;
-      if (event.type === "pointerup" && (moved || near)) {
-        suppressClick = true;
-        settleFrame = requestAnimationFrame(() => {
-          settleFrame = 0;
-          settle();
-        });
-        tabs[index]?.click();
-      } else {
-        suppressClick = moved;
-        settle();
-      }
-    };
-    const onTouchMove = (event) => {
-      if (gesture && event.cancelable && held(gesture.at, gesture.moved)) event.preventDefault();
-    };
-    const onClick = (event) => {
-      if (event.isTrusted && suppressClick && event.detail !== 0) {
-        suppressClick = false;
-        event.preventDefault();
-        return;
-      }
-      const tab = event.target.closest(".lg-tab");
-      if (!tab || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-      const index = tabs.indexOf(tab);
-      if (tab instanceof HTMLAnchorElement) {
-        active = index;
-        settle();
-      }
-      select(index);
-    };
-    const onKeyDown = (event) => {
-      const tab = event.target.closest(".lg-tab");
-      if (!tab || tab instanceof HTMLAnchorElement || !keys.includes(event.key)) return;
-      event.preventDefault();
-      const current = tabs.indexOf(tab);
-      const index = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (current + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length;
-      select(index);
-      tabs[index]?.focus();
-    };
-    const reset = () => {
-      cancelAnimationFrame(settleFrame);
-      settleFrame = 0;
-      release();
-      settle(true);
-    };
-    const onVisibilityChange = () => {
-      if (isRealDocHidden()) reset();
-    };
-    const observer = new ResizeObserver(() => {
-      measure();
-      if (!gesture) settle(true);
-    });
-    measure();
-    bar.dataset.ready = "";
-    bar.addEventListener("pointerdown", onPointerDown);
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", onPointerEnd);
-    window.addEventListener("pointercancel", onPointerEnd);
-    bar.addEventListener("lostpointercapture", onPointerEnd);
-    bar.addEventListener("touchmove", onTouchMove, { passive: false });
-    bar.addEventListener("click", onClick, true);
-    bar.addEventListener("keydown", onKeyDown);
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    window.addEventListener("blur", reset);
-    observer.observe(bar);
-    return {
-      setActive(index) {
-        cancelAnimationFrame(settleFrame);
-        settleFrame = 0;
-        active = index;
-        settle();
-      },
-      destroy() {
-        cancelAnimationFrame(settleFrame);
-        x.stop();
-        lift.stop();
-        observer.disconnect();
-        for (const key of [
-          "ready",
-          "hidden",
-          "lifted",
-          "refracting"
-        ]) delete bar.dataset[key];
-        bar.removeEventListener("pointerdown", onPointerDown);
-        window.removeEventListener("pointermove", onPointerMove);
-        window.removeEventListener("pointerup", onPointerEnd);
-        window.removeEventListener("pointercancel", onPointerEnd);
-        bar.removeEventListener("lostpointercapture", onPointerEnd);
-        bar.removeEventListener("touchmove", onTouchMove);
-        bar.removeEventListener("click", onClick, true);
-        bar.removeEventListener("keydown", onKeyDown);
-        document.removeEventListener("visibilitychange", onVisibilityChange);
-        window.removeEventListener("blur", reset);
-      }
-    };
-  }
-  function TabBar({ items, value: valueProp, defaultValue = null, onValueChange, link: Link = "a", className, style, ...props }) {
-    const barRef = useRef(null);
-    const glassRef = useRef(null);
-    const lensRef = useRef(null);
-    const tintRef = useRef(null);
-    const rowRef = useRef(null);
-    const controller = useRef(null);
-    const [value, setValue] = useControllable(valueProp, defaultValue, onValueChange);
-    const selected = items.findIndex((item) => item.value === value);
-    const latest = useRef({
-      items,
-      selected,
-      setValue
-    });
-    const signature = items.map((item) => item.value).join("\n");
-    const navigation = items.every((item) => item.href !== void 0);
-    useRefraction(glassRef);
-    useRefraction(lensRef, true);
-    useEffect(() => {
-      latest.current = {
-        items,
-        selected,
-        setValue
-      };
-    });
-    useEffect(() => {
-      const instance = attach({
-        bar: barRef.current,
-        glass: glassRef.current,
-        lens: lensRef.current,
-        tint: tintRef.current,
-        row: rowRef.current
-      }, (index) => {
-        const item = latest.current.items[index];
-        if (item) latest.current.setValue(item.value);
-      });
-      instance.setActive(latest.current.selected);
-      controller.current = instance;
-      return () => {
-        instance.destroy();
-        controller.current = null;
-      };
-    }, [signature]);
-    useLayoutEffect(() => {
-      controller.current?.setActive(selected);
-    }, [selected]);
-    return /* @__PURE__ */ jsxs("div", {
-      ref: barRef,
-      role: navigation ? "navigation" : "tablist",
-      className: cx("lg-tab-bar", className),
-      style: {
-        ...style,
-        "--lg-index": Math.max(selected, 0),
-        "--lg-tabs": items.length
-      },
-      ...props,
-      children: [
-        /* @__PURE__ */ jsx("span", {
-          ref: glassRef,
-          className: "lg-glass lg-tab-bar-glass",
-          "aria-hidden": true
-        }),
-        items.map((item, index) => item.href !== void 0 ? /* @__PURE__ */ jsx(Link, {
-          href: item.href,
-          className: "lg-tab",
-          "data-selected": index === selected ? "" : void 0,
-          "aria-current": index === selected ? "page" : void 0,
-          draggable: false,
-          children: item.label
-        }, item.value) : /* @__PURE__ */ jsx("button", {
-          type: "button",
-          role: "tab",
-          className: "lg-tab",
-          "data-selected": index === selected ? "" : void 0,
-          "aria-selected": index === selected,
-          tabIndex: index === selected || selected < 0 && index === 0 ? 0 : -1,
-          children: item.label
-        }, item.value)),
-        /* @__PURE__ */ jsx("span", {
-          ref: tintRef,
-          className: "lg-tab-tint",
-          "aria-hidden": true,
-          children: /* @__PURE__ */ jsx("span", {
-            ref: rowRef,
-            className: "lg-tab-row",
-            children: items.map((item) => /* @__PURE__ */ jsx("span", {
-              className: "lg-tab-copy",
-              children: item.label
-            }, item.value))
-          })
-        }),
-        /* @__PURE__ */ jsx("span", {
-          ref: lensRef,
-          className: "lg-glass lg-tab-lens",
-          "aria-hidden": true
-        })
-      ]
-    });
-  }
-  return {
-    Button,
-    Glass,
-    Input,
-    Menu,
-    SearchField,
-    Slider,
-    Switch,
-    TabBar
-  };
-})();
-
-
-// ============================================================
-    // REACT COMPONENTS POWERED BY GLISSE (https://glisse.kelvinzhang.com/)
-    // ============================================================
-    const html = (typeof htm !== 'undefined' && typeof React !== 'undefined')
-        ? htm.bind(React.createElement)
-        : null;
-
-    // Hoisted static SVG icons for zero reconciliation overhead
-    const SVG_ICONS = {
-        chevron: html`<svg className="lg-select-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>`,
-        checkSelect: html`<svg className="lg-select-item-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`,
-        checkSwatch: html`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`,
-        dragHandlePill: html`<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style=${{ flexShrink: 0 }}><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>`,
-        dragHandleModal: html`<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="5 9 2 12 5 15"></polyline><polyline points="9 5 12 2 15 5"></polyline><polyline points="15 19 12 22 9 19"></polyline><polyline points="19 9 22 12 19 15"></polyline><line x1="2" y1="12" x2="22" y2="12"></line><line x1="12" y1="2" x2="12" y2="22"></line></svg>`,
-        resetPill: html`<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style=${{ marginRight: '5px' }}><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg>`,
-        modalGear: html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>`,
-        closeModal: html`<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`,
-    };
-
-    // Modal Compound Component (Glisse Liquid Glass Window)
-    const Modal = ({ isOpen, isClosing, onClose, children }) => {
-        if (!isOpen && !isClosing) return null;
-        return children;
-    };
-    Modal.Backdrop = ({ isClosing, onClose, isDraggable, children }) => html`
-        <div 
-            id="__ul-settings-overlay"
-            data-glisse-backdrop=""
-            className=${`modal__backdrop ${isClosing ? 'modal__backdrop--closing' : ''} ${isDraggable ? 'modal__backdrop--draggable' : ''}`}
-            onClick=${(e) => {
-                if (!isDraggable && e.target && e.target.id === '__ul-settings-overlay') onClose();
-            }}
-        >
-            ${children}
-        </div>
-    `;
-    Modal.Container = ({ isDraggable, children }) => html`
-        <div className=${`modal__container ${isDraggable ? 'modal__container--draggable' : ''}`}>
-            ${children}
-        </div>
-    `;
-    Modal.Dialog = ({ isDraggable, style, dialogRef, children }) => html`
-        <div 
-            ref=${dialogRef}
-            className=${`modal__dialog ${isDraggable ? 'modal__dialog--draggable' : ''}`} 
-            role="dialog" 
-            aria-modal=${isDraggable ? 'false' : 'true'}
-            style=${style}
-            onClick=${(e) => e.stopPropagation()}
-        >
-            ${children}
-        </div>
-    `;
-    Modal.Header = ({ isDraggable, isDragging, onPointerDown, children }) => html`
-        <header 
-            className=${`modal__header ${isDraggable ? 'modal__header--draggable' : ''} ${isDragging ? 'modal__header--dragging' : ''}`}
-            onPointerDown=${onPointerDown}
-        >
-            ${children}
-        </header>
-    `;
-    Modal.Icon = ({ children }) => html`<div className="modal__icon">${children}</div>`;
-    Modal.Heading = ({ children }) => html`<div className="modal__title-box"><h2 className="modal__heading">${children}</h2></div>`;
-    Modal.Body = ({ children }) => html`
-        <div className="modal__body">
-            ${children}
-        </div>
-    `;
-
-    // Tabs Compound Component
-    const Tabs = ({ children }) => html`<div className="tabs">${children}</div>`;
-    Tabs.Panel = ({ id, activeTab, children }) => {
-        const isActive = id === activeTab;
-        return html`
-            <div 
-                className="tabs__panel" 
-                data-tab=${id} 
-                data-active=${isActive ? 'true' : undefined}
-                style=${isActive ? {} : { display: 'none' }}
-            >
-                ${children}
-            </div>
-        `;
-    };
-
-    // Switch Row Component with Glisse Liquid Glass Switch
-    const Switch = ({ isSelected, onChange, disabled, isDisabled, size = 'md', className = '', children, onClick }) => {
-        const effectiveChecked = Boolean(isSelected);
-        const effectiveDisabled = Boolean(disabled || isDisabled);
-
-        const handleToggle = (nextVal) => {
-            if (effectiveDisabled) return;
-            if (onChange) onChange(typeof nextVal === 'boolean' ? nextVal : !effectiveChecked);
-        };
-
-        return html`
-            <div 
-                className=${`field-switch-row ${className}`.trim()} 
-                data-selected=${effectiveChecked ? 'true' : 'false'}
-                data-disabled=${effectiveDisabled ? 'true' : undefined}
-                onClick=${(e) => {
-                    if (onClick) onClick(e);
-                    else handleToggle(!effectiveChecked);
-                }}
-            >
-                <div className="field-switch-content">
-                    ${children}
-                </div>
-                <div onClick=${(e) => e.stopPropagation()} style=${{ display: 'inline-flex', flexShrink: 0 }}>
-                    <${Glisse.Switch}
-                        checked=${effectiveChecked}
-                        onCheckedChange=${handleToggle}
-                        disabled=${effectiveDisabled}
-                    />
-                </div>
-            </div>
-        `;
-    };
-    Switch.Label = ({ children }) => html`<div data-slot="label">${children}</div>`;
-    Switch.Description = ({ children }) => html`<div data-slot="description">${children}</div>`;
-
-    // FieldRow Component (Clean Uniform Box)
-    const FieldRow = ({ className = '', style = {}, onClick, children, ...restProps }) => html`
-        <div
-            className=${`field-row ${className}`.trim()}
-            style=${style}
-            onClick=${onClick}
-            ...${restProps}
-        >
-            ${children}
-        </div>
-    `;
-
-    // Card Compound Component (Clean Uniform Card)
-    const Card = ({ variant = 'secondary', className = '', children }) => html`
-        <div className=${`card card--${variant} ${className}`.trim()}>${children}</div>
-    `;
-    Card.Header = ({ className = '', children }) => html`<div className=${`card__header ${className}`.trim()}>${children}</div>`;
-    Card.Title = ({ className = '', children }) => html`<div className=${`card__title ${className}`.trim()}>${children}</div>`;
-    Card.Description = ({ className = '', children }) => html`<div className=${`card__description ${className}`.trim()}>${children}</div>`;
-    Card.Content = ({ className = '', children }) => html`<div className=${`card__content ${className}`.trim()}>${children}</div>`;
-
-    // Badge Component
-    const Badge = ({ size = 'sm', variant = 'primary', color = '', className = '', children }) => html`
-        <span className=${`badge badge--${size} badge--${variant} ${color ? `badge--${color}` : ''} ${className}`}>
-            ${children}
-        </span>
-    `;
-
-    // GlisseSelect Component (Powered by official Kelvin Zhang Glisse.Menu)
-    const GlisseSelect = React.memo(({ options, selectedKey, onSelectionChange, ariaLabel = "Options", align = "end" }) => {
-        const selectedOption = (options && options.find(o => o.id === selectedKey)) || (options && options[0]) || { label: '' };
-        const triggerIcon = html`
-            <span className="lg-select-trigger-content">
-                <span className="lg-select-current-label">${selectedOption.label}</span>
-${SVG_ICONS.chevron}
-            </span>
-        `;
-
-        const menuItems = (options || []).map((opt) => {
-            const isSelected = opt.id === selectedKey;
-            return {
-                label: html`
-                    <span className="lg-select-item-inner">
-                        <span className="lg-select-item-text">
-                            <span className="lg-select-item-title">${opt.label}</span>
-                            ${opt.desc ? html`<span className="lg-select-item-desc">${opt.desc}</span>` : null}
-                        </span>
-                        ${isSelected ? html`
-${SVG_ICONS.checkSelect}
-                        ` : null}
-                    </span>
-                `,
-                onSelect: () => {
-                    if (onSelectionChange) onSelectionChange(opt.id);
-                }
-            };
-        });
-
-        return html`
-            <${Glisse.Menu}
-                className="lg-menu-select"
-                items=${menuItems}
-                aria-label=${ariaLabel}
-                icon=${triggerIcon}
-                align=${align}
-            />
-        `;
-    });
-
-    const PRESET_OPTIONS = [
-        { id: 'off', label: 'Off', desc: 'Allows all telemetry traffic without blocking' },
-        { id: 'simple', label: 'Simple', desc: 'Silently blocks LogImproperUse only' },
-        { id: 'harsh', label: 'Harsh', desc: 'Aggressive network & script suppression' },
-        { id: 'custom', label: 'Custom', desc: 'Individually selected tracker blockers' },
-    ];
-
-    const PILL_MODE_OPTIONS = [
-        { id: 'minimal', label: 'Settings Button Only', desc: 'Cleanest floating circle button (Default)' },
-        { id: 'boost', label: 'Time Boost & Settings', desc: 'Shows active boost status & settings' },
-        { id: 'compact', label: 'Compact Details', desc: 'Shows boost status & blocked network count' },
-        { id: 'full', label: 'Full Details', desc: 'Shows full metrics and boosted questions' },
-    ];
-
-    const PILL_POS_OPTIONS = [
-        { id: 'bottom-right', label: 'Bottom Right', desc: 'Floats in the bottom-right corner' },
-        { id: 'bottom-left', label: 'Bottom Left', desc: 'Floats in the bottom-left corner' },
-        { id: 'top-right', label: 'Top Right', desc: 'Floats in the top-right corner' },
-        { id: 'top-left', label: 'Top Left', desc: 'Floats in the top-left corner' },
-    ];
-
-    const THEME_OPTIONS = [
-        { id: 'dark', label: 'Dark', desc: 'Apple deep translucent dark glass' },
-        { id: 'light', label: 'Light', desc: 'Apple pure frosted light glass' },
-        { id: 'auto', label: 'Auto (System)', desc: 'Matches macOS / iOS system dark or light preference' },
-    ];
-
-    const LOG_LEVEL_OPTIONS = [
-        { id: 'silent', label: 'Silent', desc: 'Mutes all console logs' },
-        { id: 'normal', label: 'Normal', desc: 'Logs key operations and warnings' },
-        { id: 'verbose', label: 'Verbose', desc: 'Full network packets and grouped reports' },
-    ];
-
-    const KEYBIND_ACTION_OPTIONS = [
-        { id: 'toggle-pill', label: 'Toggle Floating Button', desc: 'Closes open settings first, then hides/shows the floating button' },
-        { id: 'open-modal',  label: 'Open Settings Directly',  desc: 'Opens the Control Panel directly without showing the button' },
-    ];
-
-    // Glisse Slider Wrapper
-    const Slider = ({
-        value,
-        defaultValue = 0,
-        minValue = 0,
-        maxValue = 100,
-        step = 1,
-        isDisabled = false,
-        disabled = false,
-        onChange,
-        className = '',
-        children,
-    }) => {
-        const curVal = typeof value !== 'undefined' ? value : defaultValue;
-        const effectiveDisabled = Boolean(isDisabled || disabled);
-
-        return html`
-            <div className=${`field-slider-wrapper ${className}`.trim()} data-disabled=${effectiveDisabled ? 'true' : undefined}>
-                <${Glisse.Slider}
-                    value=${curVal}
-                    min=${minValue}
-                    max=${maxValue}
-                    step=${step}
-                    disabled=${effectiveDisabled}
-                    onValueChange=${(val) => {
-                        if (onChange) onChange(val);
-                    }}
-                />
-                <span className="slider__output">
-                    ${Math.round((curVal <= 1 && maxValue <= 1) ? curVal * 100 : curVal)}%
-                </span>
-            </div>
-        `;
-    };
-
-    // ServiceTile with Glisse Liquid Glass Switch
-    const ServiceTile = React.memo(({ serviceKey, service, isChecked, onToggle }) => {
-        return html`
-            <div 
-                className="service-tile"
-                data-checked=${isChecked ? 'true' : 'false'}
-                onClick=${() => onToggle(serviceKey)}
-            >
-                <span className="service-tile__label" title=${service.label}>
-                    ${service.label}
-                </span>
-                <div onClick=${(e) => e.stopPropagation()} style=${{ display: 'inline-flex', flexShrink: 0 }}>
-                    <${Glisse.Switch}
-                        checked=${isChecked}
-                        onCheckedChange=${() => onToggle(serviceKey)}
-                    />
-                </div>
-            </div>
-        `;
-    });
-
-    const StatusPill = React.memo(({ currentSettings, currentStats, accumulatedBonus, onToggleBoost, onOpenSettings }) => {
-        if (currentSettings.keybindAction === 'open-modal' || !currentSettings.pillVisible) return null;
-        const mode = currentSettings.pillMode || 'minimal';
-        const isMinimal = mode === 'minimal';
-        const isCompact = mode === 'compact';
-        const isFull    = mode === 'full';
-        const enabled   = currentSettings.timeBoostEnabled;
-
-        const pos = POSITION_STYLES[currentSettings.pillPosition] || POSITION_STYLES['bottom-right'];
-        const pillStyle = Object.assign({}, pos, {
-            opacity: String(currentSettings.pillOpacity),
-            display: 'flex',
-            width: isMinimal ? '44px' : 'auto',
-            height: isMinimal ? '44px' : '38px',
-            borderRadius: isMinimal ? '22px' : '19px',
-            background: isMinimal ? 'none' : undefined,
-            '--lg-blur': '1px',
-            '--lg-bezel': isMinimal ? '10px' : '8px',
-            '--lg-thickness': isMinimal ? '18px' : '14px',
-            '--lg-zoom': 1.02,
-            '--lg-rim-saturation': 1.6,
-            '--lg-refraction': 1.05,
-        });
-
-        const rangeLabel = currentSettings.extraSecondsMin === currentSettings.extraSecondsMax
-            ? `+${currentSettings.extraSecondsMin}s`
-            : `+${currentSettings.extraSecondsMin}–${currentSettings.extraSecondsMax}s`;
-
-        const kbText = formatKeybind(currentSettings.uiToggleKeybind);
-        const actionDesc = currentSettings.keybindAction === 'open-modal' ? 'open/close settings' : 'hide/show';
-        const tooltip = isMinimal
-            ? `UpLearn Control Panel (${kbText}) | Boost: ${enabled ? 'ON' : 'OFF'}`
-            : `Click badge: toggle time boost | Click gear: Control Panel | ${kbText}: ${actionDesc}`;
-
-        return html`
-            <${Glisse.Glass} 
-                id="__ul-pill"
-                refract=${isMinimal}
-                className=${`heroui-pill ${isMinimal ? 'heroui-pill--minimal' : ''}`}
-                data-mode=${mode}
-                style=${pillStyle}
-                title=${tooltip}
-                onClick=${(e) => {
-                    if (isMinimal) {
-                        e.preventDefault(); e.stopPropagation();
-                        onOpenSettings();
-                    }
-                }}
-            >
-                <div 
-                    className="heroui-pill__main"
-                    onClick=${(e) => {
-                        if (!isMinimal) {
-                            e.preventDefault(); e.stopPropagation();
-                            onToggleBoost();
-                        }
-                    }}
-                >
-                    <span className=${`heroui-pill__badge badge badge--sm ${enabled ? 'badge--primary badge--accent' : 'badge--secondary'}`}>
-                        <span className="heroui-pill__dot"></span>
-                        <span className="heroui-pill__label">${rangeLabel} ${enabled ? 'Active' : 'Paused'}</span>
-                    </span>
-                    <span className="heroui-pill__stats">
-                        <span 
-                            className="heroui-pill__stat-item" 
-                            style=${{ display: (isCompact || isFull) ? 'inline-flex' : 'none' }}
-                        >
-                            🛡 ${currentStats.blocked}
-                        </span>
-                        <span 
-                            className="heroui-pill__stat-item"
-                            style=${{ display: isFull ? 'inline-flex' : 'none' }}
-                        >
-                            ⚡ ${currentStats.boosted}${accumulatedBonus > 0 ? ` (+${accumulatedBonus}s)` : ''}
-                        </span>
-                    </span>
-                </div>
-                <button 
-                    type="button" 
-                    className="heroui-pill__gear" 
-                    title="Open UpLearn Settings (Ctrl+Shift+U)"
-                    onClick=${(e) => {
-                        e.preventDefault(); e.stopPropagation();
-                        onOpenSettings();
-                    }}
-                >
-                    <svg width=${isMinimal ? "20" : "18"} height=${isMinimal ? "20" : "18"} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                        <circle cx="12" cy="12" r="3"></circle>
-                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                    </svg>
-                    <span className="heroui-pill__indicator-dot" style=${{ display: enabled ? 'block' : 'none' }}></span>
-                </button>
-            <//>
-        `;
-    });
-
-    // TelemetryTab
-    const TelemetryTab = React.memo(({
-        currentSettings,
-        onUpdateSetting,
-    }) => {
-        const { useState, useMemo, useCallback } = React;
-        const [servicesFilter, setServicesFilter] = useState('');
-
-        const { filteredServicesList, activeServicesCount, totalServicesCount } = useMemo(() => {
-            const q = servicesFilter.toLowerCase().trim();
-            let active = 0, total = 0;
-            const list = [];
-            for (const key in TELEMETRY_SERVICES) {
-                total++;
-                const svc = TELEMETRY_SERVICES[key];
-                const checked = isServiceEnabledIn(currentSettings, key);
-                if (checked) active++;
-                if (!q || svc.label.toLowerCase().includes(q) || svc.hosts.some(h => h.includes(q))) {
-                    list.push({ key, svc, checked });
-                }
-            }
-            return { filteredServicesList: list, activeServicesCount: active, totalServicesCount: total };
-        }, [servicesFilter, currentSettings.telemetryServices, currentSettings.suppressJitsu]);
-
-        const handleToggleService = useCallback((key) => {
-            const current = currentSettings.telemetryServices || {};
-            const curVal = isServiceEnabledIn(currentSettings, key);
-            const next = !curVal;
-            const updated = Object.assign({}, current, { [key]: next });
-            LOG(`service "${TELEMETRY_SERVICES[key].label}" ${next ? 'ENABLED' : 'DISABLED'}`);
-            onUpdateSetting('telemetryServices', updated);
-        }, [currentSettings.telemetryServices, currentSettings.suppressJitsu, onUpdateSetting]);
-
-        const handleEnableAllServices = useCallback(() => {
-            const updated = {};
-            for (const k in TELEMETRY_SERVICES) updated[k] = true;
-            onUpdateSetting('telemetryServices', updated);
-        }, [onUpdateSetting]);
-
-        const handleDisableAllServices = useCallback(() => {
-            const updated = {};
-            for (const k in TELEMETRY_SERVICES) updated[k] = false;
-            onUpdateSetting('telemetryServices', updated);
-        }, [onUpdateSetting]);
-
-        const updatePreset = useCallback((val) => onUpdateSetting('telemetryPreset', val), [onUpdateSetting]);
-        const updateLogImproper = useCallback((v) => onUpdateSetting('blockLogImproperUse', v), [onUpdateSetting]);
-        const updateBlockLogEvent = useCallback((v) => onUpdateSetting('blockLogEvent', v), [onUpdateSetting]);
-        const updatePrivateSearch = useCallback((v) => onUpdateSetting('privateSearchMode', v), [onUpdateSetting]);
-        const updateBlockDom = useCallback((v) => onUpdateSetting('blockDomElements', v), [onUpdateSetting]);
-        const updateBlockWs = useCallback((v) => onUpdateSetting('blockWebSockets', v), [onUpdateSetting]);
-        const updateBlockBeacon = useCallback((v) => onUpdateSetting('blockSendBeacon', v), [onUpdateSetting]);
-        const updateSpoofVis = useCallback((v) => onUpdateSetting('spoofVisibility', v), [onUpdateSetting]);
-        const updateSuppressNoise = useCallback((v) => onUpdateSetting('suppressConsoleNoise', v), [onUpdateSetting]);
-        const updateSuppressJitsu = useCallback((v) => onUpdateSetting('suppressJitsu', v), [onUpdateSetting]);
-
-        return html`
-            <div className="grid-2col">
-                <div className="col-stack">
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>
-                                <span>Core Telemetry Intercepts</span>
-                                <${Badge} variant="soft" color="accent">Protection Active<//>
-                            <//>
-                            <${Card.Description}>Configure network intercepts, telemetry blocking presets, and client-side privacy cloaks.<//>
-                        <//>
-                        <${Card.Content}>
-                            <${FieldRow}>
-                                <label>Active Preset
-                                    <small>Off · Simple (LogImproperUse only) · Harsh (Block all) · Custom</small>
-                                </label>
-                                <${GlisseSelect} 
-                                    options=${PRESET_OPTIONS}
-                                    selectedKey=${currentSettings.telemetryPreset}
-                                    onSelectionChange=${updatePreset}
-                                    ariaLabel="Active Preset"
-                                />
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.blockLogImproperUse}
-                                onChange=${updateLogImproper}
-                            >
-                                <${Switch.Label}>Block LogImproperUse requests<//>
-                                <${Switch.Description}>Silently drops UpLearn improper-use telemetry sent to API<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.blockLogEvent !== false}
-                                onChange=${updateBlockLogEvent}
-                            >
-                                <${Switch.Label}>Mock LogEvent mutations<//>
-                                <${Switch.Description}>Resolves UI interaction logging locally to prevent client telemetry<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.privateSearchMode !== false}
-                                onChange=${updatePrivateSearch}
-                            >
-                                <${Switch.Label}>Private Search Mode<//>
-                                <${Switch.Description}>Resolves LogLessonSearch mutations locally so search queries remain private<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.suppressJitsu}
-                                onChange=${updateSuppressJitsu}
-                            >
-                                <${Switch.Label}>Suppress Jitsu telemetry<//>
-                                <${Switch.Description}>Checked: blocks jitsu.uplearn.co.uk. Unchecked: logs inspected packets.<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.blockWebSockets}
-                                onChange=${updateBlockWs}
-                            >
-                                <${Switch.Label}>Block telemetry WebSockets<//>
-                                <${Switch.Description}>Terminates analytics & Intercom WebSocket connections<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.blockSendBeacon}
-                                onChange=${updateBlockBeacon}
-                            >
-                                <${Switch.Label}>Block telemetry sendBeacon<//>
-                                <${Switch.Description}>Drops background beacon-style telemetry packets<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.blockDomElements}
-                                onChange=${updateBlockDom}
-                            >
-                                <${Switch.Label}>Block DOM telemetry injection<//>
-                                <${Switch.Description}>Hooks script/iframe src and purges blocked tracker nodes<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.spoofVisibility}
-                                onChange=${updateSpoofVis}
-                            >
-                                <${Switch.Label}>Spoof visibility & focus<//>
-                                <${Switch.Description}>Ensures page always believes it is focused & visible<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.suppressConsoleNoise}
-                                onChange=${updateSuppressNoise}
-                            >
-                                <${Switch.Label}>Suppress site's console noise<//>
-                                <${Switch.Description}>Mutes [J-ERROR], Jitsu send errors, and blocked-host spam<//>
-                            <//>
-                        <//>
-                    <//>
-                </div>
-
-                <div className="col-stack">
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>
-                                <span>Third-Party Telemetry Services</span>
-                                <${Badge} variant="soft" color="accent">${activeServicesCount}/${totalServicesCount} Active<//>
-                            <//>
-                            <${Card.Description}>Toggle individual analytics trackers. Changes auto-switch preset to Custom.<//>
-                        <//>
-                        <${Card.Content}>
-                            <div className="services-toolbar">
-                                <${Glisse.SearchField} 
-                                    value=${servicesFilter}
-                                    onValueChange=${setServicesFilter}
-                                    placeholder="Search services…"
-                                    className="services-search-field"
-                                />
-                                <div className="services-actions">
-                                    <${Glisse.Button} variant="glass" onClick=${handleEnableAllServices} className="services-action-btn">
-                                        Enable All
-                                    <//>
-                                    <${Glisse.Button} variant="glass" onClick=${handleDisableAllServices} className="services-action-btn">
-                                        Disable All
-                                    <//>
-                                </div>
-                            </div>
-                            <div className="services-grid">
-                                ${filteredServicesList.map(({ key, svc, checked }) => html`
-                                    <${ServiceTile} 
-                                        key=${key}
-                                        serviceKey=${key} 
-                                        service=${svc} 
-                                        isChecked=${checked} 
-                                        onToggle=${handleToggleService}
-                                    />
-                                `)}
-                            </div>
-                        <//>
-                    <//>
-                </div>
-            </div>
-        `;
-    });
-
-    // TimeBoostTab
-    const TimeBoostTab = React.memo(({
-        currentSettings,
-        accumulatedBonus,
-        sessionContext,
-        onUpdateSetting,
-        onAddManualBonus,
-        onClearBonus,
-    }) => {
-        const { useState, useEffect, useCallback } = React;
-        const [minStr, setMinStr] = useState(() => String(currentSettings.extraSecondsMin));
-        const [maxStr, setMaxStr] = useState(() => String(currentSettings.extraSecondsMax));
-
-        useEffect(() => {
-            setMinStr(String(currentSettings.extraSecondsMin));
-        }, [currentSettings.extraSecondsMin]);
-
-        useEffect(() => {
-            setMaxStr(String(currentSettings.extraSecondsMax));
-        }, [currentSettings.extraSecondsMax]);
-
-        const commitMin = useCallback(() => {
-            const val = parseInt(minStr, 10);
-            if (!isNaN(val) && val >= 1) {
-                onUpdateSetting('extraSecondsRange', { min: val, max: currentSettings.extraSecondsMax });
-            } else {
-                setMinStr(String(currentSettings.extraSecondsMin));
-            }
-        }, [minStr, currentSettings.extraSecondsMin, currentSettings.extraSecondsMax, onUpdateSetting]);
-
-        const commitMax = useCallback(() => {
-            const val = parseInt(maxStr, 10);
-            if (!isNaN(val) && val >= 1) {
-                onUpdateSetting('extraSecondsRange', { min: currentSettings.extraSecondsMin, max: val });
-            } else {
-                setMaxStr(String(currentSettings.extraSecondsMax));
-            }
-        }, [maxStr, currentSettings.extraSecondsMin, currentSettings.extraSecondsMax, onUpdateSetting]);
-
-        const updateTimeBoost = useCallback((v) => onUpdateSetting('timeBoostEnabled', v), [onUpdateSetting]);
-        const updateDynamicTime = useCallback((v) => onUpdateSetting('dynamicTimeEnabled', v), [onUpdateSetting]);
-        const updatePredictFinal = useCallback((v) => onUpdateSetting('predictFinalCallEnabled', v), [onUpdateSetting]);
-        const updateManualBtn = useCallback((v) => onUpdateSetting('manualTimeButtonEnabled', v), [onUpdateSetting]);
-        const updateManualStack = useCallback((v) => onUpdateSetting('manualTimeStacksWithAuto', v), [onUpdateSetting]);
-        const updateFullVideo = useCallback((v) => onUpdateSetting('fullVideoWatchedEnabled', v), [onUpdateSetting]);
-        const updateAutoSkipVideo = useCallback((v) => onUpdateSetting('autoSkipVideoEnabled', v), [onUpdateSetting]);
-        const updateAddVideoDuration = useCallback((v) => onUpdateSetting('addVideoDurationToTimeSpent', v), [onUpdateSetting]);
-
-        const handleRangePresetChange = useCallback((preset) => {
-            if (!preset) return;
-            setMinStr(String(preset.min));
-            setMaxStr(String(preset.max));
-            onUpdateSetting('extraSecondsRange', { min: preset.min, max: preset.max });
-        }, [onUpdateSetting]);
-
-        const rangeHint = (currentSettings.extraSecondsMin === currentSettings.extraSecondsMax)
-            ? `Every question receives +${currentSettings.extraSecondsMin}s bonus.`
-            : `Each question rolls a random +${currentSettings.extraSecondsMin}–${currentSettings.extraSecondsMax}s bonus.`;
-
-        const ctx = sessionContext || {};
-        const qContextDesc = ctx.hasSession
-            ? `${ctx.sessionTitle || ctx.sessionType}${ctx.questionLabel ? ` · ${ctx.questionLabel}` : ''}${ctx.questionSnippet ? ` — "${ctx.questionSnippet}"` : ''}`
-            : 'Open a quiz, video, summary, or exam lesson to detect active questions';
-        const qContextBadge = ctx.questionType
-            ? `${ctx.questionType}${ctx.questionRecommendedSeconds ? ` · ~${ctx.questionRecommendedSeconds}s` : ''}`
-            : (ctx.hasSession ? (ctx.completed ? 'Completed' : 'Standby') : 'None');
-        const predDesc = ctx.predictedOp
-            ? `Intercepts and syncs ${ctx.predictedOp} when this ${ctx.sessionType || 'activity'} finishes`
-            : 'Waiting for an active quiz, lesson, or exam session';
-
-        return html`
-            <div className="grid-2col">
-                <div className="col-stack">
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>
-                                <span>Question Time Boost</span>
-                                <${Badge} variant="soft" color=${currentSettings.timeBoostEnabled ? 'success' : 'default'}>
-                                    ${currentSettings.timeBoostEnabled ? 'Active' : 'Paused'}
-                                <//>
-                            <//>
-                            <${Card.Description}>Automatically injects extra time spent into question submissions and quiz completions.<//>
-                        <//>
-                        <${Card.Content}>
-                            <${Switch} 
-                                isSelected=${currentSettings.timeBoostEnabled}
-                                onChange=${updateTimeBoost}
-                            >
-                                <${Switch.Label}>Enable question time boost<//>
-                                <${Switch.Description}>Injects calculated time bonuses into question answering and quiz completion API calls<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.dynamicTimeEnabled !== false}
-                                onChange=${updateDynamicTime}
-                                isDisabled=${!currentSettings.timeBoostEnabled}
-                            >
-                                <${Switch.Label}>Dynamic question time calculation<//>
-                                <${Switch.Description}>Adapts time per question based on type, word count, math/blanks, marks, and retries<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.predictFinalCallEnabled !== false}
-                                onChange=${updatePredictFinal}
-                            >
-                                <${Switch.Label}>Predict & sync final completion call<//>
-                                <${Switch.Description}>Tracks active session and syncs final quiz, walkthrough, and video completion payloads<//>
-                            <//>
-
-                            <${FieldRow}>
-                                <label>Extra Seconds Range
-                                    <small>${rangeHint}</small>
-                                </label>
-                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    <${Glisse.Input} 
-                                        type="number" 
-                                        style=${{ width: '88px', height: '34px' }} 
-                                        min="1" 
-                                        max="3600"
-                                        value=${minStr}
-                                        onValueChange=${setMinStr}
-                                        onBlur=${commitMin}
-                                        onKeyDown=${(e) => { if (e.key === 'Enter') commitMin(); }}
-                                    />
-                                    <span style=${{ color: 'var(--lg-muted)', fontWeight: 600 }}>to</span>
-                                    <${Glisse.Input} 
-                                        type="number" 
-                                        style=${{ width: '88px', height: '34px' }} 
-                                        min="1" 
-                                        max="3600"
-                                        value=${maxStr}
-                                        onValueChange=${setMaxStr}
-                                        onBlur=${commitMax}
-                                        onKeyDown=${(e) => { if (e.key === 'Enter') commitMax(); }}
-                                    />
-                                    <span style=${{ color: 'var(--lg-muted)', fontWeight: 600 }}>s</span>
-                                </div>
-                            <//>
-
-                            <div className="field-box" style=${{ padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                                <div style=${{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
-                                    <span style=${{ fontSize: '13px', fontWeight: 590, color: 'var(--lg-foreground)' }}>Quick Range Presets</span>
-                                    <span style=${{ fontSize: '11px', color: 'var(--lg-muted)' }}>Tap to apply duration</span>
-                                </div>
-                                <div style=${{ display: 'flex', flexWrap: 'wrap', gap: '8px', width: '100%' }}>
-                                    ${QUICK_RANGE_PRESETS.map((p, idx) => {
-                                        const isSelected = p.min === currentSettings.extraSecondsMin && p.max === currentSettings.extraSecondsMax;
-                                        return html`
-                                            <${Glisse.Button}
-                                                key=${idx}
-                                                variant=${isSelected ? 'filled' : 'glass'}
-                                                onClick=${() => handleRangePresetChange(p)}
-                                                style=${{ height: '30px', padding: '0 13px', fontSize: '12px', borderRadius: '9999px', fontWeight: isSelected ? 600 : 500 }}
-                                            >
-                                                ${p.label}
-                                            <//>
-                                        `;
-                                    })}
-                                </div>
-                            </div>
-                        <//>
-                    <//>
-
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>
-                                <span>Interactive Quiz Page Button</span>
-                                <${Badge} variant="soft" color=${currentSettings.manualTimeButtonEnabled ? 'accent' : 'default'}>Quiz Button<//>
-                            <//>
-                            <${Card.Description}>Injects an interactive "+Add time" button right next to UpLearn's submit button.<//>
-                        <//>
-                        <${Card.Content}>
-                            <${Switch} 
-                                isSelected=${currentSettings.manualTimeButtonEnabled}
-                                onChange=${updateManualBtn}
-                            >
-                                <${Switch.Label}>Enable question page "+Add time" button<//>
-                                <${Switch.Description}>Displays button next to Submit on question pages. Click to enter custom seconds (e.g. 120 or 2m).<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.manualTimeStacksWithAuto}
-                                onChange=${updateManualStack}
-                                isDisabled=${!currentSettings.manualTimeButtonEnabled}
-                            >
-                                <${Switch.Label}>Manual time stacks with auto-boost<//>
-                                <${Switch.Description}>Checked: manual extra adds on top of auto-boost. Unchecked: manual extra replaces auto-boost for that submission.<//>
-                            <//>
-                        <//>
-                    <//>
-                </div>
-
-                <div className="col-stack">
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>
-                                <span>Video Lesson Automation</span>
-                                <${Badge} variant="soft" color=${(currentSettings.fullVideoWatchedEnabled || currentSettings.autoSkipVideoEnabled || currentSettings.addVideoDurationToTimeSpent) ? 'success' : 'default'}>Video Auto<//>
-                            <//>
-                            <${Card.Description}>Automate video lesson playback, skip straight to completion, and credit full duration.<//>
-                        <//>
-                        <${Card.Content}>
-                            <${Switch} 
-                                isSelected=${currentSettings.fullVideoWatchedEnabled}
-                                onChange=${updateFullVideo}
-                            >
-                                <${Switch.Label}>Always mark videos as fully watched (100%)<//>
-                                <${Switch.Description}>Sets percentWatched to 1 on CompleteVideoLesson mutations so every video registers as fully completed<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.autoSkipVideoEnabled}
-                                onChange=${updateAutoSkipVideo}
-                            >
-                                <${Switch.Label}>Auto-skip video (skips to 1s before end)<//>
-                                <${Switch.Description}>Automatically seeks straight to 1 second before the end so it completes immediately<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.addVideoDurationToTimeSpent}
-                                onChange=${updateAddVideoDuration}
-                            >
-                                <${Switch.Label}>Add video duration to timeSpent<//>
-                                <${Switch.Description}>In CompleteVideoLesson payload, rewrites timeSpent to equal full duration (e.g. 17m33s = PT1053S)<//>
-                            <//>
-                        <//>
-                    <//>
-
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>
-                                <span>Live Session Bonus Activity</span>
-                                <${Badge} variant="soft" color=${accumulatedBonus > 0 ? "accent" : "default"}>
-                                    ${accumulatedBonus > 0 ? `+${accumulatedBonus}s Active` : '0s Pending'}
-                                <//>
-                            <//>
-                            <${Card.Description}>Real-time quiz bonus accumulated in this session to inject into UpLearn summaries.<//>
-                        <//>
-                        <${Card.Content}>
-                            <${FieldRow}>
-                                <label>Active Question Context
-                                    <small>${qContextDesc}</small>
-                                </label>
-                                <${Badge} variant="soft" color=${ctx.questionType ? 'accent' : 'default'}>
-                                    ${qContextBadge}
-                                <//>
-                            <//>
-                            <${FieldRow}>
-                                <label>Predicted Final API Call
-                                    <small>${predDesc}</small>
-                                </label>
-                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
-                                    <${Badge} variant="soft" color=${ctx.predictedOp ? 'success' : 'default'}>
-                                        ${ctx.predictedOp ? `${ctx.predictedOp}${ctx.predictedTotalSeconds > 0 ? ` (~${formatSeconds(ctx.predictedTotalSeconds)})` : ''}` : 'None'}
-                                    <//>
-                                </div>
-                            <//>
-                            <${FieldRow}>
-                                <label>Accumulated Time Bonus
-                                    <small>Currently queued bonus to be credited on submission</small>
-                                </label>
-                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    <span style=${{ fontSize: '15px', fontWeight: 700, color: 'var(--accent, var(--lg-fill))', fontVariantNumeric: 'tabular-nums' }}>
-                                        +${accumulatedBonus}s
-                                    </span>
-                                </div>
-                            <//>
-                            <${FieldRow}>
-                                <label>Manual Session Boost
-                                    <small>Quickly queue additional bonus seconds or clear pending bonus</small>
-                                </label>
-                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
-                                    <${Glisse.Button} 
-                                        variant="glass" 
-                                        onClick=${() => onAddManualBonus && onAddManualBonus(30)}
-                                    >
-                                        +30s
-                                    <//>
-                                    <${Glisse.Button} 
-                                        variant="glass" 
-                                        onClick=${() => onAddManualBonus && onAddManualBonus(60)}
-                                    >
-                                        +60s
-                                    <//>
-                                    <${Glisse.Button} 
-                                        variant="glass" 
-                                        destructive
-                                        onClick=${onClearBonus}
-                                        title="Clear accumulated bonus"
-                                    >
-                                        Clear
-                                    <//>
-                                </div>
-                            <//>
-                        <//>
-                    <//>
-                </div>
-            </div>
-        `;
-    });
-
-    const ColorSwatch = React.memo(({ color, isSelected, onSelect }) => {
-        return html`
-            <div 
-                className="color-swatch"
-                data-active=${isSelected ? 'true' : 'false'}
-                style=${{ backgroundColor: color.hex }}
-                title=${color.name}
-                onClick=${() => onSelect(color.hex)}
-            >
-                ${isSelected ? html`
-                    <span style=${{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#ffffff' }}>
-${SVG_ICONS.checkSwatch}
-                    </span>
-                ` : null}
-            </div>
-        `;
-    });
-
-    // PreferencesTab
-    const PreferencesTab = React.memo(({
-        currentSettings,
-        isCapturingKeybind,
-        onStartCaptureKeybind,
-        onClearKeybind,
-        onUpdateSetting,
-        onResetAllSettings,
-    }) => {
-        const { useCallback } = React;
-        const updatePillMode = useCallback((val) => onUpdateSetting('pillMode', val), [onUpdateSetting]);
-        const updatePillPosition = useCallback((val) => onUpdateSetting('pillPosition', val), [onUpdateSetting]);
-        const updatePillOpacity = useCallback((val) => {
-            onUpdateSetting('pillOpacity', val);
-            try {
-                const pillEl = (uiShadowRoot && uiShadowRoot.getElementById('__ul-pill')) || document.getElementById('__ul-pill');
-                if (pillEl) pillEl.style.opacity = String(val);
-            } catch {}
-        }, [onUpdateSetting]);
-        const updateDisableAutoFullscreen = useCallback((val) => onUpdateSetting('disableAutoFullscreen', val), [onUpdateSetting]);
-        const updateDarkMode = useCallback((val) => onUpdateSetting('darkMode', val), [onUpdateSetting]);
-        const updateDraggableUI = useCallback((val) => onUpdateSetting('draggableUI', val), [onUpdateSetting]);
-        const updateTheme = useCallback((val) => onUpdateSetting('theme', val), [onUpdateSetting]);
-        const updateAccentColor = useCallback((val) => onUpdateSetting('accentColor', val), [onUpdateSetting]);
-        const updateKeybindAction = useCallback((val) => onUpdateSetting('keybindAction', val), [onUpdateSetting]);
-        const updateLogLevel = useCallback((val) => onUpdateSetting('logLevel', val), [onUpdateSetting]);
-
-        const isOpenModalAction = currentSettings.keybindAction === 'open-modal';
-
-        return html`
-            <div className="grid-2col">
-                <div className="col-stack">
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>
-                                <span>Control Panel Window & Theme</span>
-                                <${Badge} variant="soft" color="accent">Visuals<//>
-                            <//>
-                            <${Card.Description}>Configure floating window mode, color theme, and liquid glass refraction.<//>
-                        <//>
-                        <${Card.Content}>
-                            <${Switch} 
-                                isSelected=${currentSettings.draggableUI}
-                                onChange=${updateDraggableUI}
-                            >
-                                <${Switch.Label}>Draggable Glass Window<//>
-                                <${Switch.Description}>Float the Control Panel as a movable window with liquid glass refraction over the page<//>
-                            <//>
-
-                            <${FieldRow}>
-                                <label>Control Panel Theme
-                                    <small>Translucent dark, frosted light, or system matching</small>
-                                </label>
-                                <${GlisseSelect} 
-                                    options=${THEME_OPTIONS}
-                                    selectedKey=${currentSettings.theme}
-                                    onSelectionChange=${updateTheme}
-                                    ariaLabel="Control Panel Theme"
-                                />
-                            <//>
-
-                            <${FieldRow}>
-                                <label>Theme Accent Color
-                                    <small>Primary tint for switches, badges, and controls</small>
-                                </label>
-                                <div style=${{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                                    <div className="color-swatches">
-                                        ${QUICK_COLOR_SWATCHES.map((c) => html`
-                                            <${ColorSwatch}
-                                                key=${c.hex}
-                                                color=${c}
-                                                isSelected=${c.hex.toLowerCase() === currentSettings.accentColor.toLowerCase()}
-                                                onSelect=${updateAccentColor}
-                                            />
-                                        `)}
-                                    </div>
-                                    <label title="Custom hex color" style=${{
-                                        width: '26px',
-                                        height: '26px',
-                                        borderRadius: '50%',
-                                        background: 'conic-gradient(from 180deg at 50% 50%, #FF0000 0deg, #FFA500 60deg, #FFFF00 120deg, #008000 180deg, #0000FF 240deg, #EE82EE 300deg, #FF0000 360deg)',
-                                        display: 'inline-flex',
-                                        alignItems: 'center',
-                                        justifyContent: 'center',
-                                        cursor: 'pointer',
-                                        boxShadow: '0 2px 6px rgba(0, 0, 0, 0.2)',
-                                        position: 'relative',
-                                        overflow: 'hidden',
-                                        flexShrink: 0
-                                    }}>
-                                        <input 
-                                            type="color" 
-                                            style=${{ opacity: 0, position: 'absolute', inset: 0, width: '100%', height: '100%', cursor: 'pointer' }}
-                                            value=${currentSettings.accentColor}
-                                            onChange=${(e) => updateAccentColor(e.target.value)}
-                                        />
-                                    </label>
-                                </div>
-                            <//>
-                        <//>
-                    <//>
-
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>
-                                <span>UpLearn Webpage Tweaks</span>
-                                <${Badge} variant="soft" color="accent">Page Tweaks<//>
-                            <//>
-                            <${Card.Description}>Enhance your UpLearn browsing experience with soft dark mode and screen controls.<//>
-                        <//>
-                        <${Card.Content}>
-                            <${Switch} 
-                                isSelected=${currentSettings.darkMode}
-                                onChange=${updateDarkMode}
-                            >
-                                <${Switch.Label}>UpLearn Soft Dark Mode<//>
-                                <${Switch.Description}>Soft high-contrast dark theme across all lesson and quiz pages<//>
-                            <//>
-
-                            <${Switch} 
-                                isSelected=${currentSettings.disableAutoFullscreen}
-                                onChange=${updateDisableAutoFullscreen}
-                            >
-                                <${Switch.Label}>Prevent auto fullscreen<//>
-                                <${Switch.Description}>Blocks the website from silently forcing fullscreen mode<//>
-                            <//>
-                        <//>
-                    <//>
-                </div>
-
-                <div className="col-stack">
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>
-                                <span>Hotkeys & Floating Status Button</span>
-                                <${Badge} variant="soft" color="accent">Shortcuts<//>
-                            <//>
-                            <${Card.Description}>Configure keyboard triggers and floating island button behavior.<//>
-                        <//>
-                        <${Card.Content}>
-                            <${FieldRow}>
-                                <label>Keybind Action
-                                    <small>Behavior when pressing your global keyboard shortcut</small>
-                                </label>
-                                <${GlisseSelect} 
-                                    options=${KEYBIND_ACTION_OPTIONS}
-                                    selectedKey=${currentSettings.keybindAction || 'toggle-pill'}
-                                    onSelectionChange=${updateKeybindAction}
-                                    ariaLabel="Keybind Action"
-                                />
-                            <//>
-
-                            <${FieldRow}>
-                                <label>Global Shortcut Keybind
-                                    <small>${isOpenModalAction ? 'Keyboard shortcut to directly open or close the Control Panel' : 'Keyboard shortcut to show or hide the floating status pill'}</small>
-                                </label>
-                                <div style=${{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
-                                    <${Glisse.Button} 
-                                        variant="glass" 
-                                        className=${isCapturingKeybind ? 'keybind-btn keybind-btn--capturing' : 'keybind-btn'}
-                                        onClick=${onStartCaptureKeybind}
-                                        title="Click to record new keybind"
-                                    >
-                                        ${isCapturingKeybind ? 'Press any key…' : formatKeybind(currentSettings.uiToggleKeybind)}
-                                    <//>
-                                    <${Glisse.Button} 
-                                        variant="glass" 
-                                        data-icon="only"
-                                        title="Clear keybind"
-                                        aria-label="Clear keybind"
-                                        onClick=${onClearKeybind}
-                                    >
-                                        ✕
-                                    <//>
-                                </div>
-                            <//>
-
-                            ${isOpenModalAction ? html`
-                                <div className="field-callout" style=${{ margin: '4px 0' }}>
-${SVG_ICONS.dragHandlePill}
-                                    <span>Floating button is hidden because Keybind Action is set to "Open Settings Directly". Press your shortcut to toggle settings.</span>
-                                </div>
-                            ` : html`
-                                <${FieldRow}>
-                                    <label>Pill Information Display
-                                        <small>Select how much info is displayed on the floating pill</small>
-                                    </label>
-                                    <${GlisseSelect} 
-                                        options=${PILL_MODE_OPTIONS}
-                                        selectedKey=${currentSettings.pillMode}
-                                        onSelectionChange=${updatePillMode}
-                                        ariaLabel="Pill Information Display"
-                                    />
-                                <//>
-
-                                <${FieldRow}>
-                                    <label>Pill Dock Position
-                                        <small>Corner of the screen where the status pill floats</small>
-                                    </label>
-                                    <${GlisseSelect} 
-                                        options=${PILL_POS_OPTIONS}
-                                        selectedKey=${currentSettings.pillPosition}
-                                        onSelectionChange=${updatePillPosition}
-                                        ariaLabel="Pill Dock Position"
-                                    />
-                                <//>
-
-                                <${FieldRow}>
-                                    <label>Pill Opacity
-                                        <small>Adjust background transparency</small>
-                                    </label>
-                                    <${Slider} 
-                                        value=${currentSettings.pillOpacity}
-                                        minValue=${0.2}
-                                        maxValue=${1}
-                                        step=${0.05}
-                                        onChange=${updatePillOpacity}
-                                    />
-                                <//>
-                            `}
-                        <//>
-                    <//>
-
-                    <${Card}>
-                        <${Card.Header}>
-                            <${Card.Title}>
-                                <span>Diagnostics & Maintenance</span>
-                                <${Badge} variant="soft" color="accent">System<//>
-                            <//>
-                            <${Card.Description}>Developer console diagnostics and factory settings reset.<//>
-                        <//>
-                        <${Card.Content}>
-                            <${FieldRow}>
-                                <label>Console Logging Level
-                                    <small>Verbose inspects bodies and prints grouped block reports</small>
-                                </label>
-                                <${GlisseSelect} 
-                                    options=${LOG_LEVEL_OPTIONS}
-                                    selectedKey=${currentSettings.logLevel}
-                                    onSelectionChange=${updateLogLevel}
-                                    ariaLabel="Console Logging Level"
-                                />
-                            <//>
-
-                            <${FieldRow} className="field-row--danger" style=${{ marginTop: '2px' }}>
-                                <div>
-                                    <div style=${{ fontSize: '13px', fontWeight: 600, color: 'var(--lg-foreground)' }}>Reset All Preferences</div>
-                                    <div style=${{ fontSize: '11.5px', color: 'var(--lg-muted)', marginTop: '2px' }}>Restore all settings & services to factory defaults</div>
-                                </div>
-                                <${Glisse.Button} 
-                                    variant="glass" 
-                                    destructive 
-                                    onClick=${onResetAllSettings}
-                                >
-                                    <span>Reset All Settings</span>
-                                <//>
-                            <//>
-                        <//>
-                    <//>
-                </div>
-            </div>
-        `;
-    });
-
-    // StatsTab
-    const StatsTab = React.memo(({
-        accumulatedBonus,
-        onResetStats,
-        isActive,
-    }) => {
-        const { useState, useEffect, useCallback } = React;
-        const [tabStats, setTabStats] = useState(() => Object.assign({}, stats));
-
-        useEffect(() => {
-            if (!isActive) return;
-            setTabStats(Object.assign({}, stats));
-            return subscribeStats((st) => {
-                setTabStats(Object.assign({}, st));
-            });
-        }, [isActive]);
-
-        const handleReset = useCallback(() => {
-            onResetStats();
-            setTabStats(Object.assign({}, stats));
-        }, [onResetStats]);
-
-        return html`
-            <${Card}>
-                <${Card.Header}>
-                    <div style=${{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
-                        <div>
-                            <${Card.Title}>
-                                <span>Session Activity & Shields</span>
-                                <${Badge} variant="soft" color="accent">Real-Time<//>
-                            <//>
-                            <${Card.Description}>Live metric counters accumulated in this browser session.<//>
-                        </div>
-                        <${Glisse.Button} variant="glass" onClick=${handleReset}>
-${SVG_ICONS.resetPill}
-                            <span>Clear Session Metrics</span>
-                        <//>
-                    </div>
-                <//>
-                <${Card.Content}>
-                    <div style=${{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-                        <div>
-                            <div style=${{ fontSize: '12px', fontWeight: 600, color: 'var(--lg-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' }}>
-                                🛡 Privacy & Telemetry Shields
-                            </div>
-                            <div className="stats-grid">
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Trackers Blocked</span>
-                                    <span className="stat-card__value">${tabStats.blocked}</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Improper Use</span>
-                                    <span className="stat-card__value">${tabStats.logImproperUseBlocked}</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Jitsu Packets</span>
-                                    <span className="stat-card__value">${tabStats.jitsuPackets}</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">FS Blocked</span>
-                                    <span className="stat-card__value">${tabStats.fullscreenBlocked}</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Console Muted</span>
-                                    <span className="stat-card__value">${tabStats.consoleSuppressed}</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">API Posts</span>
-                                    <span className="stat-card__value">${tabStats.apiPosts}</span>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div>
-                            <div style=${{ fontSize: '12px', fontWeight: 600, color: 'var(--lg-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '8px' }}>
-                                ⚡ Time Boost & Video Automation
-                            </div>
-                            <div className="stats-grid">
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Boosted Qs</span>
-                                    <span className="stat-card__value">${tabStats.boosted}</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Pending Bonus</span>
-                                    <span className="stat-card__value">${accumulatedBonus}s</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Group Bonus</span>
-                                    <span className="stat-card__value">${tabStats.groupExtra}s</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Manual Boosts</span>
-                                    <span className="stat-card__value">${tabStats.manualBoosted || 0}</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Videos 100%</span>
-                                    <span className="stat-card__value">${tabStats.videosMaxed || 0}</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Videos Skipped</span>
-                                    <span className="stat-card__value">${tabStats.videosSkipped || 0}</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Video Time Added</span>
-                                    <span className="stat-card__value">+${formatSeconds(tabStats.videoTimeAdded || 0)}</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Qs Identified</span>
-                                    <span className="stat-card__value">${tabStats.questionsIdentified || 0}</span>
-                                </div>
-                                <div className="stat-card">
-                                    <span className="stat-card__label">Final Calls Synced</span>
-                                    <span className="stat-card__value">${tabStats.finalCallsModified || 0}</span>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                <//>
-            <//>
-        `;
-    });
-
-    const SETTINGS_TAB_ITEMS = [
-        { value: 'telemetry', label: '🛡 Telemetry' },
-        { value: 'timeboost', label: '⏱ Time Boost' },
-        { value: 'preferences', label: '🎨 Preferences' },
-        { value: 'stats', label: '📊 Statistics' },
-    ];
-
-    // Glisse SettingsModal (No traffic lights, authentic Glisse TabBar & Buttons)
-    const getDefaultModalDims = () => ({
-        w: Math.min(920, window.innerWidth * 0.92),
-        h: Math.min(680, window.innerHeight * 0.86),
-    });
-    const clampModalCoord = (val, size, viewport) =>
-        Math.min(Math.max(10, Math.round(val)), Math.max(10, viewport - size - 10));
-
-    const SettingsModal = React.memo(({
-        isOpen,
-        isClosing,
-        onClose,
-        currentSettings,
-        accumulatedBonus,
-        sessionContext,
-        isCapturingKeybind,
-        onStartCaptureKeybind,
-        onClearKeybind,
-        onUpdateSetting,
-        onResetAllSettings,
-        onResetStats,
-        onAddManualBonus,
-        onClearBonus,
-    }) => {
-        const { useState, useEffect, useRef, useCallback } = React;
-        const [activeTab, setActiveTab] = useState('telemetry');
-        const [visitedTabs, setVisitedTabs] = useState(() => new Set(['telemetry']));
-
-        const isDraggable = Boolean(currentSettings && currentSettings.draggableUI);
-
-        const [pos, setPos] = useState(() => {
-            const { w, h } = getDefaultModalDims();
-            try {
-                const saved = localStorage.getItem('__ul_win_pos');
-                if (saved) {
-                    const p = JSON.parse(saved);
-                    if (typeof p.x === 'number' && typeof p.y === 'number') {
-                        return {
-                            x: clampModalCoord(p.x, w, window.innerWidth),
-                            y: clampModalCoord(p.y, h, window.innerHeight),
-                        };
-                    }
-                }
-            } catch {}
-            return {
-                x: Math.max(10, Math.round((window.innerWidth - w) / 2)),
-                y: Math.max(10, Math.round((window.innerHeight - h) / 2)),
-            };
-        });
-
-        const [isDragging, setIsDragging] = useState(false);
-        const dragRef = useRef(null);
-        const dialogRef = useRef(null);
-        const posRef = useRef(pos);
-        posRef.current = pos;
-
-        // Clamping on viewport resize
-        useEffect(() => {
-            if (!isDraggable) return;
-            const handleResize = () => {
-                setPos((prev) => {
-                    const { w, h } = getDefaultModalDims();
-                    const nextX = clampModalCoord(prev.x, w, window.innerWidth);
-                    const nextY = clampModalCoord(prev.y, h, window.innerHeight);
-                    if (nextX !== prev.x || nextY !== prev.y) {
-                        return { x: nextX, y: nextY };
-                    }
-                    return prev;
+        if (typeof window.matchMedia === 'function') {
+            const mql = window.matchMedia('(prefers-color-scheme: light)');
+            if (typeof mql.addEventListener === 'function') {
+                mql.addEventListener('change', () => {
+                    if (settings.theme === 'auto') syncRootThemeAndAccent();
                 });
-            };
-            window.addEventListener('resize', handleResize);
-            return () => window.removeEventListener('resize', handleResize);
-        }, [isDraggable]);
-
-        const handleHeaderPointerDown = useCallback((e) => {
-            if (!isDraggable) return;
-            if (e.button !== 0) return; // Left click only
-            const target = e.target;
-            if (target && target.closest && target.closest('button, a, input, select, textarea, .lg-tab, .lg-tab-bar, .lg-button')) {
-                return;
             }
+        }
+    } catch {}
+
+    // ============================================================
+    // 18. GLOBAL KEYBOARD SHORTCUTS, BOOTSTRAP & PUBLIC API
+    // ============================================================
+    const globalKeydownHandler = (e) => {
+        if (uiState.capturingKeybind) {
             e.preventDefault();
-
-            const dialogEl = dialogRef.current;
-            const dialogRect = dialogEl ? dialogEl.getBoundingClientRect() : null;
-            const fallbackDims = dialogRect ? null : getDefaultModalDims();
-            const curW = dialogRect ? dialogRect.width : fallbackDims.w;
-            const curH = dialogRect ? dialogRect.height : fallbackDims.h;
-
-            dragRef.current = {
-                startX: e.clientX,
-                startY: e.clientY,
-                initX: posRef.current.x,
-                initY: posRef.current.y,
-                dialogW: curW,
-                dialogH: curH,
-            };
-            setIsDragging(true);
-
-            const onPointerMove = (moveEvt) => {
-                if (!dragRef.current) return;
-                const dx = moveEvt.clientX - dragRef.current.startX;
-                const dy = moveEvt.clientY - dragRef.current.startY;
-                const nextX = clampModalCoord(dragRef.current.initX + dx, dragRef.current.dialogW, window.innerWidth);
-                const nextY = clampModalCoord(dragRef.current.initY + dy, dragRef.current.dialogH, window.innerHeight);
-                if (nextX === posRef.current.x && nextY === posRef.current.y) return;
-                posRef.current = { x: nextX, y: nextY };
-                if (dialogRef.current) {
-                    dialogRef.current.style.left = nextX + 'px';
-                    dialogRef.current.style.top = nextY + 'px';
-                }
-            };
-
-            const onPointerUp = () => {
-                window.removeEventListener('pointermove', onPointerMove);
-                window.removeEventListener('pointerup', onPointerUp);
-                window.removeEventListener('pointercancel', onPointerUp);
-                setIsDragging(false);
-                if (dragRef.current) {
-                    dragRef.current = null;
-                    const finalPos = posRef.current;
-                    setPos(finalPos);
-                    try {
-                        localStorage.setItem('__ul_win_pos', JSON.stringify(finalPos));
-                    } catch {}
-                }
-            };
-
-            window.addEventListener('pointermove', onPointerMove, { passive: true });
-            window.addEventListener('pointerup', onPointerUp);
-            window.addEventListener('pointercancel', onPointerUp);
-        }, [isDraggable]);
-
-        const handleTabClick = useCallback((targetTab) => {
-            setActiveTab(targetTab);
-            setVisitedTabs((prev) => {
-                if (prev.has(targetTab)) return prev;
-                const next = new Set(prev);
-                next.add(targetTab);
-                return next;
-            });
-        }, []);
-
-        if (!isOpen && !isClosing) return null;
-
-        const dialogStyle = isDraggable ? {
-            left: `${pos.x}px`,
-            top: `${pos.y}px`,
-        } : {};
-
-        return html`
-            <${Modal} isOpen=${isOpen} isClosing=${isClosing} onClose=${onClose}>
-                <${Modal.Backdrop} isClosing=${isClosing} onClose=${onClose} isDraggable=${isDraggable}>
-                    <${Modal.Container} isDraggable=${isDraggable}>
-                        <${Modal.Dialog} 
-                            isDraggable=${isDraggable}
-                            dialogRef=${dialogRef}
-                            style=${dialogStyle}
-                        >
-                            
-                            <!-- Glisse Header with Title, TabBar & Close Button -->
-                            <${Modal.Header}
-                                isDraggable=${isDraggable}
-                                isDragging=${isDragging}
-                                onPointerDown=${handleHeaderPointerDown}
-                            >
-                                <div className="modal__brand">
-                                    <${Modal.Icon}>
-${SVG_ICONS.modalGear}
-                                    <//>
-                                    <div>
-                                        <${Modal.Heading}>UpLearn Control Panel<//>
-                                        ${isDraggable ? html`
-                                            <div style=${{ fontSize: '10.5px', color: 'var(--lg-muted)', display: 'flex', alignItems: 'center', gap: '4px', marginTop: '1px' }}>
-${SVG_ICONS.dragHandleModal}
-                                                <span>Draggable Liquid Glass</span>
-                                            </div>
-                                        ` : null}
-                                    </div>
-                                </div>
-
-                                <div className="modal__header-nav">
-                                    <${Glisse.TabBar} 
-                                        items=${SETTINGS_TAB_ITEMS}
-                                        value=${activeTab}
-                                        onValueChange=${handleTabClick}
-                                        style=${{ '--lg-tab-width': '124px', '--lg-tab-height': '34px' }}
-                                    />
-                                </div>
-
-                                <${Glisse.Button} 
-                                    variant="glass" 
-                                    data-icon="only"
-                                    onClick=${onClose} 
-                                    title="Close (Esc)"
-                                    aria-label="Close modal"
-                                    style=${{ width: '36px', height: '36px', padding: 0 }}
-                                >
-${SVG_ICONS.closeModal}
-                                <//>
-                            <//>
-
-                            <!-- Body -->
-                            <${Modal.Body}>
-                                ${visitedTabs.has('telemetry') && html`
-                                    <${Tabs.Panel} id="telemetry" activeTab=${activeTab}>
-                                        <${TelemetryTab} 
-                                            currentSettings=${currentSettings}
-                                            onUpdateSetting=${onUpdateSetting}
-                                        />
-                                    <//>
-                                `}
-                                ${visitedTabs.has('timeboost') && html`
-                                    <${Tabs.Panel} id="timeboost" activeTab=${activeTab}>
-                                        <${TimeBoostTab} 
-                                            currentSettings=${currentSettings}
-                                            accumulatedBonus=${accumulatedBonus}
-                                            sessionContext=${sessionContext}
-                                            onUpdateSetting=${onUpdateSetting}
-                                            onAddManualBonus=${onAddManualBonus}
-                                            onClearBonus=${onClearBonus}
-                                        />
-                                    <//>
-                                `}
-                                ${visitedTabs.has('preferences') && html`
-                                    <${Tabs.Panel} id="preferences" activeTab=${activeTab}>
-                                        <${PreferencesTab} 
-                                            currentSettings=${currentSettings}
-                                            isCapturingKeybind=${isCapturingKeybind}
-                                            onStartCaptureKeybind=${onStartCaptureKeybind}
-                                            onClearKeybind=${onClearKeybind}
-                                            onUpdateSetting=${onUpdateSetting}
-                                            onResetAllSettings=${onResetAllSettings}
-                                        />
-                                    <//>
-                                `}
-                                ${visitedTabs.has('stats') && html`
-                                    <${Tabs.Panel} id="stats" activeTab=${activeTab}>
-                                        <${StatsTab} 
-                                            accumulatedBonus=${accumulatedBonus}
-                                            onResetStats=${onResetStats}
-                                            isActive=${activeTab === 'stats'}
-                                        />
-                                    <//>
-                                `}
-                            <//>
-
-                        <//>
-                    <//>
-                <//>
-            <//>
-        `;
-    });
-
-    function buildSessionContextSnapshot() {
-        const session = activeSession;
-        if (!session) {
-            return {
-                hasSession: false,
-                sessionType: '',
-                sessionId: '',
-                sessionTitle: '',
-                completed: false,
-                questionId: null,
-                questionLabel: '',
-                questionType: '',
-                questionRecommendedSeconds: 0,
-                questionSnippet: '',
-                predictedOp: null,
-                predictedTotalSeconds: 0,
-                contextRevision,
-            };
-        }
-        const q = !session.completed ? identifyCurrentQuestion() : null;
-        const pred = updatePredictedFinalCall(session) || session.predictedFinalCall;
-        let questionLabel = '';
-        if (q) {
-            const totalQ = Array.isArray(session.questionIds) ? session.questionIds.length : 0;
-            const rawIdx = Array.isArray(session.questionIds) ? session.questionIds.indexOf(q.id) : -1;
-            const num = rawIdx !== -1 ? (rawIdx + 1) : ((session.currentQuestionIndex || 0) + 1);
-            questionLabel = totalQ > 0 ? `Q${num}/${totalQ}` : (q.id ? `Q#${q.id}` : '');
-        } else if (Array.isArray(session.questionIds) && session.questionIds.length > 0 && !session.completed) {
-            questionLabel = `0/${session.questionIds.length}`;
-        }
-        return {
-            hasSession: true,
-            sessionType: session.sessionType || '',
-            sessionId: session.sessionId || '',
-            sessionTitle: session.title || '',
-            completed: !!session.completed,
-            questionId: q ? q.id : null,
-            questionLabel,
-            questionType: q ? (q.primaryType || 'Question') : '',
-            questionRecommendedSeconds: q ? (q.recommendedSeconds || 0) : 0,
-            questionSnippet: q ? (q.stemSnippet || '') : '',
-            predictedOp: pred ? pred.operationName : (session.predictedOp || null),
-            predictedTotalSeconds: pred ? (pred.predictedTotalSeconds || 0) : 0,
-            contextRevision,
-        };
-    }
-
-    function resetAllStats() {
-        for (const k in stats) stats[k] = 0;
-        accumulatedExtraSeconds = 0; accumulatedQuestionCount = 0;
-        if (activeSession) updatePredictedFinalCall(activeSession);
-        bumpContextRevision();
-        if (reactSetStats) {
-            reactSetStats(Object.assign({}, stats, { accumulated: 0 }));
-        }
-    }
-
-    // --- Root App Component ---
-    const App = () => {
-        const { useState, useEffect, useCallback, useRef } = React;
-        const [appSettings, setAppSettings] = useState(() => cloneSettings(settings));
-        const [appStats, setAppStats] = useState(() => Object.assign({}, stats));
-        const [accumulatedBonus, setAccumulatedBonus] = useState(accumulatedExtraSeconds);
-        const [sessionCtx, setSessionCtx] = useState(() => buildSessionContextSnapshot());
-        const [isModalOpen, setIsModalOpen] = useState(false);
-        const [isClosing, setIsClosing] = useState(false);
-        const [isCapturing, setIsCapturing] = useState(false);
-        const closeTimerRef = useRef(null);
-        const modalStateRef = useRef({ open: false, closing: false });
-
-        const setModalOpenState = useCallback((open) => {
-            if (open) {
-                if (closeTimerRef.current) {
-                    clearTimeout(closeTimerRef.current);
-                    closeTimerRef.current = null;
-                }
-                modalStateRef.current.open = true;
-                modalStateRef.current.closing = false;
-                isModalOpenGlobal = true;
-                setAccumulatedBonus(accumulatedExtraSeconds);
-                setSessionCtx(buildSessionContextSnapshot());
-                setIsClosing(false);
-                setIsModalOpen(true);
-            } else {
-                if (capturingKeybind) {
-                    capturingKeybind = false;
-                    setIsCapturing(false);
-                }
-                if ((!modalStateRef.current.open && !isModalOpenGlobal) || modalStateRef.current.closing) {
-                    return;
-                }
-                modalStateRef.current.open = false;
-                modalStateRef.current.closing = true;
-                isModalOpenGlobal = false;
-                if (closeTimerRef.current) {
-                    clearTimeout(closeTimerRef.current);
-                }
-                setIsClosing(true);
-                closeTimerRef.current = setTimeout(() => {
-                    closeTimerRef.current = null;
-                    modalStateRef.current.closing = false;
-                    setIsModalOpen(false);
-                    setIsClosing(false);
-                }, 190);
-            }
-        }, []);
-
-        // Register bridges for global callbacks
-        useEffect(() => {
-            reactSetSettings = setAppSettings;
-            reactSetStats = (st) => {
-                setAppStats(Object.assign({}, st));
-                if (typeof st.accumulated !== 'undefined') setAccumulatedBonus(st.accumulated);
-            };
-            reactSetModalOpen = setModalOpenState;
-            reactSetCapturingKeybind = setIsCapturing;
-
-            return () => {
-                if (closeTimerRef.current) {
-                    clearTimeout(closeTimerRef.current);
-                    closeTimerRef.current = null;
-                }
-                reactSetSettings = null;
-                reactSetStats = null;
-                reactSetModalOpen = null;
-                reactSetCapturingKeybind = null;
-            };
-        }, [setModalOpenState]);
-
-        // Real-time reactive live stats subscription for StatusPill / open modal context (zero polling)
-        useEffect(() => {
-            const pillNeedsStats = appSettings.pillVisible && appSettings.keybindAction !== 'open-modal' && (appSettings.pillMode === 'compact' || appSettings.pillMode === 'full');
-            const pillNeedsBoost = pillNeedsStats && appSettings.pillMode === 'full';
-            if (!isModalOpen && !pillNeedsStats) {
-                return;
-            }
-            if (pillNeedsStats) setAppStats(Object.assign({}, stats));
-            if (isModalOpen || pillNeedsBoost) setAccumulatedBonus(accumulatedExtraSeconds);
-            if (isModalOpen) setSessionCtx(buildSessionContextSnapshot());
-            let lastBlocked = stats.blocked;
-            let lastBoosted = stats.boosted;
-            let lastAcc = accumulatedExtraSeconds;
-            let lastCtxAcc = accumulatedExtraSeconds;
-            let lastCtxRev = contextRevision;
-
-            return subscribeStats((st) => {
-                const acc = accumulatedExtraSeconds;
-                const rev = contextRevision;
-                if (pillNeedsStats && (st.blocked !== lastBlocked || (pillNeedsBoost && st.boosted !== lastBoosted))) {
-                    lastBlocked = st.blocked;
-                    lastBoosted = st.boosted;
-                    setAppStats(Object.assign({}, st));
-                }
-                if ((isModalOpen || pillNeedsBoost) && acc !== lastAcc) {
-                    lastAcc = acc;
-                    setAccumulatedBonus(acc);
-                }
-                if (isModalOpen && (acc !== lastCtxAcc || rev !== lastCtxRev)) {
-                    lastCtxAcc = acc;
-                    lastCtxRev = rev;
-                    setSessionCtx(buildSessionContextSnapshot());
-                }
-            });
-        }, [isModalOpen, appSettings.pillVisible, appSettings.keybindAction, appSettings.pillMode]);
-
-        const handleCloseModal = useCallback(() => {
-            setModalOpenState(false);
-        }, [setModalOpenState]);
-
-        const handleOpenSettings = useCallback(() => {
-            if (isModalOpenGlobal) {
-                setModalOpenState(false);
-            } else {
-                setModalOpenState(true);
-            }
-        }, [setModalOpenState]);
-
-        const handleToggleBoost = useCallback(() => {
-            const next = !settings.timeBoostEnabled;
-            applySettingChange('timeBoostEnabled', next);
-            LOG('time-boost ' + (next ? 'ENABLED' : 'DISABLED'));
-        }, []);
-
-        const handleStartCaptureKeybind = useCallback(() => {
-            capturingKeybind = !capturingKeybind;
-            setIsCapturing(capturingKeybind);
-            LOG('keybind capture ' + (capturingKeybind ? 'started' : 'cancelled'));
-        }, []);
-
-        const handleClearKeybind = useCallback(() => {
-            if (capturingKeybind) {
-                capturingKeybind = false;
-                setIsCapturing(false);
-                return;
-            }
-            applySettingChange('uiToggleKeybind', { code: null, ctrl: false, shift: false, alt: false, meta: false });
-            LOG('keybind cleared');
-        }, []);
-
-        const handleResetAllSettings = useCallback(() => {
-            if (confirm('Reset all UpLearn settings to defaults?')) {
-                Object.assign(settings, DEFAULT_SETTINGS);
-                settings.telemetryServices = buildDefaultTelemetryServices();
-                settings.uiToggleKeybind = Object.assign({}, DEFAULT_KEYBIND);
-                normalizeRange(settings);
-                saveSettings(true);
-                applyDarkMode();
-                ensureButton();
-                patchVisibilityProps();
-                installHasFocusPatch();
-                initVideoAutoSkipController();
-                setAppSettings(cloneSettings(settings));
-                LOG('settings reset to defaults');
-            }
-        }, []);
-
-        const handleResetStats = useCallback(() => {
-            resetAllStats();
-            setSessionCtx(buildSessionContextSnapshot());
-            LOG('stats reset');
-        }, []);
-
-        const handleAddManualBonus = useCallback((sec) => {
-            accumulatedExtraSeconds += sec;
-            setAccumulatedBonus(accumulatedExtraSeconds);
-            if (activeSession) updatePredictedFinalCall(activeSession);
-            bumpContextRevision();
-            setSessionCtx(buildSessionContextSnapshot());
-            bumpStat('manualBoosted');
-            LOG('manual bonus added: +' + sec + 's (total ' + accumulatedExtraSeconds + 's)');
-        }, []);
-
-        const handleClearBonus = useCallback(() => {
-            accumulatedExtraSeconds = 0;
-            accumulatedQuestionCount = 0;
-            setAccumulatedBonus(0);
-            if (activeSession) updatePredictedFinalCall(activeSession);
-            bumpContextRevision();
-            setSessionCtx(buildSessionContextSnapshot());
-            LOG('manual bonus cleared');
-        }, []);
-
-        // Sync theme attribute & accent CSS variable on root container
-        useEffect(() => {
-            const syncThemeAndAccent = () => {
-                if (uiContainerEl) {
-                    const effectiveTheme = getEffectiveTheme(appSettings.theme);
-                    if (uiContainerEl.getAttribute('data-theme') !== effectiveTheme) {
-                        uiContainerEl.setAttribute('data-theme', effectiveTheme);
-                    }
-                    if (uiContainerEl.style.getPropertyValue('--accent') !== appSettings.accentColor) {
-                        uiContainerEl.style.setProperty('--accent', appSettings.accentColor);
-                    }
-                }
-            };
-            syncThemeAndAccent();
-            if (appSettings.theme === 'auto' && typeof window.matchMedia === 'function') {
-                try {
-                    const mql = window.matchMedia('(prefers-color-scheme: light)');
-                    if (typeof mql.addEventListener === 'function') {
-                        mql.addEventListener('change', syncThemeAndAccent);
-                        return () => mql.removeEventListener('change', syncThemeAndAccent);
-                    }
-                } catch {}
-            }
-        }, [appSettings.theme, appSettings.accentColor]);
-
-        return html`
-            <div className="heroui-react-wrapper">
-                <${StatusPill} 
-                    currentSettings=${appSettings}
-                    currentStats=${appStats}
-                    accumulatedBonus=${accumulatedBonus}
-                    onToggleBoost=${handleToggleBoost}
-                    onOpenSettings=${handleOpenSettings}
-                />
-                ${(isModalOpen || isClosing) ? html`
-                    <${SettingsModal} 
-                        isOpen=${isModalOpen}
-                        isClosing=${isClosing}
-                        onClose=${handleCloseModal}
-                        currentSettings=${appSettings}
-                        accumulatedBonus=${accumulatedBonus}
-                        sessionContext=${sessionCtx}
-                        isCapturingKeybind=${isCapturing}
-                        onStartCaptureKeybind=${handleStartCaptureKeybind}
-                        onClearKeybind=${handleClearKeybind}
-                        onUpdateSetting=${applySettingChange}
-                        onResetAllSettings=${handleResetAllSettings}
-                        onResetStats=${handleResetStats}
-                        onAddManualBonus=${handleAddManualBonus}
-                        onClearBonus=${handleClearBonus}
-                    />
-                ` : null}
-            </div>
-        `;
-    };
-
-    function mountReactUI() {
-        if (reactRootInstance || !uiContainerEl) return;
-        if (typeof ReactDOM === 'undefined' || typeof React === 'undefined' || typeof htm === 'undefined') {
-            nativeConsole.error('[UL] React, ReactDOM, or HTM not loaded from @require.');
-            return;
-        }
-        try {
-            reactRootInstance = ReactDOM.createRoot(uiContainerEl);
-            reactRootInstance.render(html`<${App} />`);
-            LOG('Glisse & Apple Liquid Glass UI mounted');
-        } catch (err) {
-            nativeConsole.error('[UL] Error mounting React UI:', err);
-        }
-    }
-
-    // ============================================================
-    // GLOBAL KEYBOARD SHORTCUTS
-    // ============================================================
-    window.addEventListener('keydown', (e) => {
-        if (capturingKeybind) {
-            e.preventDefault(); e.stopPropagation();
+            e.stopPropagation();
             if (e.code === 'Escape') {
-                capturingKeybind = false;
-                if (reactSetCapturingKeybind) reactSetCapturingKeybind(false);
+                uiState.capturingKeybind = false;
+                runBindings('__capturingKeybind');
                 LOG('keybind capture cancelled');
                 return;
             }
             const kb = captureKeybindFromEvent(e);
+            uiState.capturingKeybind = false;
             applySettingChange('uiToggleKeybind', kb);
-            capturingKeybind = false;
-            if (reactSetCapturingKeybind) reactSetCapturingKeybind(false);
+            runBindings('__capturingKeybind');
             LOG('keybind set to:', formatKeybind(kb));
             return;
         }
-        if (e.key === 'Escape' && isModalOpenGlobal && !capturingKeybind) {
+        if (e.key === 'Escape' && uiState.modalIsOpen && !uiState.capturingKeybind) {
             e.preventDefault();
+            if (uiState.openMenuClosers.size > 0) {
+                e.stopPropagation();
+                for (const closeFn of Array.from(uiState.openMenuClosers)) {
+                    try { closeFn(true); } catch {}
+                }
+                return;
+            }
             closeSettingsModal();
             return;
         }
         if (matchesKeybind(e, settings.uiToggleKeybind) && !e.repeat) {
             e.preventDefault();
             if (settings.keybindAction === 'open-modal') {
-                if (isModalOpenGlobal) closeSettingsModal();
+                if (uiState.modalIsOpen) closeSettingsModal();
                 else openSettingsModal();
             } else {
-                if (isModalOpenGlobal) {
-                    // First press closes settings UI, leaving button visible
+                if (uiState.modalIsOpen) {
                     closeSettingsModal();
                     if (!settings.pillVisible) {
                         settings.pillVisible = true;
                         saveSettings();
-                        syncModalIfOpen();
+                        renderStatusPill();
                     }
                     LOG('settings UI closed via keybind; floating button remains visible');
                 } else {
-                    // Second press (or single press when settings UI is closed) toggles button visibility
                     settings.pillVisible = !settings.pillVisible;
                     saveSettings();
-                    syncModalIfOpen();
+                    renderStatusPill();
                     LOG('pill ' + (settings.pillVisible ? 'SHOWN' : 'HIDDEN'));
                 }
             }
@@ -10910,31 +10673,29 @@ ${SVG_ICONS.closeModal}
         }
         if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === 'KeyU') {
             e.preventDefault();
-            if (isModalOpenGlobal) closeSettingsModal();
+            if (uiState.modalIsOpen) closeSettingsModal();
             else openSettingsModal();
             return;
         }
-    }, true);
+    };
 
-    // ============================================================
-    // BOOTSTRAP
-    // ============================================================
+    safeWinAdd('keydown', globalKeydownHandler, true);
+
     function bootstrap() {
-        ensureDarkObserver();
+        syncRootThemeAndAccent();
         applyDarkMode();
         ensureUIHost();
         ensureButton();
         initVideoAutoSkipController();
     }
+
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', bootstrap, { once: true });
+        safeDocAdd('DOMContentLoaded', bootstrap, { once: true });
     } else {
         bootstrap();
     }
 
-    // ============================================================
-    // PUBLIC API (Exposed in verbose mode for DevTools debugging)
-    // ============================================================
+    // Public DevTools API (preserved 100% backward-compatible)
     publicApi = {
         settings, saveSettings, stats,
         openSettings: openSettingsModal,
@@ -10950,12 +10711,12 @@ ${SVG_ICONS.closeModal}
         setFullVideoWatchedEnabled: (v) => { applySettingChange('fullVideoWatchedEnabled', !!v); },
         setAutoSkipVideoEnabled: (v) => { applySettingChange('autoSkipVideoEnabled', !!v); },
         setAddVideoDurationToTimeSpent: (v) => { applySettingChange('addVideoDurationToTimeSpent', !!v); },
-        getKnownLessonDurations: () => knownLessonDurations,
-        getCurrentVideoLesson: () => currentVideoLesson,
-        getActiveSession: () => activeSession,
+        getKnownLessonDurations: () => sessionState.knownLessonDurations,
+        getCurrentVideoLesson: () => videoState.currentVideoLesson,
+        getActiveSession: () => sessionState.activeSession,
         getCurrentQuestion: (vars, opName, qStr) => identifyCurrentQuestion(vars, opName, qStr),
-        getPredictedFinalCall: () => activeSession ? updatePredictedFinalCall(activeSession) : null,
-        getQuestionRegistry: () => Array.from(questionRegistry.values()),
+        getPredictedFinalCall: () => sessionState.activeSession ? updatePredictedFinalCall(sessionState.activeSession) : null,
+        getQuestionRegistry: () => Array.from(sessionState.questionRegistry.values()),
         calculateDynamicTime: (qOrId, origSeconds, opName, qStr) => {
             const desc = (qOrId && typeof qOrId === 'object')
                 ? qOrId
@@ -10965,14 +10726,16 @@ ${SVG_ICONS.closeModal}
         getSessionContextSnapshot: buildSessionContextSnapshot,
         skipVideoNow: (force = true) => checkAndAutoSkipVideo(force),
         handleApiResponse,
-        getLatestExamPaperData: () => latestExamPaperData,
-        getLatestUserProfile: () => latestUserProfile,
-        getLatestFeatureFlags: () => latestFeatureFlags,
-        getLatestGlobalFeatureFlags: () => latestGlobalFeatureFlags,
-        getLatestQuizFeedback: () => latestQuizFeedback,
-        getQueuedSeconds: () => queuedSeconds,
+        getLatestExamPaperData: () => sessionState.latestExamPaperData,
+        getLatestUserProfile: () => sessionState.latestUserProfile,
+        getLatestFeatureFlags: () => sessionState.latestFeatureFlags,
+        getLatestGlobalFeatureFlags: () => sessionState.latestGlobalFeatureFlags,
+        getLatestQuizFeedback: () => sessionState.latestQuizFeedback,
+        getQueuedSeconds: () => sessionState.queuedSeconds,
         setQueuedSeconds: (secs) => {
-            queuedSeconds = secs;
+            sessionState.queuedSeconds = secs;
+            if (sessionState.activeSession) updatePredictedFinalCall(sessionState.activeSession);
+            bumpContextRevision();
             updateLabel();
         },
         ensureManualTimeButton: ensureButton,
@@ -10980,8 +10743,8 @@ ${SVG_ICONS.closeModal}
         rewriteBodyText,
         telemetryServices: TELEMETRY_SERVICES,
         resetStats: resetAllStats,
-        getAccumulated: () => accumulatedExtraSeconds,
-        getAccumulatedCount: () => accumulatedQuestionCount,
+        getAccumulated: () => sessionState.accumulatedExtraSeconds,
+        getAccumulatedCount: () => sessionState.accumulatedQuestionCount,
         pickExtraSeconds,
         _match: (url) => matchTelemetryService(url),
     };
@@ -10990,7 +10753,9 @@ ${SVG_ICONS.closeModal}
         window.__ul = publicApi;
     }
 
-    LOG('=== READY | timeBoost:', settings.timeBoostEnabled,
+    // Consolidated single startup summary
+    LOG('=== READY on', location.host,
+        '| timeBoost:', settings.timeBoostEnabled,
         '| dynamicTime:', settings.dynamicTimeEnabled,
         '| predictFinal:', settings.predictFinalCallEnabled,
         '| range:', settings.extraSecondsMin + '–' + settings.extraSecondsMax + 's',
@@ -11005,16 +10770,17 @@ ${SVG_ICONS.closeModal}
         '| suppress jitsu:', settings.suppressJitsu ? 'YES' : 'no',
         '===');
     if (settings.logLevel === 'verbose') {
-        nativeConsole.groupCollapsed('%c[UL · verbose] 🟢 Ready — active blockers', CSS.verbose);
-        const anyServiceOn = Object.keys(TELEMETRY_SERVICES).some(
-            (k) => k !== 'jitsu' && settings.telemetryServices[k]
-        );
-        nativeConsole.log('%cThird-party services:   ', CSS.muted, anyServiceOn ? 'ON' : 'OFF');
+        nativeConsole.groupCollapsed('%c[UL · verbose] 🟢 Startup summary — active blockers & settings', CSS.verbose);
+        const enabledServices = Object.keys(TELEMETRY_SERVICES)
+            .filter((k) => k !== 'jitsu' && settings.telemetryServices[k])
+            .map((k) => TELEMETRY_SERVICES[k].label);
+        nativeConsole.log('%cThird-party services:   ', CSS.muted, enabledServices.length ? enabledServices.join(', ') : '(none)');
         nativeConsole.log('%cSuppress Jitsu:         ', CSS.muted, settings.suppressJitsu ? 'YES (blocked + logged)' : 'no (allowed + logged)');
         nativeConsole.log('%cLogImproperUse:         ', CSS.muted, settings.blockLogImproperUse ? 'ON' : 'OFF');
         nativeConsole.log('%cLogEvent handler:       ', CSS.muted, settings.blockLogEvent !== false ? 'ON' : 'OFF');
         nativeConsole.log('%cPrivate search mode:    ', CSS.muted, settings.privateSearchMode !== false ? 'ON' : 'OFF');
-        nativeConsole.log('%cFunction cloaking:       ', CSS.muted, 'ON');
+        nativeConsole.log('%cFunction cloaking:      ', CSS.muted, 'ON');
+        nativeConsole.log('%cTime boost:             ', CSS.muted, settings.timeBoostEnabled ? `ON (+${settings.extraSecondsMin}–${settings.extraSecondsMax}s)` : 'OFF');
         nativeConsole.log('%cDynamic question time:  ', CSS.muted, settings.dynamicTimeEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cPredict final API call: ', CSS.muted, settings.predictFinalCallEnabled ? 'ON' : 'OFF');
         nativeConsole.log('%cManual time button:     ', CSS.muted, settings.manualTimeButtonEnabled ? 'ON' : 'OFF');
@@ -11027,6 +10793,7 @@ ${SVG_ICONS.closeModal}
         nativeConsole.log('%cVisibility spoofing:    ', CSS.muted, settings.spoofVisibility ? 'ON' : 'OFF');
         nativeConsole.log('%cConsole noise filter:   ', CSS.muted, settings.suppressConsoleNoise ? 'ON' : 'OFF');
         nativeConsole.log('%cFullscreen block:       ', CSS.muted, settings.disableAutoFullscreen ? 'ON' : 'OFF');
+        nativeConsole.log('%cDark mode:              ', CSS.muted, settings.darkMode ? 'ON' : 'OFF');
         nativeConsole.groupEnd();
     }
 })();
