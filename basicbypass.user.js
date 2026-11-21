@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UpLearn Telemetry + Fullscreen + Tab-Switch Blocker (Hardened)
 // @namespace    https://github.com/FabianDream/In-Browser-API-Interceptor
-// @version      1.6.4
+// @version      1.7.0
 // @description  Blocks telemetry, third-party trackers, WebWorker beacons, auto-fullscreen, and tab-switch/blur detection.
 // @author       FabianDream
 // @homepageURL  https://github.com/FabianDream/In-Browser-API-Interceptor
@@ -44,8 +44,10 @@
     'use strict';
 
     // ============================================================
-    // STEALTH & CLOAKING INFRASTRUCTURE
+    // 0. STEALTH, BUILTIN SNAPSHOTS & SHARED HELPERS
     // ============================================================
+    const origCreate           = Object.create;
+    const origKeys             = Object.keys;
     const origDefineProperty   = Object.defineProperty;
     const origDefineProperties = Object.defineProperties;
     const origGetOwnPropDesc   = Object.getOwnPropertyDescriptor;
@@ -54,11 +56,24 @@
     const reflectApply         = Reflect.apply;
     const reflectConstruct     = Reflect.construct;
     const reflectOwnKeys       = Reflect.ownKeys;
+    const isArray              = Array.isArray;
+
+    const OrigPromise          = Promise;
+    const OrigEvent            = Event;
+    const OrigDOMException     = typeof DOMException === 'function' ? DOMException : Error;
+    const OrigResponse         = typeof Response === 'function' ? Response : null;
+    const OrigRequest          = typeof Request === 'function' ? Request : null;
+    const OrigURLSearchParams  = typeof URLSearchParams === 'function' ? URLSearchParams : null;
+    const OrigFormData         = typeof FormData === 'function' ? FormData : null;
+    const OrigArrayBuffer      = typeof ArrayBuffer === 'function' ? ArrayBuffer : null;
+    const isArrayBufferView    = OrigArrayBuffer ? OrigArrayBuffer.isView : () => false;
+    const OrigTextDecoder      = typeof TextDecoder === 'function' ? TextDecoder : null;
+    const ProgressEvtCtor      = typeof ProgressEvent === 'function' ? ProgressEvent : OrigEvent;
+    const CloseEvtCtor         = typeof CloseEvent === 'function' ? CloseEvent : null;
+    const origSetTimeout       = window.setTimeout;
 
     const wmGet       = WeakMap.prototype.get;
     const wmSet       = WeakMap.prototype.set;
-    const wsHas       = WeakSet.prototype.has;
-    const wsAdd       = WeakSet.prototype.add;
     const setHas      = Set.prototype.has;
     const setAdd      = Set.prototype.add;
     const setDel      = Set.prototype.delete;
@@ -66,11 +81,10 @@
     const mapSet      = Map.prototype.set;
     const mapDel      = Map.prototype.delete;
     const mapKeys     = Map.prototype.keys;
-    const mapSizeDesc = origGetOwnPropDesc(Map.prototype, 'size');
-    const mapSize     = mapSizeDesc && mapSizeDesc.get;
     const mapIterNext = Object.getPrototypeOf(new Map().keys()).next;
 
     const cloakedFns = new WeakMap();
+    const noop       = () => {};
 
     function cloak(fn) {
         wmSet.call(cloakedFns, fn, `function ${fn.name}() { [native code] }`);
@@ -96,8 +110,6 @@
         },
     }).toString);
 
-    const noop = () => {};
-
     function makeGetter(prop, val) {
         const name = `get ${prop}`;
         return cloak(({ [name]() { return val; } })[name]);
@@ -114,6 +126,24 @@
         };
     }
 
+    function defineDescriptors(target, descs, fallback) {
+        try {
+            origDefineProperties(target, descs);
+        } catch {
+            const keys = origKeys(descs);
+            for (let i = 0; i < keys.length; i++) {
+                const prop = keys[i];
+                try {
+                    origDefineProperty(target, prop, descs[prop]);
+                } catch {
+                    if (fallback) {
+                        try { origDefineProperty(fallback, prop, descs[prop]); } catch {}
+                    }
+                }
+            }
+        }
+    }
+
     const DEBUG = false;
     const LOG   = DEBUG && typeof console !== 'undefined' && console.log
         ? console.log.bind(console, '%c[UL]', 'color:#00e5ff;font-weight:bold')
@@ -122,21 +152,29 @@
         ? console.warn.bind(console, '[UL]')
         : noop;
 
-    // Response synthesis for dropped telemetry calls
-    const SYNTHETIC_OK_BODY = '{"data":{"logImproperUse":true}}';
-    const NO_CONTENT_INIT   = { status: 204, statusText: 'No Content' };
-    const OK_RESPONSE_INIT  = {
+    // Shared payload-matching & response synthesis
+    const MAX_BODY_SCAN       = 65536;
+    const LOG_IMPROPER_USE_RE = /logimproperuse/i;
+    const MEDIA_BLOB_TYPE_RE  = /^(?:video|audio|image|font)\//i;
+    const SYNTHETIC_OK_BODY   = '{"data":{"logImproperUse":true}}';
+    const NO_CONTENT_INIT     = { status: 204, statusText: 'No Content' };
+    const OK_RESPONSE_INIT    = {
         status: 200,
         statusText: 'OK',
         headers: { 'Content-Type': 'application/json' },
     };
 
     function syntheticOk() {
-        return new Response(SYNTHETIC_OK_BODY, OK_RESPONSE_INIT);
+        return new OrigResponse(SYNTHETIC_OK_BODY, OK_RESPONSE_INIT);
     }
 
     function syntheticNoContent() {
-        return new Response(null, NO_CONTENT_INIT);
+        return new OrigResponse(null, NO_CONTENT_INIT);
+    }
+
+    function isImproperUseText(str) {
+        const len = str.length;
+        return len >= 14 && len <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(str);
     }
 
     function isPostMethod(method) {
@@ -152,6 +190,7 @@
     // 1. TELEMETRY HOST DEFINITIONS & SINGLE-PASS URL CLASSIFIER
     // ============================================================
     const API_HOST          = 'web.uplearn.co.uk';
+    const API_HOST_LEN      = API_HOST.length;
     const API_ORIGIN_PREFIX = 'https://' + API_HOST + '/';
 
     const URL_OTHER      = 0;
@@ -207,8 +246,8 @@
 
     const HOST_CACHE_MAX = 256;
     const hostKindCache  = new Map();
+    let hostKindCacheSize = 0;
 
-    // Unified single-pass scheme + hostname classifier with origin & HTTP(S) fast-paths
     function classifyUrl(url) {
         const str = typeof url === 'string' ? url : toUrlString(url);
         const len = str.length;
@@ -267,7 +306,7 @@
         let hasUpper = false;
         for (; end < len; end++) {
             const c = str.charCodeAt(end);
-            if (c === 47 || c === 63 || c === 35 || c <= 32) break; // / ? # or control/space
+            if (c === 47 || c === 63 || c === 35 || c === 92 || c <= 32) break; // / ? # \ or control/space
             if (c === 64) { // @
                 start = end + 1;
                 colon = -1;
@@ -289,23 +328,29 @@
         const hostLen = end - start;
         if (hostLen <= 0) return URL_OTHER;
 
-        if (!hasUpper && hostLen === API_HOST.length && str.startsWith(API_HOST, start)) {
+        if (hostLen === API_HOST_LEN && !hasUpper && str.startsWith(API_HOST, start)) {
             return URL_TARGET_API;
         }
 
         const rawHost = str.slice(start, end);
         const host = hasUpper ? rawHost.toLowerCase() : rawHost;
-        if (host === API_HOST) return URL_TARGET_API;
+        if (hasUpper && hostLen === API_HOST_LEN && host === API_HOST) {
+            return URL_TARGET_API;
+        }
 
         let kind = mapGet.call(hostKindCache, host);
         if (kind !== undefined) return kind;
 
         kind = hostIsTelemetry(host) ? URL_TELEMETRY : URL_OTHER;
-        if ((mapSize ? mapSize.call(hostKindCache) : hostKindCache.size) >= HOST_CACHE_MAX) {
+        if (hostKindCacheSize >= HOST_CACHE_MAX) {
             const oldest = mapIterNext.call(mapKeys.call(hostKindCache)).value;
-            if (oldest !== undefined) mapDel.call(hostKindCache, oldest);
+            if (oldest !== undefined) {
+                mapDel.call(hostKindCache, oldest);
+                hostKindCacheSize--;
+            }
         }
         mapSet.call(hostKindCache, host, kind);
+        hostKindCacheSize++;
         return kind;
     }
 
@@ -313,70 +358,44 @@
         return classifyUrl(url) === URL_TELEMETRY;
     }
 
-    const MAX_BODY_SCAN       = 65536;
-    const LOG_IMPROPER_USE_RE = /logimproperuse/i;
-    let sharedTextDecoder = null;
-
-    function bodyLooksLikeLogImproperUse(body) {
-        if (typeof body === 'string') {
-            return body.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(body);
-        }
-        if (!body || typeof body !== 'object') return false;
-        try {
-            if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
-                const s = body.toString();
-                return s.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(s);
-            }
-            if (ArrayBuffer.isView(body) || (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer)) {
-                if (body.byteLength > MAX_BODY_SCAN) return false;
-                sharedTextDecoder ||= new TextDecoder();
-                return LOG_IMPROPER_USE_RE.test(sharedTextDecoder.decode(body));
-            }
-            if (typeof FormData !== 'undefined' && body instanceof FormData) {
-                for (const [key, val] of body) {
-                    if (
-                        (typeof key === 'string' && key.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(key)) ||
-                        (typeof val === 'string' && val.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(val))
-                    ) return true;
-                }
-            }
-        } catch {}
-        return false;
-    }
-
     // ============================================================
     // 2. DOM, SCRIPT, IFRAME, IMAGE & LINK TAG INTERCEPTION
     // ============================================================
     function hookElementProperty(proto, prop, tag) {
         const desc = proto && origGetOwnPropDesc(proto, prop);
-        if (desc && desc.set) {
-            const origSet = desc.set;
-            const sName = `set ${prop}`;
-            origDefineProperty(proto, prop, {
-                get: desc.get,
-                set: cloak(({
-                    [sName](val) {
-                        if (isTelemetryUrl(val)) {
-                            if (DEBUG) LOG(`blocked <${tag}> ${prop}:`, val);
-                            return;
-                        }
-                        return origSet.call(this, val);
-                    },
-                })[sName]),
-                configurable: true,
-                enumerable: desc.enumerable,
-            });
-        }
+        if (!desc || !desc.set) return;
+        const origSet = desc.set;
+        const sName = `set ${prop}`;
+        origDefineProperty(proto, prop, {
+            get: desc.get,
+            set: cloak(({
+                [sName](val) {
+                    if (isTelemetryUrl(val)) {
+                        if (DEBUG) LOG(`blocked <${tag}> ${prop}:`, val);
+                        return;
+                    }
+                    return origSet.call(this, val);
+                },
+            })[sName]),
+            configurable: true,
+            enumerable: desc.enumerable,
+        });
     }
 
-    if (typeof HTMLScriptElement !== 'undefined') hookElementProperty(HTMLScriptElement.prototype, 'src',  'script');
-    if (typeof HTMLIFrameElement !== 'undefined') hookElementProperty(HTMLIFrameElement.prototype, 'src',  'iframe');
-    if (typeof HTMLImageElement  !== 'undefined') hookElementProperty(HTMLImageElement.prototype,  'src',  'img');
+    const HTMLImgProto = typeof HTMLImageElement !== 'undefined' ? HTMLImageElement.prototype : null;
+    const ELEMENT_HOOKS = [
+        [typeof HTMLScriptElement !== 'undefined' ? HTMLScriptElement.prototype : null, 'src',  'script'],
+        [typeof HTMLIFrameElement !== 'undefined' ? HTMLIFrameElement.prototype : null, 'src',  'iframe'],
+        [HTMLImgProto,                                                                  'src',  'img'],
+        [typeof HTMLLinkElement   !== 'undefined' ? HTMLLinkElement.prototype   : null, 'href', 'link'],
+    ];
+    for (let i = 0; i < ELEMENT_HOOKS.length; i++) {
+        hookElementProperty(ELEMENT_HOOKS[i][0], ELEMENT_HOOKS[i][1], ELEMENT_HOOKS[i][2]);
+    }
     const ImageCtor = typeof Image === 'function' ? Image : window.Image;
-    if (typeof ImageCtor === 'function' && ImageCtor.prototype && (typeof HTMLImageElement === 'undefined' || ImageCtor.prototype !== HTMLImageElement.prototype)) {
+    if (typeof ImageCtor === 'function' && ImageCtor.prototype && ImageCtor.prototype !== HTMLImgProto) {
         hookElementProperty(ImageCtor.prototype, 'src', 'img');
     }
-    if (typeof HTMLLinkElement   !== 'undefined') hookElementProperty(HTMLLinkElement.prototype,   'href', 'link');
 
     function isUrlAttribute(name) {
         if (name === 'src' || name === 'href') return true;
@@ -411,9 +430,14 @@
     // 3. WEB WORKER, BLOB & WEBSOCKET NEUTERING
     // ============================================================
     const TELEMETRY_CODE_RE = /openreplay|sentry|sessionReplay|replayUploader/i;
-    const telemetryBlobs    = new WeakSet();
+    const BLOB_TELEMETRY    = 1;
+    const BLOB_IMPROPER_USE = 2;
+    const BLOB_ALL_FLAGS    = BLOB_TELEMETRY | BLOB_IMPROPER_USE;
+
+    const blobFlags         = new WeakMap();
     const telemetryBlobUrls = new Set();
     let hasTelemetryBlobs     = false;
+    let hasImproperUseBlobs   = false;
     let telemetryBlobUrlCount = 0;
 
     function createDummyTarget(newTarget, FallbackCtor, descs) {
@@ -430,7 +454,12 @@
             URL.createObjectURL = cloak(({
                 createObjectURL(obj) {
                     const url = origCreateObjectURL.call(this, obj);
-                    if (hasTelemetryBlobs && obj && typeof obj === 'object' && wsHas.call(telemetryBlobs, obj)) {
+                    if (
+                        hasTelemetryBlobs &&
+                        obj &&
+                        typeof obj === 'object' &&
+                        ((wmGet.call(blobFlags, obj) || 0) & BLOB_TELEMETRY)
+                    ) {
                         if (!setHas.call(telemetryBlobUrls, url)) {
                             setAdd.call(telemetryBlobUrls, url);
                             telemetryBlobUrlCount++;
@@ -453,13 +482,23 @@
         }
     }
 
-    const MEDIA_BLOB_TYPE_RE = /^(?:video|audio|image|font)\//i;
-
-    function isTelemetryBlobPart(part, isMediaType) {
+    function classifyBlobPart(part, isMediaType) {
         if (typeof part === 'string') {
-            return !isMediaType && part.length >= 6 && part.length < 1e6 && TELEMETRY_CODE_RE.test(part);
+            if (isMediaType) return 0;
+            let flags = 0;
+            const len = part.length;
+            if (len >= 6 && len < 1e6 && TELEMETRY_CODE_RE.test(part)) {
+                flags |= BLOB_TELEMETRY;
+            }
+            if (isImproperUseText(part)) {
+                flags |= BLOB_IMPROPER_USE;
+            }
+            return flags;
         }
-        return hasTelemetryBlobs && typeof part === 'object' && part !== null && wsHas.call(telemetryBlobs, part);
+        if ((hasTelemetryBlobs || hasImproperUseBlobs) && part !== null && typeof part === 'object') {
+            return wmGet.call(blobFlags, part) || 0;
+        }
+        return 0;
     }
 
     const OrigBlob = window.Blob;
@@ -469,27 +508,27 @@
             const argc = arguments.length;
             const blob = new.target === PatchedBlob
                 ? (argc === 0 ? new OrigBlob() : argc === 1 ? new OrigBlob(blobParts) : new OrigBlob(blobParts, options))
-                : reflectConstruct(OrigBlob, argc === 0 ? [] : argc === 1 ? [blobParts] : [blobParts, options], new.target);
+                : reflectConstruct(OrigBlob, arguments, new.target);
             try {
                 if (blobParts) {
                     const isMediaType = !!(options && typeof options.type === 'string' && MEDIA_BLOB_TYPE_RE.test(options.type));
-                    if (!isMediaType || hasTelemetryBlobs) {
-                        if (Array.isArray(blobParts)) {
+                    if (!isMediaType || hasTelemetryBlobs || hasImproperUseBlobs) {
+                        let flags = 0;
+                        if (isArray(blobParts)) {
                             for (let i = 0, len = blobParts.length; i < len; i++) {
-                                if (isTelemetryBlobPart(blobParts[i], isMediaType)) {
-                                    wsAdd.call(telemetryBlobs, blob);
-                                    hasTelemetryBlobs = true;
-                                    break;
-                                }
+                                flags |= classifyBlobPart(blobParts[i], isMediaType);
+                                if (flags === BLOB_ALL_FLAGS) break;
                             }
                         } else if (typeof blobParts[Symbol.iterator] === 'function') {
                             for (const part of blobParts) {
-                                if (isTelemetryBlobPart(part, isMediaType)) {
-                                    wsAdd.call(telemetryBlobs, blob);
-                                    hasTelemetryBlobs = true;
-                                    break;
-                                }
+                                flags |= classifyBlobPart(part, isMediaType);
+                                if (flags === BLOB_ALL_FLAGS) break;
                             }
+                        }
+                        if (flags !== 0) {
+                            wmSet.call(blobFlags, blob, flags);
+                            if (flags & BLOB_TELEMETRY) hasTelemetryBlobs = true;
+                            if (flags & BLOB_IMPROPER_USE) hasImproperUseBlobs = true;
                         }
                     }
                 }
@@ -559,12 +598,13 @@
                     writable: true,
                     configurable: true,
                 });
-                setTimeout(() => {
+                origSetTimeout.call(window, () => {
+                    if (dummy.readyState === 3) return;
                     dummy.readyState = 3;
-                    dispatchDummyWsEvent(dummy, new Event('error'), 'onerror');
-                    const closeEvt = typeof CloseEvent !== 'undefined'
-                        ? new CloseEvent('close', { code: 1006, reason: 'Blocked' })
-                        : new Event('close');
+                    dispatchDummyWsEvent(dummy, new OrigEvent('error'), 'onerror');
+                    const closeEvt = CloseEvtCtor
+                        ? new CloseEvtCtor('close', { code: 1006, reason: 'Blocked' })
+                        : new OrigEvent('close');
                     dispatchDummyWsEvent(dummy, closeEvt, 'onclose');
                 }, 0);
                 return dummy;
@@ -590,6 +630,34 @@
     // 4. FETCH / XHR / BEACON INTERCEPTORS
     // ============================================================
     const SKIP_CONTENT_TYPE_RE = /^\s*(?:image\/|video\/|audio\/|multipart\/|application\/octet-stream\b)/i;
+    let sharedTextDecoder = null;
+
+    function bodyLooksLikeLogImproperUse(body) {
+        if (typeof body === 'string') return isImproperUseText(body);
+        if (!body || typeof body !== 'object') return false;
+        if (hasImproperUseBlobs && ((wmGet.call(blobFlags, body) || 0) & BLOB_IMPROPER_USE)) {
+            return true;
+        }
+        try {
+            if (OrigURLSearchParams && body instanceof OrigURLSearchParams) {
+                return isImproperUseText(body.toString());
+            }
+            if (isArrayBufferView(body) || (OrigArrayBuffer && body instanceof OrigArrayBuffer)) {
+                if (body.byteLength > MAX_BODY_SCAN || !OrigTextDecoder) return false;
+                sharedTextDecoder ||= new OrigTextDecoder();
+                return isImproperUseText(sharedTextDecoder.decode(body));
+            }
+            if (OrigFormData && body instanceof OrigFormData) {
+                for (const [key, val] of body) {
+                    if (
+                        (typeof key === 'string' && isImproperUseText(key)) ||
+                        (typeof val === 'string' && isImproperUseText(val))
+                    ) return true;
+                }
+            }
+        } catch {}
+        return false;
+    }
 
     function shouldSkipRequestScan(req) {
         const headers = req.headers;
@@ -608,33 +676,44 @@
                     const kind = classifyUrl(input);
                     if (kind === URL_TELEMETRY) {
                         if (DEBUG) LOG('blocked telemetry fetch:', input);
-                        return Promise.resolve(syntheticNoContent());
+                        return OrigPromise.resolve(syntheticNoContent());
                     }
 
                     if (kind === URL_TARGET_API) {
                         const method = (init && init.method) || (typeof input === 'object' && input !== null ? input.method : undefined);
                         if (isPostMethod(method)) {
-                            const body = init && init.body;
+                            const hasInitBody = init != null && init.body !== undefined;
+                            const body = hasInitBody ? init.body : null;
                             let asyncSource = null;
 
                             if (body != null) {
                                 if (bodyLooksLikeLogImproperUse(body)) {
                                     if (DEBUG) LOG('dropped LogImproperUse (fetch)');
-                                    return Promise.resolve(syntheticOk());
+                                    return OrigPromise.resolve(syntheticOk());
                                 }
-                                if (typeof body === 'object' && typeof body.text === 'function' && !(typeof body.size === 'number' && body.size > MAX_BODY_SCAN)) {
+                                if (
+                                    typeof body === 'object' &&
+                                    typeof body.text === 'function' &&
+                                    !(typeof body.size === 'number' && body.size > MAX_BODY_SCAN) &&
+                                    !(typeof body.type === 'string' && MEDIA_BLOB_TYPE_RE.test(body.type))
+                                ) {
                                     asyncSource = body;
                                 }
-                            } else if (typeof Request !== 'undefined' && input instanceof Request && input.body != null && !input.bodyUsed) {
-                                if (!shouldSkipRequestScan(input)) {
-                                    asyncSource = input.clone();
-                                }
+                            } else if (
+                                !hasInitBody &&
+                                OrigRequest &&
+                                input instanceof OrigRequest &&
+                                input.body != null &&
+                                !input.bodyUsed &&
+                                !shouldSkipRequestScan(input)
+                            ) {
+                                asyncSource = input.clone();
                             }
 
-                            if (asyncSource) {
+                            if (asyncSource !== null) {
                                 return asyncSource.text().then(
                                     (text) => {
-                                        if (text.length <= MAX_BODY_SCAN && LOG_IMPROPER_USE_RE.test(text)) {
+                                        if (isImproperUseText(text)) {
                                             if (DEBUG) LOG('dropped LogImproperUse (async fetch body)');
                                             return syntheticOk();
                                         }
@@ -711,19 +790,18 @@
 
         const XHR_BLOCKED_DESCS = makeXhrDescs(204, 'No Content', '', false, '');
         const XHR_OK_DESCS      = makeXhrDescs(200, 'OK', SYNTHETIC_OK_BODY, true, 'content-type: application/json\r\n');
-        const SPOOFED_XHR_KEYS  = Object.keys(XHR_OK_DESCS);
+        const SPOOFED_XHR_KEYS  = origKeys(XHR_OK_DESCS);
 
         function spoofXhr(xhr, st, descs) {
             const seq = ++st.seq;
-            setTimeout(() => {
+            origSetTimeout.call(window, () => {
                 if (st.seq !== seq) return;
                 st.spoofed = true;
                 try {
                     origDefineProperties(xhr, descs);
-                    xhr.dispatchEvent(new Event('readystatechange'));
-                    const EvtCtor = typeof ProgressEvent !== 'undefined' ? ProgressEvent : Event;
-                    xhr.dispatchEvent(new EvtCtor('load'));
-                    xhr.dispatchEvent(new EvtCtor('loadend'));
+                    xhr.dispatchEvent(new OrigEvent('readystatechange'));
+                    xhr.dispatchEvent(new ProgressEvtCtor('load'));
+                    xhr.dispatchEvent(new ProgressEvtCtor('loadend'));
                 } catch {}
             }, 0);
         }
@@ -876,7 +954,6 @@
     }
 
     for (const evt of SUPPRESSED_EVENTS) {
-        if (evt === 'webkitvisibilitychange') continue;
         const prop  = 'on' + evt;
         const inDoc = prop in docTarget || prop in document;
         const inWin = prop in window;
@@ -893,35 +970,21 @@
         }
     }
 
-    try {
-        origDefineProperties(docTarget, docSpoofDescs);
-    } catch {
-        for (const prop of Object.keys(docSpoofDescs)) {
-            try {
-                origDefineProperty(docTarget, prop, docSpoofDescs[prop]);
-            } catch {
-                try { origDefineProperty(document, prop, docSpoofDescs[prop]); } catch {}
-            }
-        }
-    }
+    defineDescriptors(docTarget, docSpoofDescs, docTarget !== document ? document : null);
     if (docTarget !== document) {
-        for (const prop of Object.keys(docSpoofDescs)) {
+        const docKeys = origKeys(docSpoofDescs);
+        for (let i = 0; i < docKeys.length; i++) {
+            const prop = docKeys[i];
+            const desc = docSpoofDescs[prop];
             if (origGetOwnPropDesc(document, prop)) {
-                try { origDefineProperty(document, prop, docSpoofDescs[prop]); } catch {}
+                try { origDefineProperty(document, prop, desc); } catch {}
             }
             if (HtmlDocProto && origGetOwnPropDesc(HtmlDocProto, prop)) {
-                try { origDefineProperty(HtmlDocProto, prop, docSpoofDescs[prop]); } catch {}
+                try { origDefineProperty(HtmlDocProto, prop, desc); } catch {}
             }
         }
     }
-
-    try {
-        origDefineProperties(window, winSpoofDescs);
-    } catch {
-        for (const prop of Object.keys(winSpoofDescs)) {
-            try { origDefineProperty(window, prop, winSpoofDescs[prop]); } catch {}
-        }
-    }
+    defineDescriptors(window, winSpoofDescs, null);
 
     const FS_METHODS = [
         'requestFullscreen',
@@ -936,7 +999,7 @@
         if (m in Element.prototype) {
             const rejectFn = cloak(({
                 [m]() {
-                    const p = Promise.reject(new DOMException('Fullscreen blocked', 'NotAllowedError'));
+                    const p = OrigPromise.reject(new OrigDOMException('Fullscreen blocked', 'NotAllowedError'));
                     p.catch(noop);
                     return p;
                 },
@@ -954,87 +1017,69 @@
         }
     }
 
-    const origProtoAdd   = EventTarget.prototype.addEventListener;
-    const winDesc        = origGetOwnPropDesc(window, 'window');
-    const rawWin         = (winDesc && winDesc.value) || window;
-    const distinctRawWin = rawWin !== window ? rawWin : null;
+    const winDesc = origGetOwnPropDesc(window, 'window');
+    const rawWin  = (winDesc && winDesc.value) || window;
 
-    const patchedAddEventListener = distinctRawWin !== null
-        ? cloak(({
+    if (EventTargetProto && typeof EventTargetProto.addEventListener === 'function') {
+        const origProtoAdd = EventTargetProto.addEventListener;
+
+        const patchedAddEventListener = cloak(({
             addEventListener(type, listener, options = undefined) {
                 if (
-                    (this === document || this === window || this === distinctRawWin || this == null) &&
+                    (this === document || this === window || this === rawWin || this == null) &&
                     setHas.call(SUPPRESSED_EVENTS, type)
                 ) {
                     return;
                 }
-                if (arguments.length >= 2) {
-                    return origProtoAdd.call(this, type, listener, options);
-                }
-                return arguments.length === 1
-                    ? origProtoAdd.call(this, type)
-                    : origProtoAdd.call(this);
-            },
-        }).addEventListener)
-        : cloak(({
-            addEventListener(type, listener, options = undefined) {
-                if (
-                    (this === document || this === window || this == null) &&
-                    setHas.call(SUPPRESSED_EVENTS, type)
-                ) {
-                    return;
-                }
-                if (arguments.length >= 2) {
-                    return origProtoAdd.call(this, type, listener, options);
-                }
-                return arguments.length === 1
-                    ? origProtoAdd.call(this, type)
-                    : origProtoAdd.call(this);
+                const argc = arguments.length;
+                if (argc >= 2) return origProtoAdd.call(this, type, listener, options);
+                return argc === 1 ? origProtoAdd.call(this, type) : origProtoAdd.call(this);
             },
         }).addEventListener);
 
-    function defineAddEventListener(target, protoFallback) {
-        const desc = origGetOwnPropDesc(target, 'addEventListener') ||
-            (protoFallback && origGetOwnPropDesc(protoFallback, 'addEventListener'));
-        try {
-            origDefineProperty(target, 'addEventListener', {
-                value: patchedAddEventListener,
-                writable: true,
-                enumerable: desc ? desc.enumerable : true,
-                configurable: true,
-            });
-        } catch {
-            try { target.addEventListener = patchedAddEventListener; } catch {}
+        function defineAddEventListener(target, protoFallback) {
+            const desc = origGetOwnPropDesc(target, 'addEventListener') ||
+                (protoFallback && origGetOwnPropDesc(protoFallback, 'addEventListener'));
+            try {
+                origDefineProperty(target, 'addEventListener', {
+                    value: patchedAddEventListener,
+                    writable: true,
+                    enumerable: desc ? desc.enumerable : true,
+                    configurable: true,
+                });
+            } catch {
+                try { target.addEventListener = patchedAddEventListener; } catch {}
+            }
         }
-    }
 
-    defineAddEventListener(EventTarget.prototype, null);
-    if (window.addEventListener !== patchedAddEventListener) {
-        defineAddEventListener(window, WinProto);
-    }
-    if (document.addEventListener !== patchedAddEventListener) {
-        defineAddEventListener(document, DocProto);
-    }
-
-    const killEvent = (e) => {
-        if (
-            e.type === 'blur' &&
-            e.target &&
-            e.target !== window &&
-            e.target !== document &&
-            (distinctRawWin === null || e.target !== distinctRawWin)
-        ) {
-            return;
+        defineAddEventListener(EventTargetProto, null);
+        if (window.addEventListener !== patchedAddEventListener) {
+            defineAddEventListener(window, WinProto);
         }
-        e.stopImmediatePropagation();
-    };
+        if (document.addEventListener !== patchedAddEventListener) {
+            defineAddEventListener(document, DocProto);
+        }
 
-    for (const evt of SUPPRESSED_EVENTS) {
-        if (evt === 'focusout') continue;
-        try {
-            origProtoAdd.call(rawWin, evt, killEvent, true);
-        } catch {
-            try { origProtoAdd.call(window, evt, killEvent, true); } catch {}
+        const killEvent = (e) => {
+            if (
+                e.type === 'blur' &&
+                e.target &&
+                e.target !== window &&
+                e.target !== document &&
+                e.target !== rawWin
+            ) {
+                return;
+            }
+            e.stopImmediatePropagation();
+        };
+
+        for (const evt of SUPPRESSED_EVENTS) {
+            if (evt === 'focusout') continue;
+            try {
+                origProtoAdd.call(rawWin, evt, killEvent, true);
+            } catch {
+                try { origProtoAdd.call(window, evt, killEvent, true); } catch {}
+            }
         }
     }
 
@@ -1042,27 +1087,23 @@
     // 6. PROPERTY PROTECTION & MONITORING
     // ============================================================
     function getProtectedSet(target) {
-        if (target === document || (DocProto !== null && target === DocProto) || (HtmlDocProto !== null && target === HtmlDocProto)) {
-            return PROTECTED_DOC_PROPS;
-        }
-        if (target === window || (WinProto !== null && target === WinProto) || (distinctRawWin !== null && target === distinctRawWin)) {
-            return PROTECTED_WIN_PROPS;
-        }
-        if (EventTargetProto !== null && target === EventTargetProto) {
-            return PROTECTED_ET_PROPS;
-        }
+        if (!target || typeof target !== 'object') return null;
+        if (target === document || target === DocProto || target === HtmlDocProto) return PROTECTED_DOC_PROPS;
+        if (target === window || target === WinProto || target === rawWin) return PROTECTED_WIN_PROPS;
+        if (target === EventTargetProto) return PROTECTED_ET_PROPS;
         return null;
+    }
+
+    function isProtectedProp(target, prop) {
+        const set = getProtectedSet(target);
+        if (set === null) return false;
+        const key = typeof prop === 'string' || typeof prop === 'symbol' ? prop : String(prop);
+        return setHas.call(set, key);
     }
 
     Object.defineProperty = cloak(({
         defineProperty(target, prop, descriptor) {
-            if (target === document || (DocProto !== null && target === DocProto) || (HtmlDocProto !== null && target === HtmlDocProto)) {
-                if (setHas.call(PROTECTED_DOC_PROPS, prop)) return target;
-            } else if (target === window || (WinProto !== null && target === WinProto) || (distinctRawWin !== null && target === distinctRawWin)) {
-                if (setHas.call(PROTECTED_WIN_PROPS, prop)) return target;
-            } else if (EventTargetProto !== null && target === EventTargetProto) {
-                if (setHas.call(PROTECTED_ET_PROPS, prop)) return target;
-            }
+            if (isProtectedProp(target, prop)) return target;
             return origDefineProperty(target, prop, descriptor);
         },
     }).defineProperty);
@@ -1070,27 +1111,27 @@
     Object.defineProperties = cloak(({
         defineProperties(target, props) {
             const set = props != null ? getProtectedSet(target) : null;
-            if (set) {
+            if (set !== null) {
                 const obj = Object(props);
                 const keys = reflectOwnKeys(obj);
                 let safeProps = null;
                 for (let i = 0; i < keys.length; i++) {
                     const key = keys[i];
                     if (setHas.call(set, key)) {
-                        if (!safeProps) {
-                            safeProps = Object.create(null);
+                        if (safeProps === null) {
+                            safeProps = origCreate(null);
                             for (let j = 0; j < i; j++) {
                                 const prevKey = keys[j];
                                 const d = origGetOwnPropDesc(obj, prevKey);
                                 if (d && d.enumerable) safeProps[prevKey] = obj[prevKey];
                             }
                         }
-                    } else if (safeProps) {
+                    } else if (safeProps !== null) {
                         const d = origGetOwnPropDesc(obj, key);
                         if (d && d.enumerable) safeProps[key] = obj[key];
                     }
                 }
-                if (safeProps) {
+                if (safeProps !== null) {
                     return origDefineProperties(target, safeProps);
                 }
             }
@@ -1102,13 +1143,7 @@
         const origReflectDefineProperty = Reflect.defineProperty;
         Reflect.defineProperty = cloak(({
             defineProperty(target, prop, descriptor) {
-                if (target === document || (DocProto !== null && target === DocProto) || (HtmlDocProto !== null && target === HtmlDocProto)) {
-                    if (setHas.call(PROTECTED_DOC_PROPS, prop)) return true;
-                } else if (target === window || (WinProto !== null && target === WinProto) || (distinctRawWin !== null && target === distinctRawWin)) {
-                    if (setHas.call(PROTECTED_WIN_PROPS, prop)) return true;
-                } else if (EventTargetProto !== null && target === EventTargetProto) {
-                    if (setHas.call(PROTECTED_ET_PROPS, prop)) return true;
-                }
+                if (isProtectedProp(target, prop)) return true;
                 return origReflectDefineProperty(target, prop, descriptor);
             },
         }).defineProperty);
